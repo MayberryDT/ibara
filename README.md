@@ -104,7 +104,7 @@ ibara gives people and agents real power over real computers, so we designed it 
 - Nothing listens on the internet. The agent entry, pairing and Take Control's stream listen only on this computer's Tailscale addresses. If the ufw firewall is on, setup opens those ports on the Tailscale interface only.
 - Adding a computer needs proof. Tailscale tells ibara which computer and which login is asking. Your own computers add each other when your console on the asking computer vouches for the request. Anyone else's computer waits until a person at your computer accepts a 6-digit code that both screens show, or brings a single-use invite code you made.
 - Every computer and every agent has its own permissions: Watch, Files, Take Control, Agent Tasks and Administer. Each is Allowed, Ask First or Denied. A friend's invite never includes Administer, and you can change or remove any permission from the Access tab at any time.
-- Agents are named. A connected agent is `codex@your-laptop`, not an anonymous key, and its named cursor on the screen says the same.
+- Agents are named. A connected agent is, for example, `claude-code@your-laptop`: its MCP client's name and the computer it came from, not an anonymous key.
 - Steps that matter ask first. By default, reading and ordinary changes are allowed, while sending, spending, deleting and access changes wait for a person to approve that exact step. An approval covers only that step, and it ends if control changes hands. You can turn off asking before sends, spends and deletes for agents from your own computers, for every computer, one computer or one agent; agents from anyone else's computer keep asking, and access changes always ask.
 - You can always take over. Moving your mouse stops the agent's input at once, and Take Control pauses every agent until you hand back. Hand Back lets agents work again unless you paused them yourself, and never restarts an agent's task by itself.
 - Releases are signed. The installer and `ibara update` check the release's signature against a key built into ibara, and every package's digest, before anything is installed.
@@ -182,7 +182,7 @@ Not yet. ibara relies on Omarchy's Hyprland setup, bar and commands, and we test
 
 ### How do I update or remove ibara
 
-`ibara update` installs the newest release, and `ibara update --check` only says whether there is one. `ibara rollback` goes back to the release before. `ibara uninstall` removes ibara and keeps this computer's identity for a later install, and `ibara uninstall --delete-data` removes everything. Ask each agent you connected to remove its `ibara` server, its `ibara` skill link and the ibara block in its instructions file.
+`ibara update` installs the newest release, and `ibara update --check` only says whether there is one. `ibara --version` prints the installed version. `ibara rollback` goes back to the release before, and says so without asking for your password when there is none. `ibara uninstall` removes the `ibara`, `ibara-stream` and `ibara-view` packages and keeps this computer's identity for a later install, and `ibara uninstall --delete-data` removes everything, including the viewer's settings and cache. `cua-driver-bin` stays installed, since other software may use it; remove it with `sudo pacman -R cua-driver-bin` if nothing else needs it. Ask each agent you connected to remove its `ibara` server, its `ibara` skill link and the ibara block in its instructions file. `ibara --help` lists the commands you run.
 
 ### Something is not working
 

@@ -501,6 +501,13 @@ impl OperatorSessions {
         }
     }
 
+    /// Close `computer`'s session at once: it left the directory or answers as a new computer.
+    pub fn forget(&self, computer: &str) {
+        if let Some(session) = self.lock().remove(computer) {
+            session.close(Close::Force);
+        }
+    }
+
     /// The number of open sessions.
     pub fn open_sessions(&self) -> usize {
         self.lock().values().filter(|s| !s.closed.load(Ordering::SeqCst)).count()

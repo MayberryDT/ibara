@@ -46,6 +46,16 @@ impl SystemWait {
         }
     }
 
+    /// Its name in operator status (`system_wait`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SystemWait::Starting => "starting",
+            SystemWait::Settling => "settling",
+            SystemWait::NeedsPerson => "needs_person",
+            SystemWait::ResumeOff => "resume_off",
+        }
+    }
+
     /// The refusal of a begin.
     pub(crate) fn refusal(self) -> IbaraError {
         let (message, retry, next) = match self {
@@ -905,6 +915,9 @@ impl Controller {
                 "authorization_generation": grant.generation,
                 "owner": self.viewer_owner_name()?,
                 "ownership_revision": self.viewer_revision_name()?,
+                // Who still pauses agents after the hand back: none (they can work
+                // again), a person, or ibara while it settles the computer.
+                "pause_origin": self.journal.get_control()?.pause_origin.map(|o| o.as_str()),
                 "agent_resumed": false,
             }))
         }

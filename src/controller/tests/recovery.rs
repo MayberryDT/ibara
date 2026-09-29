@@ -209,15 +209,21 @@ fn handing_back_resumes_a_system_pause_but_never_a_persons() {
         let c = rig.controller.clone();
         assert_eq!(control(&c).pause_origin, Some(PauseOrigin::System));
 
-        // Right after a start, before the watchdog: hand back resumes agents.
+        // Right after a start, before the watchdog: status says ibara is starting,
+        // and hand back resumes agents.
+        let status = operator(&c, "status").await;
+        assert_eq!(status["system_wait"], "starting", "{status}");
         transition(&c, "take_control").await;
-        transition(&c, "handback").await;
+        let back = transition(&c, "handback").await;
+        assert_eq!((back["owner"].clone(), back["pause_origin"].clone()), (json!("none"), Value::Null), "{back}");
         assert_resumed(&c);
+        assert_eq!(operator(&c, "status").await["system_wait"], Value::Null);
 
         // A person's own pause stays through take control and hand back.
         operator(&c, "pause").await;
         transition(&c, "take_control").await;
-        transition(&c, "handback").await;
+        let back = transition(&c, "handback").await;
+        assert_eq!((back["owner"].clone(), back["pause_origin"].clone()), (json!("human"), json!("person")), "{back}");
         assert_eq!(control(&c).pause_origin, Some(PauseOrigin::Person));
         operator(&c, "resume").await;
         assert_resumed(&c);

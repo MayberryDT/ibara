@@ -146,6 +146,17 @@ pub struct Field {
     whole: bool,
 }
 
+/// Where an element click stands after [`Cua::click_element`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ElementClick {
+    /// Activated through accessibility; the element's center on the
+    /// screen, when Cua gives its box.
+    Sent(Option<(f64, f64)>),
+    /// Nothing sent: for the pointer at `at`, the element's center on the
+    /// screen, inside its window.
+    Pointer { at: (f64, f64) },
+}
+
 #[derive(Debug, Clone)]
 pub struct CuaConfig {
     pub program: PathBuf,
@@ -539,8 +550,10 @@ impl Cua {
     }
 
     /// The element again, by identity, in a fresh snapshot, while it is
-    /// still unique there; else `STALE_TARGET`.
-    async fn resolve_fresh(&self, selector: &Value) -> Result<(Value, ResolvedElement)> {
+    /// still unique there; else `STALE_TARGET`. With it, the box of the
+    /// window's own top element in that snapshot, which says how the
+    /// snapshot's boxes sit on the screen ([`screen_center`]).
+    async fn resolve_fresh(&self, selector: &Value) -> Result<(Value, ResolvedElement, Option<[f64; 4]>)> {
         let gone = || stale("Semantic element no longer resolves uniquely.");
         let pid = selector["pid"].as_i64().unwrap_or(0);
         let window = selector["window_id"].as_u64().unwrap_or(0);
@@ -568,7 +581,13 @@ impl Cua {
             actions: strings(&element["actions"]),
             text,
         };
-        Ok((element.clone(), resolved))
+        let top = snapshot["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["parent_index"].is_null() && matches!(e["role"].as_str(), Some("frame" | "window" | "dialog" | "alert" | "file chooser")))
+            .and_then(frame_of);
+        Ok((element.clone(), resolved, top))
     }
 
     /// How many of the window's menus are open (see [`open_menus`]).
@@ -589,29 +608,55 @@ impl Cua {
         self.call("click", json!({"pid": pid, "window_id": window, "element_token": token}), true, ACT_TIMEOUT).await.map(drop)
     }
 
-    /// Activate an element through accessibility after checking it still
-    /// resolves uniquely to the same role and name. The named cursor goes
-    /// to the element first; `cancel` is honoured once it has arrived.
-    /// Returns the element's center in layout coordinates, when known.
+    /// Click an element after checking it still resolves uniquely to the
+    /// same role and name. A left click activates it through accessibility:
+    /// the named cursor goes to the element first, and `cancel` is honoured
+    /// once it has arrived. Cua has no accessibility action for a double or
+    /// right click: on Hyprland it would send them as background pointer
+    /// input, which it does not offer to ibara, and its failure there comes
+    /// after dispatch. Those, and a left click Cua refused for the same
+    /// reason before sending anything ([`background_refused`]), are for the
+    /// pointer at the element's center instead ([`ElementClick::Pointer`]).
     #[allow(clippy::too_many_arguments)]
-    pub async fn click_element(&self, selector: &Value, role: &str, name: &str, tool: &str, cancel: Option<&Cancel>, screens: &Screens) -> Result<Option<(f64, f64)>> {
-        let (element, live) = self.resolve_fresh(selector).await?;
+    pub async fn click_element(
+        &self,
+        selector: &Value,
+        role: &str,
+        name: &str,
+        tool: &str,
+        window: Rect,
+        cancel: Option<&Cancel>,
+        screens: &Screens,
+    ) -> Result<ElementClick> {
+        let (element, live, top) = self.resolve_fresh(selector).await?;
         if live.role != role || live.name != name {
             return Err(stale("Semantic identity changed."));
         }
-        let token = element["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
-        let frame = &element["frame"];
-        let center = match (frame["x"].as_f64(), frame["y"].as_f64(), frame["w"].as_f64(), frame["h"].as_f64()) {
-            (Some(x), Some(y), Some(w), Some(h)) => Some((x + w / 2.0, y + h / 2.0)),
-            _ => None,
+        let center = frame_of(&element).map(|frame| screen_center(frame, top, window));
+        let inside = center.filter(|&(x, y)| {
+            x >= window.x as f64 && y >= window.y as f64 && x < (window.x + window.width) as f64 && y < (window.y + window.height) as f64
+        });
+        let pointer = |refused: Option<IbaraError>| match inside {
+            Some(at) => Ok(ElementClick::Pointer { at }),
+            None => Err(refused.unwrap_or_else(|| {
+                unavailable("Nothing was sent: that element is not inside its window on the screen now, so the pointer cannot reach it.")
+                    .with("next", "Scroll it into view, observe again and click it; or click a point from computer_observe with view \"image\".")
+            })),
         };
+        if tool != "click" {
+            return pointer(None);
+        }
+        let token = element["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
         if let Some((x, y)) = center {
-            // The same point Cua's own reveal uses (AT-SPI screen extents).
             self.lead(x, y, screens).await;
         }
         unless_cancelled(cancel)?;
         let args = json!({"pid": selector["pid"], "window_id": selector["window_id"], "element_token": token});
-        self.call(tool, args, true, ACT_TIMEOUT).await.map(|_| center)
+        match self.call(tool, args, true, ACT_TIMEOUT).await {
+            Ok(_) => Ok(ElementClick::Sent(center)),
+            Err(refused) if background_refused(&refused) => pointer(Some(refused)),
+            Err(refused) => Err(refused),
+        }
     }
 
     // ---- input (exact-target foreground) ----
@@ -1075,6 +1120,44 @@ fn stale(message: &str) -> IbaraError {
     IbaraError::new("STALE_TARGET", message, true).with("execution_not_started", true)
 }
 
+/// An element's box as Cua gives it (x, y, width, height), when it has one.
+fn frame_of(element: &Value) -> Option<[f64; 4]> {
+    let frame = &element["frame"];
+    match (frame["x"].as_f64(), frame["y"].as_f64(), frame["w"].as_f64(), frame["h"].as_f64()) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some([x, y, w, h]),
+        _ => None,
+    }
+}
+
+/// The center of `frame` on the screen. Cua gives an element's box as its
+/// toolkit reports it: on the screen for most apps, in the window's own
+/// coordinates for some (Cua 0.29.1 on Hyprland gave Mousepad's text at
+/// 1,30 in a window at 12,38). When the read has the window's top element,
+/// `top` (the window itself), a box is placed as far from the window's
+/// corner on the screen as it is from `top`'s. Without one (Mousepad's read
+/// has none), a box that fits the window only in the window's own
+/// coordinates is taken as given in them.
+fn screen_center(frame: [f64; 4], top: Option<[f64; 4]>, window: Rect) -> (f64, f64) {
+    let [x, y, w, h] = frame;
+    let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+    let (wx, wy, width, height) = (window.x as f64, window.y as f64, window.width as f64, window.height as f64);
+    let fits = |x: f64, y: f64| x >= 0.0 && y >= 0.0 && x + w <= width && y + h <= height;
+    match top {
+        Some([tx, ty, _, _]) => (wx + cx - tx, wy + cy - ty),
+        None if !fits(x - wx, y - wy) && fits(x, y) => (wx + cx, wy + cy),
+        None => (cx, cy),
+    }
+}
+
+/// Cua refused, before sending anything, to act on an element as
+/// background input: it offers that only to the apps it has qualified
+/// (`client_not_qualified`), or not on this desktop at all
+/// (`background_unavailable`).
+fn background_refused(error: &IbaraError) -> bool {
+    error.details.get("execution_not_started") == Some(&json!(true))
+        && matches!(error.details.get("reason").and_then(Value::as_str), Some("client_not_qualified" | "background_unavailable"))
+}
+
 /// The named cursor's motion, every field ibara relies on, with a glide of
 /// `glide_ms` (1: it lands in one frame): no idle hide, turns of 1 px. Cua
 /// 0.29.1 on Wayland fills each field a call leaves out with its own
@@ -1436,6 +1519,9 @@ fn partial(tool: &str, sc: &Value, text: &str) -> Option<IbaraError> {
 const KEYS_INSTEAD: &str = "Use keys instead (kind key, in computer_act or browser_act): Tab and shift+Tab move between controls, Return or space presses the focused one, Page_Down and Page_Up scroll, and text typed without a target goes to the focused field. In the browser, browser_act navigate opens an address directly.";
 /// What an agent can use when Cua refuses keyboard input.
 const POINTER_INSTEAD: &str = "Use the pointer instead: click the element that does it (a button, a menu item), and write a file's text with computer_files instead of typing it.";
+/// What an agent can use while something outside the window holds the
+/// pointer and keyboard: an accessibility action needs neither.
+const GRAB_INSTEAD: &str = "Left-click an element by its id from computer_observe instead (an element with an accessibility action needs neither the pointer nor the keyboard), or close what holds them in its own app, or wait a moment for a drag to end or a person to close it; then observe again and try again.";
 
 /// A refusal by its cause ([`cause`]), with that cause as `reason` and, for a
 /// route that stays closed for now, what the agent can use instead as `next`.
@@ -1451,13 +1537,16 @@ fn refused_by(tool: &str, sc: &Value, text: &str) -> IbaraError {
             unavailable("Cua refused: this computer's current keyboard layout is not a plain US layout."),
             Some(format!("{POINTER_INSTEAD} Typing works again once a person switches this computer's keyboard to the English (US) layout.")),
         ),
+        // The plugin lets keys and points reach the target's own popup (a
+        // popover, a menu), so a grab here is another app's popup, a panel or
+        // a drag, which refuses every key and point to this window alike.
         "grab" | "dnd" => (
             IbaraError::new(
                 "BLOCKED_BY_DIALOG",
-                "A menu, popup, drag or full-screen panel holds the pointer and keyboard. Choose its item by element, or close it first: Escape closes a menu of this window.",
+                "Another app's menu or popup, a panel such as a launcher, or a drag holds this computer's pointer and keyboard, so Cua sent nothing: keys and points to this window are refused until it lets go.",
                 true,
             ),
-            None,
+            Some(GRAB_INSTEAD.to_string()),
         ),
         "keyboard_locked" => (
             unavailable("Cua refused: Caps Lock (or another lock key; NumLock is fine) is on at this computer's keyboard. A person needs to turn it off."),
@@ -1714,6 +1803,19 @@ esac
         let menu = refusal("click", &refused("primary_target_busy", "foreground_grab"), true);
         assert_eq!(menu.code, "BLOCKED_BY_DIALOG");
 
+        // Another app's grab refuses every key and point to the window, so
+        // what the agent is told to do next is neither: no Escape, no keys.
+        for tool in ["click", "drag", "scroll", "press_key", "hotkey", "type_text"] {
+            for detail in ["foreground_grab", "foreground_dnd"] {
+                let held = refusal(tool, &refused("primary_target_busy", detail), true).to_json();
+                let (message, next) = (held["message"].as_str().unwrap(), held["next"].as_str().unwrap());
+                assert!(next.contains("element by its id"), "{tool} {detail}: {next}");
+                for refused_way in ["Escape", "kind key", "Use keys", "Use the pointer"] {
+                    assert!(!message.contains(refused_way) && !next.contains(refused_way), "{tool} {detail} advises {refused_way}: {message} / {next}");
+                }
+            }
+        }
+
         for detail in ["foreground_physical_keys", "foreground_physical_buttons", "foreground_constraint", "foreground_pointer_target"] {
             let error = refusal("click", &refused("primary_target_busy", detail), true);
             assert_eq!(error.code, "CAPABILITY_UNAVAILABLE", "{detail} is not a dialog");
@@ -1945,7 +2047,7 @@ esac
         let cua = cua(&dir, fake_cua(&dir, true, &slow_chrome(3000)));
         let page = cua.elements(1, 1, None, 40, None).await.unwrap();
         let button = page.elements.iter().find(|e| e.name == "Create account").expect("the frame offers the button");
-        cua.click_element(&button.selector, &button.role, &button.name, "click", None, &Screens::of(&[])).await.unwrap();
+        cua.click_element(&button.selector, &button.role, &button.name, "click", Rect::default(), None, &Screens::of(&[])).await.unwrap();
         assert_eq!(lines(dir.join("clicked.log")), ["s1:5"], "the button, once");
         assert!(page.elements.iter().any(|e| e.name == "Terms"), "the frame shows the whole window: {:?}", page.elements);
 
@@ -1962,7 +2064,7 @@ esac
         let cua = cua(&dir, fake_cua(&dir, true, &slow_chrome(1_000_000)));
         let page = cua.elements(1, 1, None, 40, None).await.unwrap();
         let button = page.elements.iter().find(|e| e.name == "Create account").expect("the first part holds the button");
-        let refused = cua.click_element(&button.selector, &button.role, &button.name, "click", None, &Screens::of(&[])).await.unwrap_err();
+        let refused = cua.click_element(&button.selector, &button.role, &button.name, "click", Rect::default(), None, &Screens::of(&[])).await.unwrap_err();
         assert_eq!(refused.code, "STALE_TARGET", "{}", refused.message);
         assert_eq!(refused.details.get("reason"), Some(&json!("read_in_part")), "{}", refused.message);
         assert_eq!(refused.details["execution_not_started"], json!(true));
@@ -1996,5 +2098,20 @@ esac
         // So is a lone element with a name.
         let named = json!({"elements": [{"element_index": 0, "role": "frame", "label": "Untitled - Mousepad"}]});
         assert!(tree_from_snapshot(1, 1, &named).available);
+    }
+
+    /// Boxes as Cua gave them on test computers: Files (GTK 4) with its
+    /// window element, on the screen through Cua 0.28.2; Mousepad (GTK 3),
+    /// whose read has no window element, on the screen through 0.28.2 and in
+    /// the window's own coordinates through 0.29.1.
+    #[test]
+    fn an_elements_center_is_placed_on_the_screen_however_its_app_gives_its_box() {
+        let files = Rect { x: 967, y: 38, width: 941, height: 1030 };
+        let documents = [1170.0, 84.0, 144.0, 132.0];
+        assert_eq!(screen_center(documents, Some([967.0, 38.0, 941.0, 1030.0]), files), (1242.0, 150.0));
+        assert_eq!(screen_center([203.0, 46.0, 144.0, 132.0], Some([0.0, 0.0, 941.0, 1030.0]), files), (1242.0, 150.0), "the same, given in the window");
+        let mousepad = Rect { x: 12, y: 38, width: 941, height: 1030 };
+        assert_eq!(screen_center([13.0, 68.0, 939.0, 997.0], None, mousepad), (482.5, 566.5), "on the screen");
+        assert_eq!(screen_center([1.0, 30.0, 939.0, 997.0], None, mousepad), (482.5, 566.5), "in the window");
     }
 }

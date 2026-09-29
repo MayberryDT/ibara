@@ -97,6 +97,17 @@ impl Console {
             clipboards: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Let go of what this console holds for `computer`, which left the
+    /// directory or now answers as a new computer: its session, what the fleet
+    /// kept, its video, its shared clipboard and its viewer.
+    fn forget_computer(&self, computer: &str) {
+        self.sessions.forget(computer);
+        self.fleet.forget(computer);
+        self.videos.close(computer);
+        clipboard::stop(self, computer);
+        selected::close_viewer(self, computer);
+    }
 }
 
 /// One request's context (the bridge's `ctx`).
@@ -246,6 +257,7 @@ async fn dispatch(ctx: &Ctx) -> Handled {
     match command {
         "directory" => selected::directory(ctx),
         "rename-computer" => selected::rename_computer(ctx),
+        "remove-computer" => pairing::remove_computer(ctx),
         "connect-prompt" => Ok(ctx.ready(crate::operator::onboarding::connect_prompt_json())),
         "tailnet" => pairing::tailnet(ctx).await,
         "pair-start" => pairing::pair_start(ctx).await,

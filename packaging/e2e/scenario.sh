@@ -138,7 +138,7 @@ step "3b. A Hyprland upgrade only builds Cua's plugin again"
 # The person turned Tailscale off; Omarchy's update then reinstalls Hyprland.
 R 'systemctl disable --now tailscaled.service' >>"$evidence/checks.log" 2>&1
 R 'pacman -U --noconfirm $(ls /var/cache/pacman/pkg/hyprland-[0-9]*.pkg.tar.zst | tail -1)' >"$evidence/03b-hyprland.log" 2>&1
-check "only the Cua hook ran, and found the plugin built for this Hyprland" bash -c "grep -q \"Building ibara's Hyprland plugin\" $evidence/03b-hyprland.log && grep -q 'Already built for Hyprland' $evidence/03b-hyprland.log && ! grep -q 'Setting ibara up again' $evidence/03b-hyprland.log"
+check "only the Cua hook ran, and found the plugin built for this Hyprland" bash -c "grep -q \"Building ibara's Hyprland plugin\" $evidence/03b-hyprland.log && grep -q 'Already built for Hyprland' $evidence/03b-hyprland.log && ! grep -q 'Refreshing ibara' $evidence/03b-hyprland.log"
 check "Tailscale left off, as the person left it" R '[ "$(systemctl is-enabled tailscaled.service)" = disabled ] && ! systemctl is-active tailscaled.service'
 R 'systemctl enable --now tailscaled.service' >>"$evidence/checks.log" 2>&1
 

@@ -1,14 +1,14 @@
-//! `ibara control ARGS…`: the administrator route (replaces `agent/ibara-control`).
+//! The legacy single-station route (replaced `agent/ibara-control`).
 //!
-//! Runs `computerctl ARGS…` on the station named by the descriptor, as its
-//! separate administrative account, over Tailscale SSH. Tailscale SSH accepts one
-//! remote shell command, so each argument is quoted as POSIX shell data.
+//! `ibara client --operator` still opens its transfer session here: `computerctl
+//! transfer-session` on the station named by the descriptor, over Tailscale SSH,
+//! each argument quoted as POSIX shell data. `ibara control` itself only says this
+//! version does not use it.
 
 use super::transport::station_descriptor_path;
 use super::{fail, js, pattern};
 use crate::error::Result;
 use serde_json::Value;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -84,19 +84,11 @@ pub fn transfer_session_command() -> Result<Command> {
     Ok(tailscale_command(&station, &["transfer-session".to_string()]))
 }
 
-/// `ibara control ARGS…`: replaces this process with tailscale, so its exit status
-/// and signals are the command's own, as `spawnSync(…, {stdio:'inherit'})` re-raised them.
-pub fn main(args: Vec<String>) -> ExitCode {
-    let station = match load_station(&station_descriptor_path()) {
-        Ok(station) => station,
-        Err(error) => {
-            eprintln!("{}", error.message);
-            return ExitCode::from(error.status);
-        }
-    };
-    let error = tailscale_command(&station, &args).exec();
-    eprintln!("{error}");
-    ExitCode::from(127)
+/// `ibara control`: the old single-computer administrator route. This version
+/// manages computers from the console and `ibara admin`, so it only says so.
+pub fn main(_args: Vec<String>) -> ExitCode {
+    eprintln!("ibara control is not used by this version of ibara. Manage computers from the ibara console; on this computer, ibara admin.");
+    ExitCode::from(64)
 }
 
 #[cfg(test)]

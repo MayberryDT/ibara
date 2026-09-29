@@ -54,7 +54,7 @@ while [ $# -gt 2 ]; do
   esac
 done
 host=$1 command=$2
-root=$(sed -n "s/^$host //p" "$FAKE_SSH_ROUTES")
+root=$(sed -n "s/^$host //p" "$FAKE_SSH_ROUTES" | head -n 1)
 principal=${login#ibara-op-}
 [ -n "$root" ] && [ "$principal" != "$login" ] || { echo "ssh: connect to host $host port 2222: Connection refused" >&2; exit 255; }
 grep -qxF "$alias $(cut -d' ' -f1,2 "$root/host_ed25519.pub")" "$known" || { echo "Host key verification failed." >&2; exit 255; }
@@ -63,6 +63,14 @@ enrolled=$(cut -d' ' -f2 "$root/authorized/$login" 2>/dev/null)
 [ -n "$offered" ] && [ "$offered" = "$enrolled" ] || { echo "$login@$host: Permission denied (publickey)." >&2; exit 255; }
 export SSH_ORIGINAL_COMMAND="$command"
 exec "$FAKE_IBARA" agent-entry "$principal" "$root/run/controller.sock" "$root/gateway.key" "$root/state/operator-keys/$principal.key"
+"#;
+
+/// `ssh-keyscan … HOST` against the target's sshd: the host key it shows.
+const FAKE_SSH_KEYSCAN: &str = r#"#!/bin/sh
+for host in "$@"; do :; done
+root=$(sed -n "s/^$host //p" "$FAKE_SSH_ROUTES" | head -n 1)
+[ -n "$root" ] && [ -f "$root/host_ed25519.pub" ] || exit 1
+echo "$host $(cut -d' ' -f1,2 "$root/host_ed25519.pub")"
 "#;
 
 pub struct Node {
@@ -157,6 +165,7 @@ impl World {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         write_executable(&root.join("bin/tailscale"), FAKE_TAILSCALE);
         write_executable(&root.join("bin/ssh"), FAKE_SSH);
+        write_executable(&root.join("bin/ssh-keyscan"), FAKE_SSH_KEYSCAN);
         for n in NODES {
             fs::write(root.join(format!("tailscale/status-{}.json", n.name)), status_for(n).to_string()).unwrap();
             fs::write(root.join(format!("tailscale/whois-{}.json", n.ip)), whois_for(n).to_string()).unwrap();

@@ -122,7 +122,7 @@ fn own_computers_pair_without_a_person_and_the_tailnet_lists_linux_computers() {
         listed["vesper"],
         json!({"node": "vesper", "dns_name": "vesper.tail0000.ts.net", "ip": "127.0.0.3", "online": true,
                "owner": "riley@example.com", "same_owner": true, "is_self": true, "ibara": "ready",
-               "paired": false, "computer_id": null, "label": null})
+               "paired": false, "changed": false, "computer_id": null, "label": null})
     );
     let brief = |c: &Value| (c["ibara"].as_str().unwrap().to_string(), c["same_owner"].as_bool().unwrap(), c["owner"].clone());
     assert_eq!(brief(&listed["tulip1"]), ("ready".into(), true, json!("riley@example.com")));
@@ -446,4 +446,121 @@ fn a_computer_called_owner_never_takes_the_local_owners_name() {
     assert_ne!(code, Some(0), "{refused}");
     assert!(tulip1.authority().get("owner").is_none());
     world.record(json!({"target": "tulip1", "authority": tulip1.authority(), "access": tulip1.admin(&["access"]).1}));
+}
+
+/// Failure cases this must catch:
+/// 1. A computer reinstalled with its data deleted (a new identity and SSH
+///    host key) still reads as added, with no way to add it again.
+/// 2. Adding it again leaves a second card beside the old one, gives it
+///    another name here, or keeps the old pin or the old session.
+/// 3. Adding it again skips the checks of a first add.
+/// 4. Remove Computer leaves its row, its pinned host key or a working
+///    session behind, or removes a computer that isn't here.
+/// 5. A removed computer can't be added again.
+#[test]
+fn a_reinstalled_computer_is_added_again_and_a_removed_one_can_come_back() {
+    let world = World::new("readd");
+    let vesper_target = Target::start(&world, node("vesper"), None, 300_000);
+    let tulip1 = Target::start(&world, node("tulip1"), Some("Tulip1"), 300_000);
+    let mut vesper = Console::start(&world, "vesper", node("vesper"), Some(&vesper_target));
+    let pins = vesper.home.join(".local/state/ibara/known-hosts");
+    let rows = |console: &mut Console| console.ok("directory", &[])["computers"].as_array().unwrap().clone();
+
+    let started = vesper.ok("pair-start", &["tulip1"]);
+    let computer_id = vesper.settled(started["request_id"].as_str().unwrap())["computer_id"].as_str().unwrap().to_string();
+    route_works(&mut vesper, &computer_id);
+    let listed = computers(&vesper.ok("tailnet", &[]));
+    assert_eq!((listed["tulip1"]["paired"].as_bool(), listed["tulip1"]["changed"].as_bool()), (Some(true), Some(false)), "{listed:?}");
+    let old_pin = fs::read_to_string(pins.join(format!("{computer_id}.known_hosts"))).unwrap();
+
+    // Tulip1 is reinstalled with its data deleted: a new identity and host key.
+    // The station label goes with the data: it now calls itself by its Tailscale name.
+    let root = tulip1.root.clone();
+    drop(tulip1);
+    fs::remove_dir_all(&root).unwrap();
+    let tulip1 = Target::start(&world, node("tulip1"), None, 300_000);
+    let session = vesper.ask("operator-session", &["--computer", &computer_id]);
+    assert!(!session["error"].is_null(), "the old pin no longer matches: {session}");
+    let listed = computers(&vesper.ok("tailnet", &[]));
+    assert_eq!(
+        (listed["tulip1"]["paired"].as_bool(), listed["tulip1"]["changed"].as_bool(), listed["tulip1"]["computer_id"].as_str()),
+        (Some(true), Some(true), Some(computer_id.as_str())),
+        "{listed:?}"
+    );
+
+    // Adding it again goes through the same pairing, and takes over its row.
+    let started = vesper.ok("pair-start", &["tulip1"]);
+    assert_eq!(started["mode"], "own_computer", "{started}");
+    let again = vesper.settled(started["request_id"].as_str().unwrap());
+    assert_eq!((again["state"].as_str(), again["computer_id"].as_str(), again["label"].as_str()), (Some("paired"), Some(computer_id.as_str()), Some("Tulip1")), "{again}");
+    assert_eq!(tulip1.authority()["vesper"]["operator_public_key"].as_str(), Some(vesper.public_key().as_str()), "enrolled again on the new install");
+    route_works(&mut vesper, &computer_id);
+    let all = rows(&mut vesper);
+    assert_eq!(all.iter().filter(|r| r["host"] == "127.0.0.2").count(), 1, "one card for Tulip1: {all:?}");
+    let new_pin = fs::read_to_string(pins.join(format!("{computer_id}.known_hosts"))).unwrap();
+    assert_ne!(new_pin, old_pin);
+    let listed = computers(&vesper.ok("tailnet", &[]));
+    assert_eq!((listed["tulip1"]["paired"].as_bool(), listed["tulip1"]["changed"].as_bool()), (Some(true), Some(false)), "{listed:?}");
+
+    // Remove Computer: nothing about Tulip1 stays here.
+    let session = vesper.ok("operator-session", &["--computer", &computer_id]);
+    let epoch = session["controller_epoch"].as_str().unwrap().to_string();
+    let removed = vesper.ok("remove-computer", &["--computer", "Tulip1"]);
+    assert_eq!(removed["removed"], json!({"computer_id": computer_id, "label": "Tulip1"}), "{removed}");
+    assert!(rows(&mut vesper).iter().all(|r| r["computer_id"] != computer_id.as_str()));
+    assert!(!pins.join(format!("{computer_id}.known_hosts")).exists(), "its pinned host key is gone");
+    let status = vesper.ask("operator-status", &["--computer", &computer_id, "--epoch", &epoch]);
+    assert!(!status["error"].is_null(), "its session is closed: {status}");
+    let listed = computers(&vesper.ok("tailnet", &[]));
+    assert_eq!((listed["tulip1"]["paired"].as_bool(), listed["tulip1"]["computer_id"].as_str()), (Some(false), None), "{listed:?}");
+    let unknown = vesper.ask("remove-computer", &["--computer", &computer_id]);
+    assert_eq!((unknown["error"]["code"].as_str(), unknown["error"]["message"].as_str()), (Some("REMOVE_REFUSED"), Some("No computer has that ID.")), "{unknown}");
+    let usage = vesper.ask("remove-computer", &[&computer_id]);
+    assert!(!usage["error"].is_null(), "{usage}");
+
+    // Added again, as a new computer with the name it gives itself.
+    let started = vesper.ok("pair-start", &["tulip1"]);
+    let back = vesper.settled(started["request_id"].as_str().unwrap());
+    assert_eq!((back["state"].as_str(), back["label"].as_str()), (Some("paired"), Some("tulip1")), "{back}");
+    route_works(&mut vesper, back["computer_id"].as_str().unwrap());
+    world.record(json!({"target": "tulip1", "authority": tulip1.authority(), "directory": rows(&mut vesper)}));
+}
+
+/// Failure case this must catch: the owner's computer, reinstalled (a new
+/// key), pairs again under `name-2`, and the old `ibara-op-name` account and
+/// key stay enabled for the identity that is gone, when its old pairing is from
+/// before tailnet pairing and recorded no Tailscale computer.
+#[test]
+fn a_reinstalled_own_computer_takes_over_its_pairing_from_before_tailnet_pairing() {
+    let world = World::new("legacy-name");
+    let tulip1 = Target::start(&world, node("tulip1"), Some("Tulip1"), 300_000);
+    let vesper_target = Target::start(&world, node("vesper"), None, 300_000);
+    let old_key = {
+        let mut old = Console::start(&world, "vesper-old", node("vesper"), Some(&vesper_target));
+        let started = old.ok("pair-start", &["tulip1"]);
+        assert_eq!(old.settled(started["request_id"].as_str().unwrap())["state"], "paired");
+        old.public_key()
+    };
+    // The pairing as a release before tailnet pairing wrote it: no Tailscale computer.
+    let file = tulip1.root.join("state/operator-authority.json");
+    let mut authority = tulip1.authority();
+    for key in ["tailscale", "own_computer", "paired_at", "operator_key_fingerprint", "operator_public_key", "operator_endpoint_id"] {
+        authority["vesper"].as_object_mut().unwrap().remove(key);
+    }
+    fs::write(&file, authority.to_string()).unwrap();
+
+    // Vesper, reinstalled with a new key, takes it over.
+    let mut vesper = Console::start(&world, "vesper-new", node("vesper"), Some(&vesper_target));
+    let started = vesper.ok("pair-start", &["tulip1"]);
+    assert_eq!(started["mode"], "own_computer", "{started}");
+    let paired = vesper.settled(started["request_id"].as_str().unwrap());
+    assert_eq!(paired["state"], "paired", "{paired}");
+    route_works(&mut vesper, paired["computer_id"].as_str().unwrap());
+    let authority = tulip1.authority();
+    assert!(authority.get("vesper-2").is_none(), "{authority}");
+    assert_eq!(authority["vesper"]["operator_public_key"].as_str(), Some(vesper.public_key().as_str()), "{authority}");
+    let projected = tulip1.projections().last().unwrap().clone();
+    assert_eq!(projected["keys"]["vesper"], vesper.public_key(), "{projected}");
+    assert!(!projected.to_string().contains(old_key.split(' ').nth(1).unwrap()), "the old key is gone: {projected}");
+    world.record(json!({"target": "tulip1", "authority": authority, "projections": tulip1.projections()}));
 }

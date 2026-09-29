@@ -102,8 +102,14 @@ if ! session hyprctl version >/dev/null 2>&1; then
 elif [[ $loaded == 0 ]]; then
   session hyprctl reload >/dev/null
   sleep 1
-  if session hyprctl -j cua:status >/dev/null 2>&1; then
+  # Loading is not enough: a session that already loaded and unloaded the
+  # plugin (an uninstall, then an install) keeps it from taking the input seat,
+  # and agents can't click or type until the person signs in again.
+  status=$(session hyprctl -j cua:status 2>/dev/null || true)
+  if [[ -n $status ]] && jq -e '.transport.ready == true' <<<"$status" >/dev/null 2>&1; then
     echo "Built for Hyprland $hypr_built and loaded."
+  elif [[ -n $status ]]; then
+    echo "Built for Hyprland $hypr_built. Sign out and back in to finish: until then agents can't click or type on this computer."
   else
     echo "Built for Hyprland $hypr_built; it loads when you next sign in."
   fi

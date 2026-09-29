@@ -29,6 +29,8 @@ Invite levels are Watch; Use with Approval (files, Take Control and agent tasks 
 
 A program running as your desktop user counts as you. Another account on the asking computer, such as the agent account, cannot vouch for itself: its request waits for a person like anyone else's.
 
+Once a computer is added, the console pins its SSH host key and reaches it only with that key. A computer reinstalled with `--delete-data` has a new identity and a new host key, so the console stops reaching it; it is never trusted silently. Add Computer then shows it with **Add Again**, which pairs it the same way as the first time (your own computer at once, someone else's with the 6-digit code) and pins its new key on its old card. **Remove Computer** (a card's ⋯ menu, or the computer's System tab) takes a computer off this console: its entry, its pinned host key and what the console held for it. It does not change access on that computer; to end that too, remove the pairing on that computer's Access tab.
+
 ## Permissions
 
 Every paired computer and every agent has 5 permissions on each computer:

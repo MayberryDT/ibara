@@ -397,10 +397,11 @@ pub fn uninstall(args: &[String]) -> Result<(), String> {
     if let Some(owner) = super::system::station_owner().filter(|o| *o != me.name) {
         return Err(format!("ibara on this computer belongs to {owner}; run ibara uninstall as {owner}."));
     }
-    println!("This removes ibara from this computer: its services, the bar icon, access for your paired computers");
-    println!("and the ibara package. Files you received stay in ~/Downloads/Ibara.");
+    println!("This removes ibara from this computer: its services, the bar icon, access for your paired computers,");
+    println!("the ibara, ibara-stream and ibara-view packages and setup's ibara and ibarad links in ~/.local/bin.");
+    println!("Files you received stay in ~/Downloads/Ibara. cua-driver-bin stays installed, since other software may use it.");
     if delete_data {
-        println!("With --delete-data it also deletes this computer's ibara keys, identity, pairings and history.");
+        println!("With --delete-data it also deletes this computer's ibara keys, identity, pairings and history, and the viewer's settings and cache.");
     } else {
         println!("This computer's keys, pairings and history are kept for a later install (--delete-data removes them).");
     }
@@ -424,8 +425,9 @@ pub fn uninstall(args: &[String]) -> Result<(), String> {
     }
     as_root(&root_args)?;
 
+    remove_setup_links(&me);
     if delete_data {
-        for path in super::HOME_DATA {
+        for path in super::HOME_DATA.iter().chain(&VIEW_DATA) {
             let path = me.home.join(path);
             let removed = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
             if let Err(e) = removed
@@ -434,11 +436,29 @@ pub fn uninstall(args: &[String]) -> Result<(), String> {
                 println!("  Could not remove {}: {e}", path.display());
             }
         }
+        // The viewer's folder, if its settings were all it held.
+        let _ = std::fs::remove_dir(me.home.join(".config/Ibara"));
     }
     let _ = services(&["daemon-reload"]);
     println!("\nibara is removed from this computer. Agents you connected keep a server named ibara in their own settings,");
     println!("a link named ibara in their skills folder and an ibara block in their instructions file: ask each one to remove them.");
     Ok(())
+}
+
+/// Take Control's viewer's settings and cache, removed with --delete-data.
+const VIEW_DATA: [&str; 2] = [".config/Ibara/ibara-view.conf", ".cache/Ibara"];
+
+/// The `~/.local/bin` links setup makes (see `replace_old_copies`), only while
+/// they still point at the package's programs.
+fn remove_setup_links(me: &Account) {
+    for (name, target) in [("ibara", "/usr/bin/ibara"), ("ibarad", "/usr/bin/ibarad")] {
+        let link = me.home.join(".local/bin").join(name);
+        if std::fs::read_link(&link).is_ok_and(|to| to == Path::new(target))
+            && let Err(e) = std::fs::remove_file(&link)
+        {
+            println!("  Could not remove {}: {e}", link.display());
+        }
+    }
 }
 
 fn confirm(question: &str) -> Result<bool, String> {

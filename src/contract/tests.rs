@@ -251,12 +251,12 @@ fn assert_schema(path: &str, schema: &Value) {
 }
 
 #[test]
-fn tool_list_is_eleven_valid_object_schemas_within_nine_kib() {
+fn tool_list_is_eleven_valid_object_schemas_within_ten_kib() {
     let tools = tool_definitions();
     assert_eq!(tools.len(), 11);
     let json: Vec<Value> = tools.iter().map(ToolDef::to_mcp).collect();
     let size = serde_json::to_vec(&json).unwrap().len();
-    assert!(size <= 9 * 1024, "tools/list is {size} bytes");
+    assert!(size <= 10 * 1024, "tools/list is {size} bytes");
     for tool in &tools {
         assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
         assert_schema(tool.name, &tool.input_schema);

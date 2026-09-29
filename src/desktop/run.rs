@@ -334,7 +334,11 @@ pub async fn spawn_detached(cmd: Cmd) -> Result<u32> {
         }
         None => tokio::process::Command::new(&program),
     };
+    // An app starts in the person's home folder, as the desktop starts it, not
+    // in ibarad's working directory (the package's own folder).
+    let home = var(&cmd.env, "HOME").map(std::path::PathBuf::from).filter(|p| p.is_dir());
     command
+        .current_dir(home.unwrap_or_else(|| "/".into()))
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
@@ -649,9 +653,11 @@ mod tests {
             eprintln!("skipped: no systemd user manager here, so there is no unit to outlive");
             return;
         }
-        let pid = spawn_detached(Cmd::new("sleep").arg("30").env("IBARA_LAUNCH_CHECK", "d16")).await.unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let pid = spawn_detached(Cmd::new("sleep").arg("30").env("IBARA_LAUNCH_CHECK", "d16").env("HOME", &home)).await.unwrap();
         let (app, ours) = (cgroup(pid), cgroup(std::process::id()));
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"));
         // The kernel fills in the new program's environment just after its
         // exe changes, so an empty read right after exec means "not yet".
         let mut environ = Vec::new();
@@ -666,6 +672,7 @@ mod tests {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
 
         assert_ne!(app, ours, "the app must leave the launcher's control group");
+        assert_eq!(cwd.unwrap(), std::path::PathBuf::from(&home), "the app must start in the person's home folder");
         let (slice, unit) = app.rsplit_once('/').unwrap();
         assert!(slice.ends_with("/app-graphical.slice"), "{app}");
         let random = unit.strip_prefix("app-ibara-sleep-").and_then(|u| u.strip_suffix(".scope")).unwrap_or_else(|| panic!("{unit}"));

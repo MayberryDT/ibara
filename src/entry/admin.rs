@@ -25,7 +25,7 @@ const LOG_UNITS: &[&str] = &["controller", "output", "sunshine", "gateway"];
 const TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_SESSION_LINE: usize = 3 * 1024 * 1024;
 
-pub const USAGE: &str = "Usage: computerctl [COMMAND] [ARGS]
+pub const USAGE: &str = "Usage: ibara admin [COMMAND] [ARGS]   (computerctl is the same, as root)
 
 Commands:
   status                              Availability, capabilities, lease and control (default)
@@ -131,7 +131,7 @@ pub fn build_action(operation: &str, args: &[String]) -> Result<Map<String, Valu
     let mut set = |key: &str, value: Value| {
         action.insert(key.into(), value);
     };
-    let usage = |text: &str| Err(format!("Usage: computerctl {text}"));
+    let usage = |text: &str| Err(format!("Usage: ibara admin {text}"));
     match operation {
         "status" | "doctor" | "pause" | "resume" | "telemetry" | "procedures" | "endpoint" | "outputs" | "operator_access" | "access" | "access_sync" => {
             if !args.is_empty() {
@@ -589,7 +589,7 @@ pub fn main(argv: Vec<String>) -> i32 {
     let raw = argv.first().map(String::as_str);
     if matches!(raw, Some("help" | "--help" | "-h")) {
         if argv.len() > 1 {
-            return fail("Usage: computerctl help");
+            return fail("Usage: ibara admin help");
         }
         print!("{USAGE}");
         return 0;
@@ -597,7 +597,7 @@ pub fn main(argv: Vec<String>) -> i32 {
     let operation = raw.unwrap_or("status");
     if operation == "transfer-session" {
         if argv.len() != 1 {
-            return fail("Usage: computerctl transfer-session");
+            return fail("Usage: ibara admin transfer-session");
         }
         return block_on(transfer_session());
     }
@@ -649,7 +649,7 @@ mod tests {
         ];
         for (op, args) in refused {
             let err = build_action(op, &strings(args)).unwrap_err();
-            assert!(err.starts_with("Usage: computerctl"), "{op} {args:?}: {err}");
+            assert!(err.starts_with("Usage: ibara admin"), "{op} {args:?}: {err}");
         }
         let err = build_action("reconcile_operation", &strings(&["op_1", "confirmed", "{}", "note"])).unwrap_err();
         assert_eq!(err, "EVIDENCE_JSON must be a JSON array of retained evidence references.");

@@ -74,7 +74,8 @@ main() {
   done
 
   say "Installing ibara $version. This needs your password (sudo)."
-  sudo pacman -U --needed --noconfirm "$@" ||
+  # IBARA_INSTALLER quiets the package's own "run ibara setup" notes: setup runs next.
+  sudo env IBARA_INSTALLER=1 pacman -U --needed --noconfirm "$@" ||
     die "pacman could not install it. If a package failed to download, run: omarchy update, then try again."
   # Kept for `ibara rollback`, as `ibara update` keeps every release it installs.
   sudo install -D -m 0644 -t /var/cache/ibara/packages "$@"

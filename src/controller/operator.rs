@@ -409,6 +409,9 @@ impl Controller {
         let control = self.journal.get_control()?;
         out.insert("paused".into(), json!(control.paused));
         out.insert("pause_origin".into(), json!(control.pause_origin.map(|o| o.as_str())));
+        // Why agents wait while only ibara paused the computer (starting, settling,
+        // needs_person, resume_off), else null.
+        out.insert("system_wait".into(), json!(self.system_wait(&control).map(|w| w.as_str())));
         out.insert("name".into(), json!(crate::settings::current().text("name")));
         out.insert("wake".into(), self.wake_info().await);
         out.insert("disk_password".into(), self.disk_password().await);

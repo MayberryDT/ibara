@@ -43,7 +43,7 @@ A computer with no screen, or one you reach only over SSH, can accept requests w
 
 - Check that it is on and awake. The console's Wake works if the computer had Wake from the network on before it slept, and this computer or another of your computers on its network can send the wake signal.
 - Check Tailscale on both computers.
-- If the computer was reinstalled with `--delete-data`, its identity changed. Remove it from the fleet and add it again.
+- If the computer was reinstalled with `--delete-data`, its identity changed, so this console no longer trusts it. Open Add Computer: it shows that computer with **Add Again**. Choosing it pairs the computer the same way as the first time, on the same card. You can also remove it from your fleet with **Remove Computer** (its card's ⋯ menu, or its System tab) and add it again as a new computer.
 
 ## An agent cannot see my computers
 
@@ -84,11 +84,12 @@ If earlier work did not finish stopping, the computer's page says "agents are he
 
 - `ibara update --check` says whether there is a newer release.
 - `ibara update` refuses a release whose signature or digests do not match. That is the protection working: do not work around it, and [report it](https://github.com/MayberryDT/ibara/issues/new/choose).
-- `ibara rollback` goes back to the release before, and restores the journal from before the update when needed.
+- `ibara rollback` goes back to the release before, and restores the journal from before the update when needed. With no earlier release kept in `/var/cache/ibara/packages`, it says so in one line and asks for nothing.
+- `ibara --version` prints the installed version, such as `ibara 0.1.0-18`.
 
 ## Starting over
 
-`ibara uninstall` removes ibara and keeps this computer's identity, pairings and history for a later install. `ibara uninstall --delete-data` also removes them, so other computers will need to add this one again. Files you received stay in `~/Downloads/Ibara`.
+`ibara uninstall` removes the `ibara`, `ibara-stream` and `ibara-view` packages, and setup's `ibara` and `ibarad` links in `~/.local/bin`, and keeps this computer's identity, pairings and history for a later install. `ibara uninstall --delete-data` also removes them and the viewer's settings and cache (`~/.config/Ibara/ibara-view.conf`, `~/.cache/Ibara`), so other computers will need to add this one again. Files you received stay in `~/Downloads/Ibara`. `cua-driver-bin` stays installed, since other software may use it.
 
 ## Still stuck
 

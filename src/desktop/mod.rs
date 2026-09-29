@@ -594,11 +594,14 @@ impl Desktop {
     }
 
     /// Click, double-click or right-click. A point is clicked through Cua's
-    /// exact-target route in the window under it; an element is activated
-    /// through accessibility after checking it still resolves to the same
-    /// role and name. `cancel` stops the click until its input is sent.
-    /// Returns where it clicked as a fraction of the screen showing that
-    /// point, when known (a menu item chosen by keyboard has no point).
+    /// exact-target route in the window under it; an element, after checking
+    /// it still resolves to the same role and name, is activated through
+    /// accessibility, or clicked by the pointer at its center as a point is
+    /// when Cua has no accessibility route for the click
+    /// ([`cua::ElementClick::Pointer`]). `cancel` stops the click until its
+    /// input is sent. Returns where it clicked as a fraction of the screen
+    /// showing that point, when known (a menu item chosen by keyboard has no
+    /// point).
     pub async fn click(&self, target: &ClickTarget, button: Button, double: bool, cancel: Option<&Cancel>) -> Result<Option<(f64, f64)>> {
         self.effect(cancel, async {
             self.after_typing().await;
@@ -619,8 +622,23 @@ impl Desktop {
                         return self.choose_menu_item(element, live.pid, cua::window_id(&live.address)?, &screens, cancel).await.map(|_| None);
                     }
                     let tool = element_tool(&element.actions, button, double)?;
-                    let center = self.cua.click_element(&element.selector, &element.role, &element.name, tool, cancel, &screens).await?;
-                    Ok(center.and_then(|(x, y)| screens.fraction(x, y)))
+                    let window = cua::window_id(&live.address)?;
+                    match self.cua.click_element(&element.selector, &element.role, &element.name, tool, live.geometry(), cancel, &screens).await? {
+                        cua::ElementClick::Sent(center) => Ok(center.and_then(|(x, y)| screens.fraction(x, y))),
+                        cua::ElementClick::Pointer { at: (gx, gy) } => {
+                            if !screens.show(gx, gy) {
+                                return Err(stale("Nothing was sent: no screen shows that element now.")
+                                    .with("execution_not_started", true)
+                                    .with("next", "Scroll it into view, observe again and click it."));
+                            }
+                            let (lx, ly) = (gx - live.at[0] as f64, gy - live.at[1] as f64);
+                            self.point_from_cursor(&live).await;
+                            self.cua.pace(gx, gy, &screens).await;
+                            cua::unless_cancelled(cancel)?;
+                            self.cua.click_at(live.pid, window, lx, ly, button.name(), double, cancel).await?;
+                            Ok(screens.fraction(gx, gy))
+                        }
+                    }
                 }
             }
         })
@@ -746,17 +764,27 @@ impl Desktop {
         .await
     }
 
-    /// A key Cua refused because something holds the keyboard. When that
-    /// is the window's own open menu, Escape goes to the menu through
-    /// Hyprland, as a person's would, and closes it (one level); a shortcut
-    /// (a chord with a modifier) closes every level that way first and then
-    /// goes to the window. Any other key would be meant for the menu, and
-    /// every key while something else holds the keyboard (another app's
-    /// popup, a drag), stays refused, and nothing is sent.
+    /// A key Cua refused because something holds the keyboard. Cua's plugin
+    /// lets keys reach the window's own popups and menus, but one built
+    /// before ibara 0.1.0-18 refused them too, and a loaded plugin stays
+    /// until the next sign-in. When the window's own menu is open, Escape
+    /// goes to the menu through Hyprland, as a person's would, and closes it
+    /// (one level); a shortcut (a chord with a modifier) closes every level
+    /// that way first and then goes to the window. Any other key would be
+    /// meant for the menu and is refused, saying Escape closes it. Every key
+    /// while something else holds the keyboard (another app's popup, a
+    /// drag) stays refused, and nothing is sent.
     async fn key_past_menu(&self, surface: &SurfaceId, pid: i64, window: u64, keys: &[String], refused: IbaraError, cancel: Option<&Cancel>) -> Result<()> {
         let escape = matches!(keys, [only] if only == "Escape");
         if !escape && keys.len() == 1 {
-            return Err(refused);
+            return Err(match self.cua.open_menus(pid, window).await {
+                Ok(open) if open > 0 => IbaraError {
+                    message: "This window's own menu is open and holds the keyboard, so the key was not sent: it would go to the menu. Escape closes the menu.".into(),
+                    ..refused
+                }
+                .with("next", "Press Escape (kind key) to close the menu, then send the key again; or left-click the menu's item by its id from computer_observe."),
+                _ => refused,
+            });
         }
         let mut open = self.cua.open_menus(pid, window).await?;
         if open == 0 {
@@ -1221,9 +1249,10 @@ async fn video_display(hypr: &Hyprland, named: Option<&str>) -> Result<String> {
         .ok_or_else(|| IbaraError::new("CAPABILITY_UNAVAILABLE", "Named display unavailable.", true).with("reason", "no_display"))
 }
 
-/// Cua's accessibility action for a click on an element: `click` activates the
-/// element's first action, `double_click` presses twice, and a right click
-/// needs a menu action.
+/// Cua's tool for a click on an element: `click` activates the element's
+/// first action through accessibility; a double or right click is the
+/// pointer's ([`cua::Cua::click_element`]), and a right click is offered only
+/// on an element with a menu action.
 fn element_tool(actions: &[String], button: Button, double: bool) -> Result<&'static str> {
     match (button, double) {
         (Button::Right, _) if actions.iter().any(|a| a.to_lowercase().contains("menu")) => Ok("right_click"),

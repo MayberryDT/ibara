@@ -11,12 +11,22 @@ pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    /// Changes nothing anywhere, so a harness may run it without asking.
+    pub read_only: bool,
 }
+
+/// The tools that only read: MCP's `readOnlyHint` lets harnesses such as
+/// Codex and Claude Code allow them without a prompt for each call.
+const READ_ONLY: &[&str] = &["computer_status", "computer_observe", "computer_wait", "computer_procedures"];
 
 impl ToolDef {
     /// The MCP `tools/list` entry.
     pub fn to_mcp(&self) -> Value {
-        json!({ "name": self.name, "description": self.description, "inputSchema": self.input_schema })
+        let mut tool = json!({ "name": self.name, "description": self.description, "inputSchema": self.input_schema });
+        if self.read_only {
+            tool["annotations"] = json!({ "readOnlyHint": true });
+        }
+        tool
     }
 }
 
@@ -139,7 +149,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     refer_repeats(t.name, name, prop, &mut seen);
                 }
             }
-            ToolDef { name: t.name, description: t.summary, input_schema: schema }
+            ToolDef { name: t.name, description: t.summary, input_schema: schema, read_only: READ_ONLY.contains(&t.name) }
         })
         .collect()
 }

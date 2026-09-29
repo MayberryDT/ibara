@@ -32,8 +32,8 @@ const REPLY_LINE_LIMIT: usize = 8 * 1024 * 1024;
 /// Collection sidecars are small JSON documents.
 const METADATA_LIMIT: u64 = 16384;
 
-const TRANSFER_USAGE: &str = "Usage: ibara-client [--directory-db FILE] --computer NAME fetch REF DEST | stat REF";
-const RENAME_USAGE: &str = "Usage: ibara-client [--directory-db FILE] --rename-computer NAME LABEL";
+const TRANSFER_USAGE: &str = "Usage: ibara client [--directory-db FILE] --computer NAME fetch REF DEST | stat REF";
+const RENAME_USAGE: &str = "Usage: ibara client [--directory-db FILE] --rename-computer NAME LABEL";
 
 // ---------------------------------------------------------------------------
 // The transfer-v1 line protocol.
@@ -655,7 +655,7 @@ fn run(raw: Vec<String>) -> Result<Option<String>> {
     }
     if argv.first().map(String::as_str) == Some("--import-legacy") {
         if computer.is_some() || argv.len() != 2 || !Path::new(&argv[1]).is_absolute() {
-            return Err(fail("Usage: ibara-client [--directory-db FILE] --import-legacy ABSOLUTE_DESCRIPTOR_FILE"));
+            return Err(fail("Usage: ibara client [--directory-db FILE] --import-legacy ABSOLUTE_DESCRIPTOR_FILE"));
         }
         let stat = fs::symlink_metadata(&argv[1])?;
         if !stat.is_file() || stat.uid() != current_uid() || stat.mode() & 0o022 != 0 || stat.size() > METADATA_LIMIT {
@@ -667,7 +667,7 @@ fn run(raw: Vec<String>) -> Result<Option<String>> {
     }
     if argv.first().map(String::as_str) == Some("--list-computers") {
         if computer.is_some() || argv.len() != 1 {
-            return Err(fail("Usage: ibara-client [--directory-db FILE] --list-computers"));
+            return Err(fail("Usage: ibara client [--directory-db FILE] --list-computers"));
         }
         let directory = open_directory(database.as_deref())?;
         let rows: Vec<Value> = directory.list_computers()?.iter().map(|r| r.to_json()).collect();
@@ -685,7 +685,7 @@ fn run(raw: Vec<String>) -> Result<Option<String>> {
     let arg2_ok = argv.get(2).is_some_and(|a| !a.is_empty());
     if !["fetch", "upload", "stat"].contains(&mode) || !arg1_ok || (mode == "fetch" && !arg2_ok) {
         return Err(fail(
-            "Usage: ibara-client [--directory-db FILE] [--computer NAME] [--operator] fetch REF DEST | upload FILE [--staged-ref REF] | stat REF",
+            "Usage: ibara client [--directory-db FILE] [--computer NAME] [--operator] fetch REF DEST | upload FILE [--staged-ref REF] | stat REF",
         ));
     }
     if database.is_some() && computer.is_none() {

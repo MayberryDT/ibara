@@ -2,13 +2,17 @@
 //! (the other side is `server::pairing`).
 //!
 //! - `tailnet`: this computer and its Linux peers, each probed on the pairing
-//!   port, with the directory's pairing state.
+//!   port, with the directory's pairing state; `changed` marks an added
+//!   computer whose SSH host key is not the one pinned here (it was reinstalled).
 //! - `pair-start NODE [INVITE_CODE]`: create `~/.ssh/ibara_agent_ed25519` when missing, have
 //!   this computer's own ibara register the request (so it can vouch for it),
 //!   ask NODE with a request signed by that key, and follow it in the
 //!   background. Once NODE accepts, pin its SSH host key, write its verified
-//!   directory row and prove the selected route with a `session` call.
+//!   directory row and prove the selected route with a `session` call. A
+//!   computer added before that now answers as a new one (reinstalled) takes
+//!   over its old row.
 //! - `pair-status ID`, `pair-cancel ID`.
+//! - `remove-computer --computer NAME`: forget an added computer here.
 //! - `pair-requests`, `pair-answer ID accept|decline`: requests waiting for a
 //!   person on this computer, through its target daemon's pairing socket.
 //! - `invite-create LEVEL LASTS`, `invites`, `invite-revoke ID`: sharing this
@@ -17,8 +21,8 @@
 //! Requests this console started live in memory, like the target's.
 
 use super::envelope::{Fault, Handled};
-use super::{Console, Ctx};
-use crate::operator::directory::OperatorDirectory;
+use super::{Console, Ctx, validated_id};
+use crate::operator::directory::{ComputerRecord, OperatorDirectory};
 use crate::operator::{current_uid, home_dir, pattern};
 use crate::sshkey::{KeyLine, ed25519_line};
 use crate::tailnet::{self, CliError, Peer, Status};
@@ -27,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -127,40 +131,93 @@ pub async fn tailnet(ctx: &Ctx) -> Handled {
     if state != "running" {
         return Ok(ctx.ready(json!({"tailscale": tailscale, "computers": []})));
     }
-    let rows = OperatorDirectory::open(&ctx.console.database).and_then(|d| d.list_computers()).unwrap_or_default();
+    // Every verified computer here, with the host keys pinned for it.
+    let rows: Vec<(ComputerRecord, Vec<String>)> = OperatorDirectory::open(&ctx.console.database)
+        .and_then(|d| {
+            let listed = d.list_computers()?;
+            Ok(listed.iter().filter_map(|r| d.get_computer(&r.computer_id).ok().flatten()).filter(|r| r.trust_state == "verified").collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let pins = pinned_keys(&r.known_hosts_file_ref);
+            (r, pins)
+        })
+        .collect();
     let own = status.own.clone();
     let from = own.as_ref().and_then(Peer::address);
     let mut peers: Vec<&Peer> = status.peers.iter().filter(|p| p.os == "linux").collect();
     peers.sort_by(|a, b| a.node.cmp(&b.node));
     let listed: Vec<(&Peer, bool)> = own.iter().map(|o| (o, true)).chain(peers.into_iter().map(|p| (p, false))).collect();
-    // Probe every computer at once; each answers within the probe timeout.
+    // Probe every computer at once; each answers within the probe timeout. An
+    // added computer that answers also shows its SSH host key, so one that was
+    // reinstalled (a new key) can be told from one this console can reach.
     let probes: Vec<_> = listed
         .iter()
         .map(|(peer, is_self)| {
             let (peer, is_self) = ((*peer).clone(), *is_self);
-            tokio::spawn(async move { probe(&peer, is_self, from).await })
+            let port = rows.iter().find(|(r, _)| peer.named(&r.host)).map(|(r, _)| r.port);
+            tokio::spawn(async move {
+                let ibara = probe(&peer, is_self, from).await;
+                let key = match (ibara, port, peer.address()) {
+                    ("ready", Some(port), Some(address)) => host_key_at(address, port).await,
+                    _ => None,
+                };
+                (ibara, key)
+            })
         })
         .collect();
     let mut answers = Vec::with_capacity(probes.len());
     for probe in probes {
-        answers.push(probe.await.unwrap_or("unknown"));
+        answers.push(probe.await.unwrap_or(("unknown", None)));
     }
     let computers: Vec<Value> = listed
         .iter()
         .zip(answers)
-        .map(|((peer, is_self), ibara)| {
-            let row = rows.iter().find(|r| r.trust_state == "verified" && peer.named(&r.host));
+        .map(|((peer, is_self), (ibara, key))| {
+            // Of the rows naming this computer, the one its key is pinned for.
+            let named: Vec<&(ComputerRecord, Vec<String>)> = rows.iter().filter(|(r, _)| peer.named(&r.host)).collect();
+            let pinned = |(_, pins): &(ComputerRecord, Vec<String>)| key.as_ref().is_some_and(|k| pins.contains(k));
+            let row = named.iter().copied().find(|r| pinned(r)).or(named.first().copied());
+            let changed = row.is_some_and(|r| key.is_some() && !pinned(r));
+            let row = row.map(|(r, _)| r);
             let same_owner = *is_self
                 || own.as_ref().is_some_and(|o| tailnet::same_owner((o.user_id, &o.tags), (peer.user_id, &peer.tags)));
             json!({
                 "node": peer.node, "dns_name": peer.dns_name, "ip": peer.address().map(|a| a.to_string()),
                 "online": *is_self || peer.online, "owner": status.owner(peer), "same_owner": same_owner, "is_self": is_self,
-                "ibara": ibara, "paired": row.is_some(), "computer_id": row.map(|r| r.computer_id.clone()),
+                "ibara": ibara, "paired": row.is_some(), "changed": changed, "computer_id": row.map(|r| r.computer_id.clone()),
                 "label": row.map(|r| r.label.clone()),
             })
         })
         .collect();
     Ok(ctx.ready(json!({"tailscale": tailscale, "computers": computers})))
+}
+
+/// The Ed25519 host key `address` shows on `port`, if it answers in time.
+async fn host_key_at(address: IpAddr, port: i64) -> Option<String> {
+    let scan = tokio::process::Command::new("ssh-keyscan")
+        .args(["-T", "2", "-t", "ed25519", "-p", &port.to_string(), &address.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(3), scan).await.ok()?.ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [_, "ssh-ed25519", blob, ..] => Some(blob.to_string()),
+        _ => None,
+    })
+}
+
+/// The Ed25519 host keys pinned in a row's known-hosts file.
+fn pinned_keys(known_hosts_ref: &str) -> Vec<String> {
+    let text = known_hosts_ref.strip_prefix("file:").and_then(|path| std::fs::read_to_string(path).ok()).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+            [_, "ssh-ed25519", blob, ..] => Some(blob.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `ready` when ibara answers on the pairing port, `not_installed` when the
@@ -416,19 +473,32 @@ async fn follow(console: Arc<Console>, id: String) {
     }
 }
 
-/// Pin the other computer's SSH host key, write its verified directory row
-/// and prove the route answers. Returns the computer id and its name here.
-/// Whether a directory row's host (an address, or a Tailscale name in rows from
-/// before tailnet pairing) is the computer at `address`.
-async fn answered_by(row_host: &str, address: IpAddr) -> bool {
+/// Whether a directory row's host (an address, or the computer's Tailscale
+/// name) is the computer at `address`, which Tailscale calls `node`.
+fn answered_by(row_host: &str, address: IpAddr, node: Option<&str>) -> bool {
     if row_host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical()) == Some(address.to_canonical()) {
         return true;
     }
-    let Ok(who) = tailnet::whois(address).await else { return false };
     let first = row_host.split('.').next().unwrap_or("").to_ascii_lowercase();
-    !first.is_empty() && first == who.node.to_ascii_lowercase()
+    node.is_some_and(|node| !first.is_empty() && first == node.to_ascii_lowercase())
 }
 
+/// What to reach the computer at `address` by: its Tailscale name when this
+/// computer resolves that name to that address (MagicDNS), else the address.
+async fn route_host(address: IpAddr, node: Option<&str>) -> String {
+    if let Some(node) = node.filter(|n| pattern::node(n)) {
+        let resolved = tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host((node, 0))).await;
+        if let Ok(Ok(mut found)) = resolved
+            && found.any(|a| a.ip().to_canonical() == address.to_canonical())
+        {
+            return node.to_string();
+        }
+    }
+    address.to_string()
+}
+
+/// Pin the other computer's SSH host key, write its verified directory row
+/// and prove the route answers. Returns the computer id and its name here.
 async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(String, String), String> {
     let text = |key: &str| route.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     let (principal, endpoint, label) = (text("principal"), text("endpoint_id"), text("label"));
@@ -441,29 +511,43 @@ async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(
     if !pattern::principal(&principal) || !pattern::endpoint_id(&endpoint) || label.trim().is_empty() {
         return Err("The other computer's answer was incomplete. Try again.".into());
     }
+    let node = tailnet::whois(host).await.ok().map(|w| w.node);
+    let node = node.as_deref();
     let unwritable = |e: String| format!("This computer could not save the new computer: {e}");
-    let computer_id = {
+    // The row this computer gets, and the name it keeps when it takes over a row.
+    let (computer_id, kept_label) = {
         let rows = OperatorDirectory::open(&console.database).and_then(|d| d.list_computers()).map_err(|e| unwritable(e.message))?;
-        match rows.into_iter().find(|r| r.endpoint_id == endpoint && r.trust_state == "verified") {
+        let mut verified = rows.iter().filter(|r| r.trust_state == "verified");
+        match verified.clone().find(|r| r.endpoint_id == endpoint) {
             // A computer already here keeps its row only when that row points at the
             // computer that answered: an answer naming another computer's endpoint
             // must not repoint it.
-            Some(row) if answered_by(&row.host, host).await => row.computer_id,
+            Some(row) if answered_by(&row.host, host, node) => (row.computer_id.clone(), None),
             Some(_) => return Err("That computer answered as another computer already added here. Nothing was changed.".into()),
-            None => format!("computer_{}", Sha256::digest(endpoint.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()),
+            // Added here before and now answering as a new computer: it was
+            // reinstalled. Having passed the same checks as a first add, it
+            // takes over its old row and the name it has here, so the fleet
+            // keeps one card, under one name, for it.
+            None => match verified.find(|r| answered_by(&r.host, host, node)) {
+                Some(row) => (row.computer_id.clone(), Some(row.label.clone())),
+                None => (format!("computer_{}", Sha256::digest(endpoint.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()), None),
+            },
         }
     };
     // A name another computer here already has would make two cards read the
     // same: add its Tailscale name, which it cannot choose itself.
     let label = label.trim();
     let taken = OperatorDirectory::open(&console.database).and_then(|d| d.label_taken(&computer_id, label)).unwrap_or(false);
-    let label = if taken {
-        let node = tailnet::whois(host).await.map(|w| w.node).unwrap_or_else(|_| host.to_string());
+    let label = if let Some(kept) = kept_label {
+        kept
+    } else if taken {
+        let node = node.map(str::to_string).unwrap_or_else(|| host.to_string());
         let room = crate::operator::directory::LABEL_LIMIT.saturating_sub(node.encode_utf16().count() + 3);
         format!("{} ({node})", crate::operator::js::slice_units(label, room).trim_end())
     } else {
         label.to_string()
     };
+    let route_host = route_host(host, node).await;
     let known_hosts = pin_host(&computer_id, &endpoint, &host_key).map_err(|e| unwritable(e.to_string()))?;
     let identity = operator_key_path();
     let mut directory = OperatorDirectory::open(&console.database).map_err(|e| unwritable(e.message))?;
@@ -474,7 +558,7 @@ async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(
         ("endpoint_id", json!(endpoint)),
         ("label", json!(label)),
         ("transport", json!("ssh")),
-        ("host", json!(host.to_string())),
+        ("host", json!(route_host)),
         ("user", json!(principal)),
         ("port", json!(port)),
         ("identity_file_ref", json!(format!("file:{}", identity.display()))),
@@ -487,7 +571,7 @@ async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(
     let expected = current.as_ref().map(|c| c.binding_revision).unwrap_or(0);
     let changed = current.as_ref().is_none_or(|c| {
         c.endpoint_id != endpoint
-            || c.host != host.to_string()
+            || c.host != route_host
             || c.user != principal
             || c.port != port as i64
             || c.identity_file_ref != format!("file:{}", identity.display())
@@ -496,6 +580,15 @@ async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(
     record.insert("binding_revision".into(), json!(if current.is_some() { expected + i64::from(changed) } else { 1 }));
     let stored = directory.register_verified_computer(&Value::Object(record), &endpoint, expected).map_err(|e| unwritable(e.message))?;
     directory.close();
+    if let Some(previous) = &current {
+        if previous.endpoint_id != endpoint {
+            // Nothing this console kept for the computer it was applies to it now.
+            console.forget_computer(&computer_id);
+        }
+        if previous.known_hosts_file_ref != stored.known_hosts_file_ref {
+            unpin_host(&console.database, &previous.known_hosts_file_ref);
+        }
+    }
     // The other computer projects the new account and opens its socket within
     // seconds; a route that never answers is not kept as a new computer.
     let deadline = tokio::time::Instant::now() + VERIFY_FOR;
@@ -516,9 +609,14 @@ async fn finish(console: &Arc<Console>, host: IpAddr, route: &Value) -> Result<(
     }
 }
 
+/// Where this console pins the host keys of the computers it adds.
+fn known_hosts_dir() -> PathBuf {
+    crate::operator::directory::default_operator_directory_path().with_file_name("known-hosts")
+}
+
 /// `~/.local/state/ibara/known-hosts/<computer>.known_hosts`: `<endpoint> ssh-ed25519 <blob>`, 0600.
 fn pin_host(computer_id: &str, endpoint: &str, host_key: &KeyLine) -> std::io::Result<PathBuf> {
-    let dir = crate::operator::directory::default_operator_directory_path().with_file_name("known-hosts");
+    let dir = known_hosts_dir();
     std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let file = dir.join(format!("{computer_id}.known_hosts"));
@@ -528,6 +626,40 @@ fn pin_host(computer_id: &str, endpoint: &str, host_key: &KeyLine) -> std::io::R
     std::io::Write::write_all(&mut out, format!("{endpoint} ssh-ed25519 {}\n", host_key.blob).as_bytes())?;
     std::fs::rename(&temp, &file)?;
     Ok(file)
+}
+
+/// Delete a host key pin this console wrote once no computer here uses it,
+/// never a file anywhere else.
+fn unpin_host(database: &Path, known_hosts_ref: &str) {
+    let Some(path) = known_hosts_ref.strip_prefix("file:").map(Path::new) else { return };
+    if path.parent() != Some(known_hosts_dir().as_path()) {
+        return;
+    }
+    let in_use = OperatorDirectory::open(database).and_then(|d| {
+        let listed = d.list_computers()?;
+        Ok(listed.iter().any(|r| d.get_computer(&r.computer_id).ok().flatten().is_some_and(|c| c.known_hosts_file_ref == known_hosts_ref)))
+    });
+    if matches!(in_use, Ok(false)) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `remove-computer --computer NAME`: take a computer out of this console's
+/// fleet: its directory row, its pinned host key and what this console holds
+/// for it. The computer itself is not asked; adding it again pairs it as a new
+/// computer, with the same checks as the first time.
+pub fn remove_computer(ctx: &Ctx) -> Handled {
+    let computer = match ctx.args.as_slice() {
+        [flag, id] if flag == "--computer" => validated_id(Some(id), "computer_id")?,
+        _ => return Err(Fault::plain("Usage: remove-computer --computer NAME")),
+    };
+    let removed = match OperatorDirectory::open(&ctx.console.database).and_then(|mut d| d.remove_computer(&computer)) {
+        Ok(removed) => removed,
+        Err(error) => return Ok(ctx.failure("REMOVE_REFUSED", &error.message, "failed", false)),
+    };
+    unpin_host(&ctx.console.database, &removed.known_hosts_file_ref);
+    ctx.console.forget_computer(&computer);
+    Ok(ctx.ready(json!({"removed": {"computer_id": removed.computer_id, "label": removed.label}})))
 }
 
 /// `pair-status ID`.

@@ -111,7 +111,7 @@ While ibara itself holds the computer back, `computer_begin` returns `BUSY` with
 
 | Action | Parameters |
 |---|---|
-| `launch` | `app`: `editor`, `terminal`, `browser` or `files` (the file manager, Nautilus). `text editor`, `mousepad`, `shell`, `chrome`, `file manager` and `nautilus` work too |
+| `launch` | `app`: `editor`, `terminal`, `browser` or `files` (the file manager, Nautilus). `text editor`, `mousepad`, `shell`, `chrome`, `file manager` and `nautilus` work too. The editor keeps its own settings, apart from the person's Mousepad (so it never offers to restore a session): `gsettings` and `dconf` don't show them; check a setting in the editor itself |
 | `focus` | `surface` |
 | `click` | `target`: an element, or a point `{x, y, frame?}` in a picture's pixels (see below) |
 | `double_click`, `right_click` | `target` |

@@ -226,6 +226,16 @@ impl DesktopPort for LiveDesktop {
         })
     }
 
+    /// The extension reconnects 2 s after its port closes.
+    fn browser_reconnect(&self) -> LocalFuture<'_, bool> {
+        Box::pin(async move {
+            match &self.chrome {
+                Some(chrome) => chrome.reconnect(std::time::Duration::from_secs(5)).await,
+                None => false,
+            }
+        })
+    }
+
     fn outputs(&self) -> LocalFuture<'_, Result<Vec<super::ports::DisplayInfo>>> {
         Box::pin(async move {
             Ok(self

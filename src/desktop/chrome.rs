@@ -249,6 +249,33 @@ impl ChromeBridge {
             .unwrap_or_default())
     }
 
+    /// Drop the page reader's connection so it connects afresh, and wait
+    /// (≤`within`) until it has: its host exits when the socket closes, and
+    /// the extension reconnects 2 s after its port goes. Nothing is dropped
+    /// while a request is in flight or an effect is unsettled. True once
+    /// connected again.
+    pub async fn reconnect(&self, within: Duration) -> bool {
+        {
+            let mut state = lock(&self.state);
+            state.expire();
+            if state.pending.is_some() || state.unsettled {
+                return false;
+            }
+            // Dropping the only sender ends the writer, which closes the
+            // socket's write half; the host sees the end and exits.
+            state.peer = None;
+            state.ready = false;
+        }
+        let end = Instant::now() + within;
+        while Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if self.connected() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Wait (≤6.5 s) for an in-flight request; `CONTROL_UNSETTLED` if one is
     /// still pending or an effect was never acknowledged.
     pub async fn cancel(&self) -> Result<()> {
@@ -351,17 +378,21 @@ async fn serve_peer(state: Arc<Mutex<State>>, stream: UnixStream, generation: u6
             settle_reply(&state, &message);
         }
     }
+    // A peer dropped by `reconnect` is no longer current; a request in
+    // flight then belongs to its successor.
     let pending = {
         let mut s = lock(&state);
-        if s.is_current(generation) {
+        if !s.is_current(generation) {
+            None
+        } else {
             s.peer = None;
             s.ready = false;
+            let pending = s.pending.take();
+            if pending.as_ref().is_some_and(|p| p.effect) {
+                s.unsettled = true;
+            }
+            pending
         }
-        let pending = s.pending.take();
-        if pending.as_ref().is_some_and(|p| p.effect) {
-            s.unsettled = true;
-        }
-        pending
     };
     if let Some(pending) = pending {
         let error = if pending.effect {
@@ -581,6 +612,45 @@ mod tests {
         // Probing a live socket refuses a second listener (the probe itself
         // briefly occupies the single peer slot, so it runs last).
         assert!(ChromeBridge::listen(&path).await.is_err());
+        bridge.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_closes_the_reader_and_waits_for_it_to_come_back() {
+        let dir = std::env::temp_dir().join(crate::ids::id("ibara-chrome-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrome.sock");
+        let bridge = ChromeBridge::listen(&path).await.unwrap();
+        let mut first = UnixStream::connect(&path).await.unwrap();
+        write_json(&mut first, json!({"hello": 1})).await;
+        while !bridge.connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let generation = bridge.generation();
+        // The page reader, as the extension does: once its host is closed,
+        // connect again and say hello.
+        let path_again = path.clone();
+        let reader = async move {
+            assert_eq!(read_frame(&mut first).await.unwrap(), None, "the old connection is closed");
+            let mut second = UnixStream::connect(&path_again).await.unwrap();
+            write_json(&mut second, json!({"hello": 1})).await;
+            second
+        };
+        let (back, mut second) = tokio::join!(bridge.reconnect(Duration::from_secs(3)), reader);
+        assert!(back, "connected again");
+        assert_eq!(bridge.generation(), generation + 1);
+        let call = bridge.call("tabs", json!({}), false);
+        let ext_side = async {
+            let id = read_json(&mut second).await["id"].clone();
+            write_json(&mut second, json!({"id": id, "result": {"tabs": []}})).await;
+        };
+        let (result, ()) = tokio::join!(call, ext_side);
+        assert_eq!(result.unwrap()["tabs"], json!([]));
+        // Nobody comes back: false within the bound, still disconnected.
+        assert!(!bridge.reconnect(Duration::from_millis(300)).await);
+        assert!(!bridge.connected());
+        drop(second);
         bridge.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

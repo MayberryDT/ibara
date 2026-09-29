@@ -68,6 +68,11 @@ struct FakeDesktop {
     extension: RefCell<HashMap<String, Value>>,
     /// The extension operations asked for, in order.
     extension_ops: RefCell<Vec<String>>,
+    /// The next this many page reader requests (tabs included) are refused
+    /// before dispatch, as Chrome refuses one it cannot take.
+    reader_refusals: Cell<u32>,
+    /// Times ibara reconnected the page reader.
+    reader_reconnects: Cell<u32>,
     /// ibara's page reader is installed for a browser (policy and native
     /// host), whether or not a browser is open.
     reader_installed: Cell<bool>,
@@ -135,6 +140,16 @@ impl FakeDesktop {
     }
     fn acts(&self) -> usize {
         self.acts.borrow().len()
+    }
+    /// Take one of the refusals `reader_refusals` holds.
+    fn reader_refused(&self) -> crate::error::Result<()> {
+        match self.reader_refusals.get() {
+            0 => Ok(()),
+            n => {
+                self.reader_refusals.set(n - 1);
+                Err(IbaraError::new("STALE_TARGET", "Chrome refused dispatch; observe again.", true).with("execution_not_started", true))
+            }
+        }
     }
 }
 
@@ -235,6 +250,7 @@ impl DesktopPort for FakeDesktop {
     /// observation gives.
     fn tabs(&self) -> LocalFuture<'_, crate::error::Result<Vec<Tab>>> {
         Box::pin(async move {
+            self.reader_refused()?;
             let observed = self.extension.borrow().get("observe").cloned().unwrap_or(Value::Null);
             let url = observed["url"].as_str().unwrap_or("https://shop.example/").to_string();
             let title = observed["title"].as_str().unwrap_or("Shop").to_string();
@@ -248,6 +264,7 @@ impl DesktopPort for FakeDesktop {
         Box::pin(async move {
             self.extension_ops.borrow_mut().push(op.to_string());
             self.hold(op).await;
+            self.reader_refused()?;
             let field = self.field.borrow();
             if op == "field" && field.present {
                 // Like the page reader: whether it holds the text, never its value.
@@ -261,6 +278,12 @@ impl DesktopPort for FakeDesktop {
     }
     fn browser_cancel(&self) -> LocalFuture<'_, crate::error::Result<()>> {
         Box::pin(async move { Ok(()) })
+    }
+    fn browser_reconnect(&self) -> LocalFuture<'_, bool> {
+        Box::pin(async move {
+            self.reader_reconnects.set(self.reader_reconnects.get() + 1);
+            self.browser_connected()
+        })
     }
     fn outputs(&self) -> LocalFuture<'_, crate::error::Result<Vec<DisplayInfo>>> {
         Box::pin(async move { Ok(Vec::new()) })
@@ -2390,6 +2413,112 @@ fn an_assessment_of_an_automatic_check_is_ignored_and_the_finish_goes_through() 
         assert_eq!(notes.len(), 1, "{finish}");
         let note = notes[0].as_str().unwrap();
         assert!(note.contains("saved") && note.contains("missing") && !note.contains("reads_well"), "{note}");
+    });
+}
+
+async fn begin_checked(c: &Controller, request_id: &str, check: Value) -> String {
+    let checks = json!([{ "id": "c1", "description": "the check", "check": check }]);
+    let begun = call(c, "computer_begin", json!({ "goal": "Read the article", "request_id": request_id, "checks": checks })).await;
+    assert_eq!(begun["status"], "ok", "{begun}");
+    begun["result"]["task_ref"].as_str().unwrap().to_string()
+}
+
+async fn finish_with(c: &Controller, task: &str, request_id: &str, assessments: Value) -> Value {
+    let finish = call(c, "computer_finish", json!({ "task_ref": task, "request_id": request_id, "outcome": "complete", "summary": "done", "assessments": assessments })).await;
+    assert_eq!(finish["status"], "ok", "{finish}");
+    finish
+}
+
+fn only_check(finish: &Value) -> Value {
+    finish["result"]["checks"][0].clone()
+}
+
+/// Text deep in a web page is found through the page reader, which reads the
+/// whole page. Failure cases:
+/// 1. Only the browser's accessibility tree is read, which leaves the
+///    article out, so a finished task reads unmet.
+/// 2. A page the reader says lacks the text reads met, or unknown.
+#[test]
+fn text_present_in_a_browser_is_read_from_the_whole_page() {
+    run(async {
+        let rig = browser_rig();
+        let c = &rig.controller;
+        // Chromium's own tree: the toolbar, none of the article.
+        rig.desktop.page.replace(ElementPage {
+            available: true,
+            elements: Vec::new(),
+            text: "en.wikipedia.org/wiki/Ulm_Minster".into(),
+            ..Default::default()
+        });
+        rig.desktop.extension.borrow_mut().insert("check".into(), json!({ "found": true, "truncated": false }));
+        let task = begin_checked(c, "b1", json!({ "kind": "text_present", "text": "768 steps" })).await;
+        let finish = finish_with(c, &task, "f1", json!([])).await;
+        let check = only_check(&finish);
+        assert_eq!((&check["state"], &check["basis"]), (&json!("met"), &json!("automatic")), "{finish}");
+        assert!(check["detail"].as_str().unwrap().contains("on the page"), "{finish}");
+        assert_eq!(finish["result"]["complete"], true, "{finish}");
+
+        rig.desktop.extension.borrow_mut().insert("check".into(), json!({ "found": false, "truncated": false }));
+        let task = begin_checked(c, "b2", json!({ "kind": "text_present", "text": "768 steps" })).await;
+        let finish = finish_with(c, &task, "f2", json!([{ "check": "c1", "met": true, "reason": "I read it" }])).await;
+        let check = only_check(&finish);
+        assert_eq!((&check["state"], &check["basis"]), (&json!("unmet"), &json!("automatic")), "ibara's read stands: {finish}");
+        assert_eq!(finish["result"]["complete"], false, "{finish}");
+    });
+}
+
+/// A check ibara cannot read takes the agent's assessment. Failure cases:
+/// 1. A terminal without an accessibility tree leaves the check unknown
+///    whatever the agent says, so a finished task is never complete.
+/// 2. The assessment counts silently: the check still says automatic, or
+///    no note says why the agent's word counted.
+/// 3. With no assessment, the unread check reads met.
+#[test]
+fn a_check_ibara_cannot_read_takes_the_agents_assessment() {
+    run(async {
+        let rig = rig(false);
+        let c = &rig.controller;
+        rig.desktop.windows.replace(vec![win("0x2", 200, "foot", "~", true, false)]);
+        let task = begin_checked(c, "b1", json!({ "kind": "text_present", "text": "build ok" })).await;
+        let finish = finish_with(c, &task, "f1", json!([])).await;
+        assert_eq!(only_check(&finish)["state"], "unknown", "{finish}");
+        assert_eq!(finish["result"]["complete"], false, "{finish}");
+
+        let task = begin_checked(c, "b2", json!({ "kind": "text_present", "text": "build ok" })).await;
+        let finish = finish_with(c, &task, "f2", json!([{ "check": "c1", "met": true, "reason": "the terminal shows build ok" }])).await;
+        let check = only_check(&finish);
+        assert_eq!((&check["state"], &check["basis"]), (&json!("met"), &json!("your_assessment")), "{finish}");
+        let detail = check["detail"].as_str().unwrap();
+        assert!(detail.contains("no accessibility tree") && detail.contains("the terminal shows build ok"), "{detail}");
+        assert_eq!(finish["result"]["complete"], true, "{finish}");
+        let notes = finish["result"]["notes"].as_array().unwrap();
+        assert!(notes.len() == 1 && notes[0].as_str().unwrap().contains("could not read what 'c1' names"), "{finish}");
+    });
+}
+
+/// A url check the page reader refuses is asked again once after
+/// reconnecting it. Failure cases:
+/// 1. One refusal leaves the check unknown.
+/// 2. A reader that keeps refusing is asked forever, or the check reads
+///    unmet instead of unknown (and the agent's assessment is not taken).
+#[test]
+fn a_url_check_the_page_reader_refuses_is_asked_again_after_reconnecting_it() {
+    run(async {
+        let rig = browser_rig();
+        let c = &rig.controller;
+        let task = begin_checked(c, "b1", json!({ "kind": "url", "contains": "shop.example" })).await;
+        rig.desktop.reader_refusals.set(1);
+        let finish = finish_with(c, &task, "f1", json!([])).await;
+        assert_eq!(only_check(&finish)["state"], "met", "{finish}");
+        assert_eq!(rig.desktop.reader_reconnects.get(), 1);
+
+        let task = begin_checked(c, "b2", json!({ "kind": "url", "contains": "shop.example" })).await;
+        rig.desktop.reader_refusals.set(2);
+        let finish = finish_with(c, &task, "f2", json!([{ "check": "c1", "met": true, "reason": "the address bar shows shop.example" }])).await;
+        let check = only_check(&finish);
+        assert_eq!((&check["state"], &check["basis"]), (&json!("met"), &json!("your_assessment")), "{finish}");
+        assert!(check["detail"].as_str().unwrap().contains("refused dispatch"), "{finish}");
+        assert_eq!(rig.desktop.reader_reconnects.get(), 2, "once per finish");
     });
 }
 

@@ -109,7 +109,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "computer_finish",
         summary: "End the task: evaluates checks, records your assessments, closes what the task opened and still owns, releases control. complete only if all is verified.",
-        long: "outcome is complete, partial, cancelled or blocked. assessments [{check, met, reason}] cover checks whose basis is your_assessment and are attributed to you; an assessment of an automatic check is ignored and notes says so. Windows or tabs a person touched, or with unsaved changes, are left open and reported. After your control ended (a person took the computer, it expired), finish still records the outcome and summary without taking control back; windows then stay open while someone else has the computer.",
+        long: "outcome is complete, partial, cancelled or blocked. assessments [{check, met, reason}] cover checks whose basis is your_assessment and are attributed to you; an assessment of an automatic check counts only when ibara could not read it (no accessibility tree, page reader not answering), else it is ignored; notes says which. Windows or tabs a person touched, or with unsaved changes, are left open and reported. After your control ended (a person took the computer, it expired), finish still records the outcome and summary without taking control back; windows then stay open while someone else has the computer.",
         example: r#"{"task_ref": "task_3f2a", "request_id": "req-6", "outcome": "complete", "summary": "Saved dogfood.txt", "assessments": [{"check": "looks_right", "met": true, "reason": "text matches"}]}"#,
         schema: schema_of::<FinishInput>,
     },

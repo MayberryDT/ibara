@@ -30,10 +30,11 @@ Its fingerprint is `SHA256:5HvY/YcgalTemE4XlIg0Gx1yo70Y7OdGhmV0EHtZXys`.
 
 You need `curl`, `jq`, `sha256sum` and `ssh-keygen` (from `openssh`).
 
-1. Download the manifest, its signature and the packages into an empty folder. Replace `VERSION` with the release's version, for example `0.1.0-1`, or use `latest/download` for the newest release:
+1. Download the manifest, its signature, the packages and the source into an empty folder. Replace `VERSION` with the release's version, for example `0.1.0-17`, or use the `latest/download` address for the newest release:
 
    ```bash
    base=https://github.com/MayberryDT/ibara/releases/download/vVERSION
+   # or, for the newest release: base=https://github.com/MayberryDT/ibara/releases/latest/download
    curl -fsSL -O "$base/stable.json" -O "$base/stable.json.sig"
    for file in $(jq -r '.packages[].file, .source.file' stable.json); do curl -fsSLO "$base/$file"; done
    ```
@@ -62,20 +63,20 @@ You need `curl`, `jq`, `sha256sum` and `ssh-keygen` (from `openssh`).
    jq .source stable.json
    ```
 
-   `core` and `plugin` are commits of [MayberryDT/ibara](https://github.com/MayberryDT/ibara) and [MayberryDT/omarchy-ibara](https://github.com/MayberryDT/omarchy-ibara). `stream` and `view` are commits of the 2 forks, whose source is in the source tarball.
+   `core` and `plugin` are commits of [MayberryDT/ibara](https://github.com/MayberryDT/ibara) and [MayberryDT/omarchy-ibara](https://github.com/MayberryDT/omarchy-ibara). `stream` and `view` are commits of ibara's 2 forks, which have no public repositories: their source at those commits is the `ibara-stream/` and `ibara-view/` folders of the source tarball.
 
 The manifest does not list the source tarball's digest. It is built from the same commits as the packages, and you can compare its `core/` and `omarchy-ibara/` folders with those commits.
 
 ## What the installer checks
 
-The `install` script makes the same checks before it installs anything:
+The `install` script makes the same checks before it installs ibara. If `ssh-keygen` is missing, it first installs `openssh` with pacman, so that it can check the signature. Then:
 
 1. It downloads `stable.json` and `stable.json.sig` over HTTPS, following only HTTPS redirects.
 2. It checks the signature with the key written into it.
 3. It downloads the 3 packages the manifest names for that version, and checks each one's SHA-256.
 4. Only then does it install all 3 packages with one `pacman -U`, and run `ibara setup`.
 
-`ibara update` makes the same checks with the key built into the installed `ibara`. It refuses a release whose signature or digests do not match, and installs only a release newer than the one installed.
+`ibara update` makes the same checks, and also checks each package's size, with the key built into the installed `ibara`. It refuses a release whose signature, digests or sizes do not match, and installs only a release newer than the one installed.
 
 You can read the installer before running it:
 

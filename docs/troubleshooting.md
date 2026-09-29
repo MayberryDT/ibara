@@ -33,15 +33,15 @@ Start with the console. ibara repairs most problems by itself, and when it canno
 Add Computer lists the computers on your tailnet and asks each one whether ibara is ready there.
 
 - Not in the list: the computer is not on your tailnet, or Tailscale is off there. Run `tailscale status` on both.
-- Needs ibara: install ibara on that computer. Add Computer shows the install command.
-- Offline or unknown: the computer is asleep or off, or its service is not answering. Check `agent-computer.service` there.
+- "ibara isn't installed there": install ibara on that computer. Add Computer shows the install command.
+- "Offline · Turn it on to add it" or "ibara didn't answer": the computer is asleep or off, or its service is not answering. Check `agent-computer.service` there.
 - Someone else's computer waits for a person to accept the 6-digit code on their screen. If nobody accepts it within 5 minutes, ask again.
 
 A computer with no screen, or one you reach only over SSH, can accept requests with `ibara join`.
 
 ## A computer shows as offline or not answering
 
-- Check that it is on and awake. The console's Wake works if the computer turned on wake-on-network before it slept, or if another computer on its network can send the wake signal.
+- Check that it is on and awake. The console's Wake works if the computer had Wake from the network on before it slept, and this computer or another of your computers on its network can send the wake signal.
 - Check Tailscale on both computers.
 - If the computer was reinstalled with `--delete-data`, its identity changed. Remove it from the fleet and add it again.
 

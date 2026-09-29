@@ -73,8 +73,8 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 
 ### `computer_begin({computer?, goal, checks?, deliver?, request_id})`
 **Inputs:**
-- `computer` is a name, a host or a `cmp_` id. It is resolved once and echoed back as an id. It may be left out when only one computer is reachable. Every ibara command that names a computer takes the same names, so the collector takes them too: `ibara-client --computer COMPUTER fetch ARTIFACT_REF NEW_LOCAL_PATH`, with COMPUTER as `computer_status` lists it (its name or `cmp_` id).
-- `checks` is a list of `{id, description, check?}`. `check` is a typed check (see below).
+- `computer` is a name, a host or a `cmp_` id. It is resolved once and echoed back as an id. It may be left out when only one computer is reachable. Every ibara command that names a computer takes the same names, so the collector takes them too: `ibara client --computer COMPUTER fetch ARTIFACT_REF NEW_LOCAL_PATH`, with COMPUTER as `computer_status` lists it (its name or `cmp_` id).
+- `checks` is a list of `{id, description, check?}`. `check` is a typed check (see below), such as `{kind: "file_exists", path: "note.txt"}`.
 - `deliver` is an optional `{host, path}` obligation. `host` and `path` are checked as a send's `to` is (see `computer_files`), so a delivery no send could make is refused here, and the delivery is the one a later send to the same computer and path makes, under whichever of the computer's names.
   It is verified when the sent file is collected to exactly that path (after any change a person makes to it): by the agent's collector, or by a person saving it in the console. A copy saved anywhere else does not count.
 
@@ -102,12 +102,12 @@ While ibara itself holds the computer back, `computer_begin` returns `BUSY` with
 
 **Result:** `{frame: {frame_ref, revision, captured_at, covered, cost_bytes, lines[], choices[], next_richer}}`. Each `lines[]` entry is about 60 bytes. `choices[]` is at most 20: `{choice_id, label, action, param?}`, where `param` names a parameter the agent must supply (for example `text`). `next_richer` names the next, richer view available, and `next_cursor` continues a paged element list.
 
-### `computer_act({task_ref, request_id, choice?, action?, expect?, effect?, steps?})`
-**One step:** a `choice` from the latest frame (with parameters if needed), or an explicit `action`, plus an optional `expect`. A typing or key choice sends only to the window it was offered for; if another window has the keyboard focus by then, the step is refused (`STALE_TARGET`, `execution_not_started: true`) and nothing is sent. An explicit `type` or `key` action goes to the window that has the focus when it runs, and typing stops between pieces if the focus moves.
+### `computer_act({task_ref, request_id, choice?, text?, action?, expect?, effect?, steps?})`
+**One step:** a `choice` from the latest frame (with `text` when the choice takes text), or an explicit `action`, plus an optional `expect`. A typing or key choice sends only to the window it was offered for; if another window has the keyboard focus by then, the step is refused (`STALE_TARGET`, `execution_not_started: true`) and nothing is sent. An explicit `type` or `key` action goes to the window that has the focus when it runs, and typing stops between pieces if the focus moves.
 
-**Several steps:** `steps` holds up to 8 `{choice | action, expect?}`. They are checked one at a time and stop at the first unmet expectation. The grant is checked for each step on its own.
+**Several steps:** `steps` holds up to 8 `{choice | action, text?, expect?, effect?}`. They are checked one at a time and stop at the first unmet expectation. The grant is checked for each step on its own.
 
-**Actions:**
+**Actions** are objects with a `kind` and its parameters, such as `{kind: "launch", app: "editor"}` or `{kind: "click", target: "e12"}`. Expectations and typed checks take the same form.
 
 | Action | Parameters |
 |---|---|
@@ -141,7 +141,7 @@ An expectation after a step looks for a change the step made. `window` is met by
 
 **Result:** `{steps: [{index, outcome: "done" | "unmet" | "unknown" | "not_run", effect, op_ref}], frame, attention?}`.
 
-`effect` (on the act or on a step) declares a stricter effect class, `send`, `spend` or `destructive`, so the step is held for approval under design §2.4. It can never loosen a class.
+`effect` (on the act or on a step) declares a stricter effect class, `send`, `spend` or `destructive`, so the step is held for approval when that class asks first. It can never loosen a class.
 
 ibara also classes some steps as `send` on its own, whatever `effect` says: a click on a page element the page reader marks `submits` (the submit button of a form that posts), Return typed or pressed where the page says it submits such a form (a field marked `enter_submits`, or the focused field or submit button), space on a focused submit button, and a click on a desktop button named Send or Submit. A form that only opens a page, such as a site search, does not count. ibara cannot see a send for a form inside a frame, a page that sends from its own script without a form, a coordinate click, or an app other than the browser; there only `effect` holds the step.
 
@@ -151,16 +151,16 @@ A held step stays held while its approval is open: the same step under a new `re
 - After a `launch`, ibara waits up to 10 seconds for the app's first window, also without an `expect`. That window is the task's, so finishing closes it. For an app that keeps running as the program ibara started (the editor, the terminal), only that program's windows count, so a window of the same app that a person opens meanwhile is not the task's.
 - "Unmet" means the expectation was not seen within the deadline. It does not mean the step failed.
 - Nothing is replayed after an unknown outcome.
-- A step that needs approval returns `status: "pending"` with an `att_` reference and a `next`, and does not run (design §2.4). See [Held for approval](#held-for-approval).
+- A step that needs approval returns `status: "pending"` with an `att_` reference and a `next`, and does not run. See [Held for approval](#held-for-approval).
 
 ### `browser_act({task_ref, request_id, action, expect?, effect?})`
-A semantic action in the signed-in Chrome, through the extension: `navigate`, `click`, `type`, `select`, `scroll`, `key` or `wait_for`. `expect` works as in `computer_act`.
+A semantic action in the signed-in Chrome, through the extension. `action` is one of `navigate` (`url`), `click` (`target`), `type` (`target?`, `text`), `select` (`target`, `value`), `scroll` (`target?`, `dx?`, `dy?`), `key` (`keys`) or `wait_for` (`target?`, `text?`, `within_ms?`), with `kind` naming it. `target` is a page element id such as `b3`, from observing `surface: "tab"` with `view: "elements"`. `expect` works as in `computer_act`.
 
-### `computer_exec({task_ref, request_id, command[], cwd?, timeout_ms?, background?})`
+### `computer_exec({task_ref, request_id, command[], cwd?, timeout_ms?, background?, effect?})`
 Runs a command, bounded, in the task's workspace or in `cwd`. `cwd` takes a path as `computer_files` does. Its effect class is `change` unless declared otherwise with `effect: "send" | "spend" | "destructive"`. A command held for approval replies as in [Held for approval](#held-for-approval) and stays held: the same command and `cwd` under a new `request_id` is refused while its approval is open, and asks again once it was answered, as for `computer_act`.
 
 ### `computer_wait({task_ref, for, deadline_ms})`
-**`for`:** `{op}`, `{attention}` or `{expect}` (any expectation above).
+**`for`:** `{op}`, `{attention}` or `{expect}` (any expectation above). `deadline_ms` is at most 600000 (10 minutes).
 
 Returns when the thing it waits for is met, or at the deadline with `status: "pending"`. It never repeats an effect.
 
@@ -181,7 +181,7 @@ Returns when the thing it waits for is met, or at the deadline with `status: "pe
 - **Publish:** needs only the path. ibara links the step that wrote the file when it recorded that step; otherwise no author is claimed.
 - **Send:** `to.host` is the computer the agent works from, where its collector runs: its name or host name in any case (the first part of a host name is enough), its `cmp_` or `computer_` id, its endpoint id, or the collector identity registered for it. Any other computer, a `to.path` that is not an absolute path in its plainest form (no `.` or `..` parts, no doubled slashes), or a `path` that is not a file is refused at once with `INVALID_ARGUMENT` and `execution_not_started: true`, before anyone is asked to approve it; a refused `to.host` names the computer a send can reach, with its ids. The reply's `to.host` is the name ibara records deliveries to that computer under.
 - **A send moves no bytes.** It publishes the file and records where it must go; the delivery stays `pending`. The bytes move when the agent's collector, on its own computer, runs the command the send's `next` gives, `ibara client --computer <cmp_ id of the computer the file is on> fetch <art_ ref> <path>`, or when a person saves the file there from the ibara console. Only then is the delivery verified. `computer_status` on the `art_` ref and on the task repeats that command for each delivery not yet verified, and a `delivered` check that is not met says it too.
-- **Held for approval:** `send`, and any `write` that overwrites, follow design §2.4 and reply as in [Held for approval](#held-for-approval). A send is checked before it is held.
+- **Held for approval:** `send`, and any `write` that overwrites, reply as in [Held for approval](#held-for-approval) when they ask first. A send is checked before it is held.
 
 ### Held for approval
 A step, command or file operation that needs a person's approval does not run. Its reply has `status: "pending"`, the `att_` reference in `attention`, and a `next` in both the JSON and the text form:

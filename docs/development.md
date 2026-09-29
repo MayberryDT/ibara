@@ -6,7 +6,8 @@ This page explains how to build ibara's core, run its tests, find your way aroun
 
 - Arch Linux or Omarchy on x86_64
 - Rust (the `rust` package) with the 2024 edition
-- `git`, `openssh`, `openssl` and `acl`, which the tests use
+- `git`, to clone and to package, and `openssh`, `openssl` and `acl`, which the tests use
+- `base-devel`, to build the package with `makepkg`
 
 To try a change on a real desktop you also need Omarchy with Hyprland, Tailscale and `cua-driver-bin`.
 
@@ -19,7 +20,9 @@ cargo test
 
 `cargo test` runs the unit tests and the end-to-end tests in `tests/`. The end-to-end tests start real `ibarad` daemons and consoles in temporary folders, with small stand-ins for `hyprctl`, `grim`, `cua-driver`, `ssh` and `tailscale`, so they need no desktop, no network and no root. Run them as an ordinary user: several tests check that files belong to the user running them, which root would pass by accident.
 
-CI runs the same `cargo test --locked` in an Arch Linux container on every pull request ([.github/workflows/ci.yml](../.github/workflows/ci.yml)).
+The tests expect Arch's system files: one relies on `/etc/shadow` having mode 0600, so on other distributions it fails. cargo stops at the first failing test program, so use `cargo test --no-fail-fast` to see every failure at once.
+
+CI runs the same `cargo test --locked` as an ordinary user in an `archlinux:base-devel` container on every pull request and every push to `main` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)).
 
 ## Where things are
 
@@ -39,9 +42,11 @@ CI runs the same `cargo test --locked` in an Arch Linux container on every pull 
 | `src/harness/` | `ibara harness`, which runs real agent tasks end to end |
 | `tests/` | End-to-end tests of the real binaries |
 | `chrome-extension/` | The browser page reader, plain files with no build step |
-| `packaging/` | The Arch package, systemd units, the installer, and the release and publish scripts |
+| `packaging/` | The Arch package, systemd units, helper programs in `ops/`, the installer, and the release and publish scripts |
 | `packaging/e2e/` | An installation test in a throwaway Arch container |
 | `vendor/cua-hyprland-plugin/` | Cua's Hyprland plugin with ibara's changes, built on each computer |
+| `skills/ibara/` | The ibara skill agents read, installed to `/usr/share/ibara/skills/ibara` |
+| `docs/` | These pages |
 
 ## Rules we follow
 
@@ -64,7 +69,7 @@ CI runs the same `cargo test --locked` in an Arch Linux container on every pull 
 
 1. Change the input type in `src/contract/tools.rs`. Use `#[serde(deny_unknown_fields)]` and give it a `Validate` implementation, even an empty one.
 2. Change its entry in `TOOLS` in `src/contract/schema.rs`: a short summary of when to use it, the long description and one example. A test parses every example.
-3. Add any new result type to `src/contract/envelope.rs`, and a short rendering of it to `render.rs`.
+3. Add any new result type to `src/contract/envelope.rs`, and a short rendering of it to `src/contract/render.rs`.
 4. Update [agent tools](agent-tools.md).
 5. Run `cargo test`. It checks that every schema is valid and that the whole tool list stays within 9 KiB.
 
@@ -81,13 +86,13 @@ IBARA_PLUGIN_DIR=$PWD/../../omarchy-ibara IBARA_PKGREL=1 makepkg --nodeps
 
 `ibara` depends on `ibara-stream` and `ibara-view` at exactly the same version and release number. So try a change on a computer that already runs a release: set `IBARA_PKGREL` to that release's number (the part after the dash in `pacman -Q ibara`), install the new package over it with `sudo pacman -U`, then run `ibara setup` again. `ibara update` later replaces it with the next real release.
 
-The end-to-end installation test in `packaging/e2e/` builds a clean Arch container, installs 2 releases from a local copy of GitHub's release layout and checks install, update, rollback and uninstall. Its scripts describe how to run it.
+The end-to-end installation test in `packaging/e2e/` builds a clean Arch container, installs 2 releases from a local copy of GitHub's release layout and checks install, update, rollback and uninstall. It needs an Arch host with `systemd-nspawn` and `sudo`; the header of `packaging/e2e/container.sh` describes how to run it.
 
 ## Making a release
 
 Releases are GitHub releases of this repository. Only maintainers with the release key can make one.
 
-1. Make sure core, the console plugin and both forks are committed and clean.
+1. Make sure core, the console plugin and both forks (`ibara-stream` and `ibara-view`, which have no public repositories; their source is in each release's source tarball) are committed and clean.
 2. Write the release notes: one plain sentence per line. The console shows them once after the update, under What's New.
 3. Run `packaging/publish.sh` from a checkout of this repository whose commit is already pushed:
 

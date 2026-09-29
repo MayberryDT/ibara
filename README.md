@@ -7,7 +7,9 @@ ibara gives your agents computer use across the Omarchy machines you own.
 [![CI](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml/badge.svg)](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)](LICENSE)
 
-**[Watch an agent at work (33 s)](docs/media/hero.mp4):** the console on one computer follows Claude Code on another as it fills in a sign-up form, waits for your approval before it sends it, then clicks through the next pages and finishes. Waiting is sped up.
+[![An agent filling in a sign-up form on another computer, followed live in the ibara console](docs/media/hero-preview.webp)](https://ibara.app/media/hero.mp4)
+
+**[Watch an agent at work (33 s)](https://ibara.app/media/hero.mp4):** the console on one computer follows Claude Code on another as it fills in a sign-up form, waits for your approval before it sends it, then clicks through the next pages and finishes. Waiting is sped up.
 
 You and your AI agents can use every computer you own from any other one.
 Each computer shows up as a live picture in a console on the others, where you can watch it, send it files and take control of it.
@@ -104,7 +106,7 @@ ibara gives people and agents real power over real computers, so we designed it 
 - Every computer and every agent has its own permissions: Watch, Files, Take Control, Agent Tasks and Administer. Each is Allowed, Ask First or Denied. A friend's invite never includes Administer, and you can change or remove any permission from the Access tab at any time.
 - Agents are named. A connected agent is `codex@your-laptop`, not an anonymous key, and its named cursor on the screen says the same.
 - Steps that matter ask first. By default, reading and ordinary changes are allowed, while sending, spending, deleting and access changes wait for a person to approve that exact step. An approval covers only that step, and it ends if control changes hands. You can turn off asking before sends, spends and deletes for agents from your own computers, for every computer, one computer or one agent; agents from anyone else's computer keep asking, and access changes always ask.
-- You can always take over. Moving your mouse stops the agent's input at once, and Take Control pauses every agent until you hand back. Handing back never restarts an agent by itself.
+- You can always take over. Moving your mouse stops the agent's input at once, and Take Control pauses every agent until you hand back. Hand Back lets agents work again unless you paused them yourself, and never restarts an agent's task by itself.
 - Releases are signed. The installer and `ibara update` check the release's signature against a key built into ibara, and every package's digest, before anything is installed.
 
 Approvals guard the effects ibara knows about or an agent declares. An agent that can run commands or use the desktop is not in a sandbox: give agent access only to computers where you would let that agent work. [Security and access](docs/security-and-access.md) has the details, and [SECURITY.md](SECURITY.md) says how to report a vulnerability.
@@ -180,7 +182,7 @@ Not yet. ibara relies on Omarchy's Hyprland setup, bar and commands, and we test
 
 ### How do I update or remove ibara
 
-`ibara update` installs the newest release, and `ibara update --check` only says whether there is one. `ibara rollback` goes back to the release before. `ibara uninstall` removes ibara and keeps this computer's identity for a later install, and `ibara uninstall --delete-data` removes everything. Ask each agent you connected to remove its server named `ibara`.
+`ibara update` installs the newest release, and `ibara update --check` only says whether there is one. `ibara rollback` goes back to the release before. `ibara uninstall` removes ibara and keeps this computer's identity for a later install, and `ibara uninstall --delete-data` removes everything. Ask each agent you connected to remove its `ibara` server, its `ibara` skill link and the ibara block in its instructions file.
 
 ### Something is not working
 

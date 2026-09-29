@@ -131,7 +131,7 @@ sequenceDiagram
   D->>S: revoke, wait until held keys are released, stop
 ```
 
-Each console has one viewer identity, made on the first Take Control. The other computer admits only that viewer, only with a fresh ticket. Closing the viewer keeps control and the pause, and Open Viewer starts it again. Hand Back ends the stream and never resumes an agent by itself.
+Each console has one viewer identity, made on the first Take Control. The other computer admits only that viewer, only with a fresh ticket. Closing the viewer keeps control and the pause, and Open Viewer starts it again. Hand Back ends the stream and lets agents work again, unless a person paused them or ibara is still settling earlier work; it never restarts an agent's task by itself.
 
 ## What is stored where
 

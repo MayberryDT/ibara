@@ -959,7 +959,9 @@ impl Controller {
     }
 
     /// Evaluate a task's checks and record the states on the task. Checks that
-    /// need the desktop are evaluated only when `live` (finish).
+    /// need the desktop are evaluated only when `live` (finish). An automatic
+    /// check ibara could not read (no accessibility tree, the page reader not
+    /// answering) takes the agent's assessment of it, when there is one.
     async fn evaluate_task_checks(&self, task: &mut TaskRecord, assessments: &[(String, bool, String)], live: bool) -> Result<Vec<CheckStatus>> {
         let mut out = Vec::new();
         let mut changed = false;
@@ -967,6 +969,8 @@ impl Controller {
             let id = criterion.get("id").and_then(Value::as_str).unwrap_or("").to_string();
             let check: Option<Check> = criterion.get("check").filter(|c| !c.is_null()).and_then(|c| serde_json::from_value(c.clone()).ok());
             let previous = criterion.get("state").and_then(Value::as_str).map(str::to_string);
+            let assessed = assessments.iter().find(|(c, ..)| *c == id);
+            let yours = |met: bool| if met { CheckState::Met } else { CheckState::Unmet };
             let (basis, state, detail) = match check {
                 Some(check) => {
                     let needs_desktop = matches!(check, Check::Url(_) | Check::Element(_) | Check::TextPresent(_));
@@ -974,11 +978,17 @@ impl Controller {
                         (CheckBasis::Automatic, parse_state(previous.as_deref()), None)
                     } else {
                         let e = self.evaluate_check(task, &check).await;
-                        (CheckBasis::Automatic, e.state, e.detail)
+                        match assessed {
+                            Some((_, met, reason)) if e.unread => {
+                                let why = e.detail.as_deref().unwrap_or("it could not be read");
+                                (CheckBasis::YourAssessment, yours(*met), Some(clip(&format!("ibara could not read it ({why}); your assessment: {reason}"), 400)))
+                            }
+                            _ => (CheckBasis::Automatic, e.state, e.detail),
+                        }
                     }
                 }
-                None => match assessments.iter().find(|(c, ..)| *c == id) {
-                    Some((_, met, reason)) => (CheckBasis::YourAssessment, if *met { CheckState::Met } else { CheckState::Unmet }, Some(clip(reason, 300))),
+                None => match assessed {
+                    Some((_, met, reason)) => (CheckBasis::YourAssessment, yours(*met), Some(clip(reason, 300))),
                     None => (CheckBasis::YourAssessment, parse_state(previous.as_deref()), None),
                 },
             };
@@ -2982,9 +2992,10 @@ impl Controller {
         if lease.is_some() {
             self.charge(&mut task, Charge::Control)?;
         }
-        // An assessment of a check ibara evaluates itself is ignored with a
-        // note: ibara's own result stands, and the finish goes through.
-        let mut ignored = Vec::new();
+        // An assessment of a check ibara evaluates itself counts only when
+        // ibara cannot read what it names; otherwise ibara's own result
+        // stands. Either way a note says so, and the finish goes through.
+        let mut automatic = Vec::new();
         let mut assessments: Vec<(String, bool, String)> = Vec::new();
         for (i, a) in input.assessments.iter().enumerate() {
             let criterion = task.success_criteria.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(a.check.as_str()));
@@ -3003,18 +3014,11 @@ impl Controller {
                     };
                     return Err(invalid(format!("assessments[{i}].check: this task has no check '{}'; {instead}", a.check)));
                 }
-                Some(c) if c.get("check").is_some_and(|x| !x.is_null()) => ignored.push(a.check.as_str()),
-                _ => assessments.push((a.check.to_string(), a.met, a.reason.clone())),
+                Some(c) if c.get("check").is_some_and(|x| !x.is_null()) => automatic.push(a.check.as_str()),
+                _ => {}
             }
+            assessments.push((a.check.to_string(), a.met, a.reason.clone()));
         }
-        let notes: Vec<String> = match ignored.as_slice() {
-            [] => Vec::new(),
-            [one] => vec![format!("ibara checks '{one}' itself, so your assessment of it was ignored; ibara's result is in checks.")],
-            [first @ .., last] => {
-                let first = first.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
-                vec![format!("ibara checks {first} and '{last}' itself, so your assessments of them were ignored; ibara's results are in checks.")]
-            }
-        };
         let op = match self.remember_for(principal, &task_ref, "computer_finish", &request_id, &fingerprint_source(args), "change")? {
             Remembered::Fresh(op) => op,
             Remembered::Replay(op) | Remembered::FailedBeginReplay { operation: op, .. } => {
@@ -3025,6 +3029,19 @@ impl Controller {
         receipt.insert("operation_ref".into(), json!(op.operation_ref));
         // Checks that read the screen need control; without it they keep their last state.
         let checks = self.evaluate_task_checks(&mut task, &assessments, lease.is_some()).await?;
+        let (taken, ignored): (Vec<&str>, Vec<&str>) =
+            automatic.into_iter().partition(|id| checks.iter().any(|c| c.id == **id && c.basis == CheckBasis::YourAssessment));
+        let mut notes = Vec::new();
+        match ignored.as_slice() {
+            [] => {}
+            [one] => notes.push(format!("ibara checks '{one}' itself, so your assessment of it was ignored; ibara's result is in checks.")),
+            many => notes.push(format!("ibara checks {} itself, so your assessments of them were ignored; ibara's results are in checks.", quoted_list(many))),
+        }
+        match taken.as_slice() {
+            [] => {}
+            [one] => notes.push(format!("ibara could not read what '{one}' names, so your assessment of it counts; checks say why.")),
+            many => notes.push(format!("ibara could not read what {} name, so your assessments of them count; checks say why.", quoted_list(many))),
+        }
         let unknown = self.unknown_operations(&task_ref);
         let keep = if lease.is_some() { None } else { self.computer_is_taken()? };
         let cleanup = self.cleanup(&task_ref, keep).await;
@@ -3326,9 +3343,17 @@ fn target_identity(resolved: &Resolved) -> Value {
 }
 
 /// A browser window class (Chromium or Google Chrome).
-fn is_browser(class: &str) -> bool {
+pub(super) fn is_browser(class: &str) -> bool {
     let class = class.to_ascii_lowercase();
     class.contains("chromium") || class.contains("google-chrome")
+}
+
+/// `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(ids: &[&str]) -> String {
+    match ids {
+        [first @ .., last] if !first.is_empty() => format!("{} and '{last}'", first.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")),
+        _ => ids.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", "),
+    }
 }
 
 /// `text` as runs of ASCII and runs of other characters, in order, each with

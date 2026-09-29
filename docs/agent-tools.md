@@ -207,7 +207,7 @@ A computer whose access rules make an agent ask before it begins, observes or re
 ### `computer_finish({task_ref, request_id, outcome, summary, assessments?})`
 **Inputs:**
 - `outcome` is `complete`, `partial`, `cancelled` or `blocked`.
-- `assessments` is `[{check, met, reason}]`, for checks whose basis is `your_assessment`. An assessment of an `automatic` check is ignored, ibara's own result stands, and `notes` says so. An assessment of a check the task does not have is refused, naming the checks to assess.
+- `assessments` is `[{check, met, reason}]`, for checks whose basis is `your_assessment`. An assessment of an `automatic` check counts only when ibara cannot read what the check names (see [Typed checks](#typed-checks)); otherwise it is ignored and ibara's own result stands. `notes` says which. An assessment of a check the task does not have is refused, naming the checks to assess.
 
 **What it does:**
 - Evaluates every automatic check against current state.
@@ -235,7 +235,11 @@ Reads approved procedures, which are deferred to later work. Until one exists, i
 
 The basis is `automatic` when the check has a type, and `your_assessment` otherwise. Assessments are attributed to the session identity automatically.
 
-A `url` check reads the browser's tabs through ibara's page reader, which is installed for Chromium and Google Chrome and connects when one of them opens. The browser does not need to be open at `computer_begin`: the check is read at finish. If no browser with the page reader is open then, the check is unmet and says so. `computer_begin` refuses a `url` check only when the page reader is not installed for either browser on that computer.
+A `url` check reads the browser's tabs through ibara's page reader, which is installed for Chromium and Google Chrome and connects when one of them opens. The browser does not need to be open at `computer_begin`: the check is read at finish. If no browser with the page reader is open then, the check is unmet and says so. If the page reader refuses or does not answer, ibara reconnects it and asks once more before the check is `unknown`. `computer_begin` refuses a `url` check only when the page reader is not installed for either browser on that computer.
+
+A `text_present` check looks in the focused window. When that is a browser window, the page reader reads the focused tab's page, up to its first 200,000 characters, which the browser's accessibility tree mostly leaves out; the window's own tree (the address bar, the tab strip) is searched as well. A longer page without the text in that part is `unknown`, not `unmet`. In any other window, every element of its accessibility tree is searched (a long value only as far as its first 400 characters). The text must match exactly, apart from runs of spaces and line breaks on a web page.
+
+A `url`, `element` or `text_present` check is `unknown` when ibara cannot read what it names: the window has no accessibility tree (a terminal such as foot; ibara does no OCR), or the page reader does not answer. Assess such a check at `computer_finish` like a `your_assessment` one: your assessment then decides it, its basis becomes `your_assessment` and its `detail` says why ibara could not read it. When ibara can read it, its `met` or `unmet` stands whatever you assess.
 
 ## What is left out on purpose
 

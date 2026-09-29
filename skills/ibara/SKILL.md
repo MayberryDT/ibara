@@ -24,7 +24,7 @@ Keep code edits, git, tests, APIs and public pages you can fetch where you are. 
 A task holds the computer: your person sees it in their console, and no other agent can use that computer until you finish. If `computer_begin` says the computer is in use by a person or another task, tell your person instead of waiting in a loop.
 
 1. **Prepare before you begin.** Have the URLs, text and your definition of done ready before `computer_begin`.
-2. **Begin with checks that prove the result.** Give `computer_begin` a `goal` and `checks`. Prefer typed checks (`file_exists`, `file_content`, `url`, `text_present`, `element`, `delivered`); ibara proves those itself. Checks without a type are yours to assess honestly at finish. The reply has your `task_ref` and the first frame.
+2. **Begin with checks that prove the result.** Give `computer_begin` a `goal` and `checks`. Prefer typed checks (`file_exists`, `file_content`, `url`, `text_present`, `element`, `delivered`); ibara proves those itself. Checks without a type are yours to assess honestly at finish, and so is a typed check ibara can't read: text in a terminal, which has no accessibility tree, is `unknown` until your assessment decides it. The reply has your `task_ref` and the first frame.
    - Every call that acts takes a `request_id`. Use a new one for each new request; reuse one only to resend that same request.
 3. **Act from the frame.**
    - Pick element refs (`e12`) and choices (`c3`) from the latest frame instead of coordinates.

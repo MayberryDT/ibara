@@ -164,6 +164,9 @@ pub trait DesktopPort {
     /// One extension request (`tabs`, `observe`, `click`, `check`).
     fn browser_call<'a>(&'a self, op: &'a str, args: Value, effect: bool) -> LocalFuture<'a, Result<Value>>;
     fn browser_cancel(&self) -> LocalFuture<'_, Result<()>>;
+    /// Close the page reader's connection and wait briefly for it to connect
+    /// afresh; true once it has.
+    fn browser_reconnect(&self) -> LocalFuture<'_, bool>;
     fn outputs(&self) -> LocalFuture<'_, Result<Vec<DisplayInfo>>>;
     /// `format` is `png` or `jpeg`.
     fn preview<'a>(&'a self, display_id: &'a str, quality: &'a str, format: &'a str) -> LocalFuture<'a, Result<Preview>>;

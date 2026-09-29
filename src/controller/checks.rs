@@ -1,6 +1,7 @@
 //! Typed checks (evaluated at begin, status and finish) and expectations
 //! (awaited after each step until met or deadline).
 
+use super::agent::is_browser;
 use super::ports::{Cancel, Win, WinKey};
 use super::situation::FrameState;
 use super::{Controller, clip, squash};
@@ -71,22 +72,28 @@ pub(crate) struct Awaited {
     pub waited_ms: u64,
 }
 
-/// A check's evaluation.
+/// A check's evaluation. `unread` marks an `unknown` because ibara could not
+/// read what the check names (no accessibility tree, the page reader not
+/// answering): the agent's own assessment then decides it.
 #[derive(Debug, Clone)]
 pub(crate) struct Evaluated {
     pub state: CheckState,
     pub detail: Option<String>,
+    pub unread: bool,
 }
 
 impl Evaluated {
     fn met(detail: impl Into<String>) -> Self {
-        Evaluated { state: CheckState::Met, detail: Some(detail.into()) }
+        Evaluated { state: CheckState::Met, detail: Some(detail.into()), unread: false }
     }
     fn unmet(detail: impl Into<String>) -> Self {
-        Evaluated { state: CheckState::Unmet, detail: Some(detail.into()) }
+        Evaluated { state: CheckState::Unmet, detail: Some(detail.into()), unread: false }
     }
     fn unknown(detail: impl Into<String>) -> Self {
-        Evaluated { state: CheckState::Unknown, detail: Some(detail.into()) }
+        Evaluated { state: CheckState::Unknown, detail: Some(detail.into()), unread: false }
+    }
+    fn unread(detail: impl Into<String>) -> Self {
+        Evaluated { state: CheckState::Unknown, detail: Some(detail.into()), unread: true }
     }
 }
 
@@ -353,20 +360,20 @@ impl Controller {
             Check::Url(c) if !self.desktop.browser_connected() => {
                 Evaluated::unmet(format!("no browser with ibara's page reader was open, so no tab's address contains {}", c.contains))
             }
-            Check::Url(c) => match self.url_state(&c.contains).await {
+            Check::Url(c) => match self.url_state(&c.contains, true).await {
                 Ok(true) => Evaluated::met(format!("a tab's address contains {}", c.contains)),
                 Ok(false) => Evaluated::unmet(format!("no tab's address contains {}", c.contains)),
-                Err(e) => Evaluated::unknown(e.message),
+                Err(e) => Evaluated::unread(e.message),
             },
             Check::Element(c) => match self.element_state(&c.query, c.state.as_deref(), c.value.as_deref(), None).await {
                 Ok(true) => Evaluated::met(format!("element '{}' matches", squash(&c.query, 40))),
                 Ok(false) => Evaluated::unmet(format!("no element '{}' matches", squash(&c.query, 40))),
-                Err(e) => Evaluated::unknown(e.message),
+                Err(e) => Evaluated::unread(e.message),
             },
-            Check::TextPresent(c) => match self.text_state(&c.text, None, None).await {
-                Ok(true) => Evaluated::met("the text is on screen"),
-                Ok(false) => Evaluated::unmet("the text is not in the focused window"),
-                Err(e) => Evaluated::unknown(e.message),
+            Check::TextPresent(c) => match self.text_state(&c.text, None, None, true).await {
+                Ok((true, place)) => Evaluated::met(format!("the text is {place}")),
+                Ok((false, place)) => Evaluated::unmet(format!("the text is not {place}")),
+                Err(e) => Evaluated::unread(e.message),
             },
             Check::Delivered(d) => self.delivered_state(task, d),
         }
@@ -427,11 +434,21 @@ impl Controller {
         )
     }
 
-    async fn url_state(&self, contains: &str) -> Result<bool> {
+    /// `settle`: a read the page reader refused or did not answer is asked
+    /// once more after reconnecting it (a check at finish, read once; an
+    /// expectation polls instead).
+    async fn url_state(&self, contains: &str, settle: bool) -> Result<bool> {
         if !self.desktop.browser_connected() {
             return Err(unavailable("The Chrome extension is not connected."));
         }
-        Ok(self.desktop.tabs().await?.iter().any(|t| t.url.contains(contains)))
+        let tabs = match self.desktop.tabs().await {
+            Err(e) if settle && e.retry_safe => {
+                self.desktop.browser_reconnect().await;
+                self.desktop.tabs().await?
+            }
+            tabs => tabs?,
+        };
+        Ok(tabs.iter().any(|t| t.url.contains(contains)))
     }
 
     async fn focused_or(&self, surface: Option<&WinKey>) -> Result<Option<WinKey>> {
@@ -457,17 +474,80 @@ impl Controller {
         }))
     }
 
-    async fn text_state(&self, text: &str, surface: Option<&WinKey>, frame: Option<&FrameState>) -> Result<bool> {
+    /// Whether `text` is shown in `surface`, else the focused window, and
+    /// where ibara looked. In a browser window the page reader reads the
+    /// focused tab's whole page, which the browser's accessibility tree
+    /// mostly leaves out; the window's tree (the address bar, the tab strip)
+    /// is searched as well. `settle` as for [`Self::url_state`].
+    async fn text_state(&self, text: &str, surface: Option<&WinKey>, frame: Option<&FrameState>, settle: bool) -> Result<(bool, &'static str)> {
+        const PAGE: &str = "on the page in the focused tab";
+        const WINDOW: &str = "in the focused window";
         let _ = frame;
         let Some(key) = self.focused_or(surface).await? else {
-            return Ok(false);
+            return Ok((false, WINDOW));
         };
-        let page = self.desktop.elements(&key, None, 60, None).await?;
-        if !page.available {
-            return Err(unavailable("The window exposes no accessibility tree; ibara does no OCR."));
+        let page = if is_browser(&key.class) && self.desktop.browser_connected() {
+            match self.page_has_text(text).await {
+                Err(e) if settle && e.retry_safe => {
+                    self.desktop.browser_reconnect().await;
+                    self.page_has_text(text).await
+                }
+                read => read,
+            }
+        } else {
+            Ok(None)
+        };
+        if let Ok(Some(true)) = page {
+            return Ok((true, PAGE));
         }
-        Ok(page.text.contains(text)
-            || page.elements.iter().any(|e| e.name.contains(text) || e.value.as_deref().is_some_and(|v| v.contains(text))))
+        match (self.tree_has_text(&key, text).await, page) {
+            (Ok(true), _) => Ok((true, WINDOW)),
+            // The browser's tree has little of the page: without the page
+            // reader's answer, not finding it there says nothing.
+            (_, Err(e)) => Err(e),
+            (_, Ok(Some(_))) => Ok((false, PAGE)),
+            (Ok(false), Ok(None)) => Ok((false, WINDOW)),
+            (Err(e), Ok(None)) => Err(e),
+        }
+    }
+
+    /// The page reader's answer for the focused tab: `None` when no web page
+    /// has the focus (none is focused, it is not a web page, or the tab
+    /// changed as it read).
+    async fn page_has_text(&self, text: &str) -> Result<Option<bool>> {
+        let Some(tab) = self.desktop.tabs().await?.into_iter().find(|t| t.focused) else {
+            return Ok(None);
+        };
+        let data = self.desktop.browser_call("check", serde_json::json!({ "tabId": tab.id, "text": text }), false).await?;
+        if data.get("refused").and_then(Value::as_bool) == Some(true) {
+            return Ok(None);
+        }
+        match (data.get("found").and_then(Value::as_bool), data.get("truncated").and_then(Value::as_bool)) {
+            (Some(true), _) => Ok(Some(true)),
+            (Some(false), Some(true)) => Err(unavailable("The page is longer than the page reader reads, and the part it read does not have the text.")),
+            (Some(false), _) => Ok(Some(false)),
+            (None, _) => Err(unavailable("The page reader gave no answer.")),
+        }
+    }
+
+    /// Every element of `key`'s accessibility tree whose name or value holds
+    /// `text`, and its visible text; the tree's own clipping of long values
+    /// still applies.
+    async fn tree_has_text(&self, key: &WinKey, text: &str) -> Result<bool> {
+        let mut cursor = None;
+        loop {
+            let page = self.desktop.elements(key, Some(text), crate::desktop::atspi::MAX_LIMIT, cursor).await?;
+            if !page.available {
+                return Err(unavailable("The window exposes no accessibility tree; ibara does no OCR."));
+            }
+            if page.text.contains(text) || page.elements.iter().any(|e| e.name.contains(text) || e.value.as_deref().is_some_and(|v| v.contains(text))) {
+                return Ok(true);
+            }
+            match page.next_cursor {
+                Some(next) if cursor.is_none_or(|c| next > c) => cursor = Some(next),
+                _ => return Ok(false),
+            }
+        }
     }
 
     /// One evaluation of an expectation. `Ok(Some(detail))` when met.
@@ -536,13 +616,13 @@ impl Controller {
                     }
                     None => None,
                 };
-                Ok(self.text_state(&e.text, surface.as_ref(), frame).await?.then(|| "the text is present".to_string()))
+                Ok(self.text_state(&e.text, surface.as_ref(), frame, false).await?.0.then(|| "the text is present".to_string()))
             }
             Expectation::Element(e) => Ok(self
                 .element_state(&e.query, e.state.as_deref(), e.value.as_deref(), None)
                 .await?
                 .then(|| format!("element '{}' matches", squash(&e.query, 40)))),
-            Expectation::Url(e) => Ok(self.url_state(&e.contains).await?.then(|| format!("the address contains {}", e.contains))),
+            Expectation::Url(e) => Ok(self.url_state(&e.contains, false).await?.then(|| format!("the address contains {}", e.contains))),
             Expectation::File(e) => {
                 let path = self.resolve_path(task_ref, &e.path)?;
                 let exists = path.is_file();

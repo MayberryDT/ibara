@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stand-in for `omarchy restart shell` in the E2E container.
+printf 'omarchy-restart-shell\n' >>"$HOME/omarchy-stub.log"

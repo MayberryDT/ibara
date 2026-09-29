@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Take Control's two programs, as the packages installed them, in the
+container: a compositor without a screen (sway, headless) stands in for the
+desktop. As the controller's LiveStream does, ibara-stream starts with its
+configuration and control socket, opens a generation and holds one ticket for
+the console's viewer certificate; ibara-view, as the console starts it, gets
+the bundle on stdin and connects, its window on the same compositor. Passes
+when the viewer's connection is admitted and its first video arrives, and
+revoke then ends it with input settled.
+
+  stream-check EVIDENCE_FILE      (as the desktop account, in its user manager)
+"""
+import json, os, secrets, socket, subprocess, sys, time
+
+home = os.path.expanduser("~")
+runtime = os.environ["XDG_RUNTIME_DIR"]
+state = os.path.join(home, ".local/state/e2e-stream")
+sock = os.path.join(state, "control.sock")
+log_path = os.path.join(state, "ibara-stream.log")
+out = open(sys.argv[1], "w")
+
+
+def say(*parts):
+    line = " ".join(str(p) for p in parts)
+    print(line)
+    out.write(line + "\n")
+    out.flush()
+
+
+def request(op, **body):
+    body.update(v=1, id=secrets.randbelow(1 << 30), op=op)
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(sock)
+    s.sendall((json.dumps(body) + "\n").encode())
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    return json.loads(data)
+
+
+def unit(name, command, env):
+    subprocess.run(["systemctl", "--user", "stop", name], stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "--user", "reset-failed", name], stderr=subprocess.DEVNULL)
+    args = ["systemd-run", "--user", "--quiet", f"--unit={name}"]
+    for k, v in env.items():
+        args.append(f"--setenv={k}={v}")
+    subprocess.run(args + command, check=True)
+
+
+def fail(message):
+    say("FAIL", message)
+    if os.path.exists(log_path):
+        say("--- ibara-stream log (last 40 lines)")
+        say("".join(open(log_path).readlines()[-40:]))
+    sys.exit(1)
+
+
+# The desktop: sway without a screen, one 1280x720 output.
+os.makedirs(os.path.join(home, ".config/sway"), exist_ok=True)
+with open(os.path.join(home, ".config/sway/config"), "w") as f:
+    f.write("output HEADLESS-1 resolution 1280x720\n")
+unit("e2e-sway", ["sway", "-c", os.path.join(home, ".config/sway/config")],
+     {"WLR_BACKENDS": "headless", "WLR_RENDERER": "pixman", "WLR_LIBINPUT_NO_DEVICES": "1"})
+for _ in range(50):
+    if os.path.exists(os.path.join(runtime, "wayland-1")):
+        break
+    time.sleep(0.2)
+else:
+    fail("the headless compositor did not start")
+
+# ibara-stream, configured as LiveStream configures it (controller/stream.rs).
+os.makedirs(state, mode=0o700, exist_ok=True)
+for name in ("ibara-stream.log", "state.json", "credentials.json", "key.pem", "cert.pem"):
+    try:
+        os.remove(os.path.join(state, name))
+    except FileNotFoundError:
+        pass
+with open(os.path.join(state, "apps.json"), "w") as f:
+    json.dump({"env": {}, "apps": [{"name": "Desktop", "image-path": "desktop.png"}]}, f)
+config = os.path.join(state, "ibara-stream.conf")
+with open(config, "w") as f:
+    f.write(
+        f"port = 47989\nbind_address = 127.0.0.1\naddress_family = ipv4\ncapture = wlr\n"
+        f"lan_encryption_mode = 2\nwan_encryption_mode = 2\n"
+        f"file_apps = {state}/apps.json\nfile_state = {state}/state.json\ncredentials_file = {state}/credentials.json\n"
+        f"pkey = {state}/key.pem\ncert = {state}/cert.pem\nlog_path = {log_path}\nmin_log_level = info\n"
+    )
+unit("e2e-stream", ["/usr/bin/ibara-stream", config],
+     {"WAYLAND_DISPLAY": "wayland-1", "IBARA_STREAM_CONTROL_SOCKET": sock,
+      "GLIBC_TUNABLES": "glibc.malloc.mmap_threshold=131072"})
+status = None
+for _ in range(150):
+    try:
+        reply = request("status")
+        if reply.get("ok") and len(reply["status"].get("server_cert_sha256") or "") == 64:
+            status = reply["status"]
+            break
+    except OSError:
+        pass
+    time.sleep(0.2)
+if status is None:
+    fail("ibara-stream did not answer on its control socket with a certificate within 30 s")
+say("ibara-stream status:", json.dumps(status, sort_keys=True))
+if status.get("encoder") not in ("vaapi", "software"):
+    fail("ibara-stream found no encoder")
+
+# The console's viewer identity, as the console makes it.
+identity = os.path.join(home, ".local/state/e2e-viewer")
+fingerprint = subprocess.run(["/usr/bin/ibara-view", "--create-identity", identity],
+                             capture_output=True, text=True, check=True).stdout.split()[-1].lower()
+say("viewer certificate:", fingerprint)
+
+reply = request("set_generation", generation=1)
+if not reply.get("ok"):
+    fail(f"set_generation: {reply}")
+ticket = secrets.token_hex(32)
+reply = request("issue_ticket", generation=1, ticket=ticket, client_cert_sha256=fingerprint, expires_in_ms=60000)
+if not reply.get("ok"):
+    fail(f"issue_ticket: {reply}")
+
+bundle = {
+    "v": 1, "computer_id": "computer_e2e", "computer_name": "E2E", "host": "127.0.0.1",
+    "http_port": 47989, "https_port": 47984, "server_cert_sha256": status["server_cert_sha256"],
+    "ticket": ticket, "identity_dir": identity, "keys_chord": "Super+Alt+Escape",
+    "console_socket": os.path.join(runtime, "ibara-operator.sock"), "controller_epoch": "epoch_e2e",
+    "app": "Desktop", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 4000,
+}
+bundle_path = os.path.join(state, "bundle.json")
+with open(bundle_path, "w") as f:
+    json.dump(bundle, f)
+viewer_log = os.path.join(state, "ibara-view.log")
+unit("e2e-view", ["/bin/sh", "-c", f"exec /usr/bin/ibara-view connect <{bundle_path} >{viewer_log} 2>&1"],
+     {"QT_QPA_PLATFORM": "offscreen", "SDL_VIDEODRIVER": "wayland", "SDL_AUDIODRIVER": "dummy",
+      "WAYLAND_DISPLAY": "wayland-1"})
+streaming = None
+for _ in range(100):
+    s = request("status")["status"]
+    if s.get("active_streams", 0) >= 1:
+        streaming = s
+        break
+    time.sleep(0.2)
+if streaming is None:
+    say("--- ibara-view log")
+    say(open(viewer_log).read()[-4000:] if os.path.exists(viewer_log) else "(none)")
+    fail("the viewer was not admitted: no stream within 20 s")
+say("streaming:", json.dumps(streaming, sort_keys=True))
+for _ in range(50):
+    seen = [l.strip() for l in open(viewer_log, errors="replace") if "Received first video packet" in l]
+    if seen:
+        break
+    time.sleep(0.2)
+else:
+    fail("the viewer received no video")
+say("viewer:", seen[0])
+say("stream log names the client:", "CLIENT CONNECTED" in open(log_path).read())
+
+reply = request("revoke")
+say("revoke:", json.dumps(reply.get("settlement"), sort_keys=True))
+settlement = reply.get("settlement") or {}
+if not (reply.get("ok") and settlement.get("settled") and settlement.get("active_streams") == 0):
+    fail("revoke did not end the stream with input settled")
+for name in ("e2e-view", "e2e-stream", "e2e-sway"):
+    subprocess.run(["systemctl", "--user", "stop", name], stderr=subprocess.DEVNULL)
+say("PASS")

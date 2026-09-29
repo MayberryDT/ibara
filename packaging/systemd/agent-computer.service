@@ -1,0 +1,23 @@
+[Unit]
+Description=ibara: this computer, for your other computers and your agents
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ibarad
+WorkingDirectory=/usr/lib/ibara
+Environment=GDK_SCALE=1
+Environment=GTK_A11Y=atspi
+UMask=0077
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+# ibarad gets SIGTERM; its helpers (Cua, capture, input) are killed with it.
+# Apps an agent launches run in desktop scopes of their own, outside this unit,
+# so a restart of ibara never closes them.
+KillMode=mixed
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

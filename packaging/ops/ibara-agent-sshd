@@ -1,0 +1,14 @@
+#!/bin/bash
+# The agent entry's sshd (ibara-agent-sshd.service), listening only on this
+# computer's Tailscale addresses. Before Tailscale is signed in there are none;
+# it exits and systemd starts it again shortly.
+set -euo pipefail
+addresses=()
+while IFS= read -r address; do
+  [[ -n $address ]] && addresses+=(-o "ListenAddress=$address")
+done < <(/usr/bin/tailscale ip 2>/dev/null || true)
+if (( ${#addresses[@]} == 0 )); then
+  echo "Tailscale has no address yet (not signed in); trying again shortly." >&2
+  exit 75
+fi
+exec /usr/bin/sshd -D -e -f /etc/agent-computer/ssh/sshd_config "${addresses[@]}"

@@ -1,0 +1,21 @@
+#!/bin/bash
+# Login shell of the ibara-op-<principal> accounts the access projection makes
+# for paired computers. OpenSSH runs `shell -c "<ForceCommand>"`; anything
+# else, an interactive login included, is refused. The command string is
+# compared and discarded, never evaluated. The one `Match User ibara-op-*` in
+# the agent entry's sshd_config forces the bare entry; this shell adds the
+# account's principal.
+set -euo pipefail
+export PATH=/usr/bin:/usr/sbin
+unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH
+if [[ $# -ne 2 || "$1" != "-c" ]]; then
+  exit 1
+fi
+user=$(id -un)
+[[ "$user" =~ ^ibara-op-([a-z][a-z0-9_-]{0,22})$ ]] || exit 1
+principal=${BASH_REMATCH[1]}
+entry=/opt/agent-computer/current/ops/entry.sh
+case "$2" in
+  "$entry" | "$entry $principal") exec "$entry" "$principal" ;;
+  *) exit 1 ;;
+esac

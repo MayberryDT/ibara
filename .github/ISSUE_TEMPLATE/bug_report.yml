@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in ibara does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report this. To report a security problem, do not use this form: follow SECURITY.md instead.
+        Remove anything private, such as computer names, addresses and file names, from what you paste.
+  - type: input
+    id: version
+    attributes:
+      label: ibara version
+      description: The output of `pacman -Q ibara`.
+      placeholder: ibara 0.1.0-1
+    validations:
+      required: true
+  - type: input
+    id: omarchy
+    attributes:
+      label: Omarchy version
+      description: The output of `omarchy version`, if you know it.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the console and choose Add Computer.
+        2. …
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: The relevant lines from `journalctl --user -u agent-computer.service` or `journalctl --user -u ibara-operator.service`. docs/troubleshooting.md says which to read.
+      render: text
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where it happened
+      options:
+        - Installing or updating
+        - Adding a computer
+        - The console
+        - Take Control
+        - Files
+        - An agent's task
+        - Something else

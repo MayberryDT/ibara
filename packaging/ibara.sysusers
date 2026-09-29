@@ -1,0 +1,6 @@
+# The account agents on your paired computers reach this one through (SSH on
+# port 2222, forced to ibara's entry), and the group that may open this
+# computer's controller sockets.
+g ibara-runtime - -
+u ibara-agent - "ibara agent entry" /var/lib/ibara-agent /bin/bash
+m ibara-agent ibara-runtime

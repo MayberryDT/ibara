@@ -1,0 +1,308 @@
+{
+ "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "vectors": [
+  {
+   "text": "null",
+   "canonical": "null",
+   "fingerprint": "884ed757342dea179553ab752b618ea3727be91a8b5bc775d5b51aa17ed291c0"
+  },
+  {
+   "text": "true",
+   "canonical": "true",
+   "fingerprint": "4476aeee13a643ca50916f9b6ef8acc90eee4ae04c4f56720ccc2d67eeacd8f0"
+  },
+  {
+   "text": "false",
+   "canonical": "false",
+   "fingerprint": "a290a0a8027b071c7aa39d6678a6a5cd95bba2b8bb436c63092e4ff1bea5565f"
+  },
+  {
+   "text": "0",
+   "canonical": "0",
+   "fingerprint": "3a8b171143bc3fe5972827cf3a413e96e1b4573ae308ee4e2ee652100511049f"
+  },
+  {
+   "text": "-0",
+   "canonical": "0",
+   "fingerprint": "3a8b171143bc3fe5972827cf3a413e96e1b4573ae308ee4e2ee652100511049f"
+  },
+  {
+   "text": "1",
+   "canonical": "1",
+   "fingerprint": "7761b1cc25227dfca0bd6d972acc52abb62f24ce50ad5a7a430b05c5a6f5497b"
+  },
+  {
+   "text": "1.0",
+   "canonical": "1",
+   "fingerprint": "7761b1cc25227dfca0bd6d972acc52abb62f24ce50ad5a7a430b05c5a6f5497b"
+  },
+  {
+   "text": "-1.5",
+   "canonical": "-1.5",
+   "fingerprint": "f5460280327935035ce894ba533d595ffb347c10e7b0dcf9a40e40dfaa70479e"
+  },
+  {
+   "text": "0.1",
+   "canonical": "0.1",
+   "fingerprint": "c68a3e99cfa273f05af4a18d4c754703951be5f7fc3a81eac361f8ec58fc3fa4"
+  },
+  {
+   "text": "0.2",
+   "canonical": "0.2",
+   "fingerprint": "8be55ab4c11e1b86eb503872e6994d30a4794afaab728148f8f0e3cb04476e5a"
+  },
+  {
+   "text": "0.30000000000000004",
+   "canonical": "0.30000000000000004",
+   "fingerprint": "2ec3f336019a0554d1d7d0e006d3a7b1cc3fa3c9b1a65d64b1cd8a89c52c62fa"
+  },
+  {
+   "text": "100",
+   "canonical": "100",
+   "fingerprint": "59440f31cb67ee72a1bce684c046925cfcc01ce4a371752612e3aa9a75c88373"
+  },
+  {
+   "text": "1e21",
+   "canonical": "1e+21",
+   "fingerprint": "0e08c007c8e1e18b34d2d22c513bf23f69e2120c6e4eeef9321f3fbbbd6a8893"
+  },
+  {
+   "text": "1e20",
+   "canonical": "100000000000000000000",
+   "fingerprint": "f6c383dd7106d2af29f9b6d7a71bdf316755f469f2b81d4c347c4c6c8fd509e4"
+  },
+  {
+   "text": "123456789012345680000",
+   "canonical": "123456789012345680000",
+   "fingerprint": "25c4718410cf31f0dbbe57cd645e949297bda1508d229699b9a39212a66b7d35"
+  },
+  {
+   "text": "1e-6",
+   "canonical": "0.000001",
+   "fingerprint": "248484ebacb3df83dd82b2c0345a5c7b2b20ced9633cc78756882c4b9623d1d6"
+  },
+  {
+   "text": "1e-7",
+   "canonical": "1e-7",
+   "fingerprint": "3d3987a4de03c49e52841bb600b5affee4ece6fc1d1082f87df4d5cface0ff75"
+  },
+  {
+   "text": "0.000001",
+   "canonical": "0.000001",
+   "fingerprint": "248484ebacb3df83dd82b2c0345a5c7b2b20ced9633cc78756882c4b9623d1d6"
+  },
+  {
+   "text": "0.0000001",
+   "canonical": "1e-7",
+   "fingerprint": "3d3987a4de03c49e52841bb600b5affee4ece6fc1d1082f87df4d5cface0ff75"
+  },
+  {
+   "text": "1.5e-7",
+   "canonical": "1.5e-7",
+   "fingerprint": "dae1e88d0f25710cf4fd691066a97ea3b6898a98c51d77848dce1426ba7f167b"
+  },
+  {
+   "text": "123e-20",
+   "canonical": "1.23e-18",
+   "fingerprint": "6debc124dab7407bc6ab1d5d5d246b479b108ddb7fbc2318ab01d8b692b8da3d"
+  },
+  {
+   "text": "5e-324",
+   "canonical": "5e-324",
+   "fingerprint": "721c389bc3d51bca0811b4a86be16fe5b5122c4f0da0526d5bb392e0d3ad00a4"
+  },
+  {
+   "text": "1.7976931348623157e308",
+   "canonical": "1.7976931348623157e+308",
+   "fingerprint": "a071b269ae5d91d7c825dc8c61d84b03c906c983f37ee8d65fee3a79a1a31dc6"
+  },
+  {
+   "text": "9007199254740993",
+   "canonical": "9007199254740992",
+   "fingerprint": "40bf10a91af57fe74cc86aa003cce6e8e4201d6d8c5808d4da52c5a52a3cb23a"
+  },
+  {
+   "text": "9007199254740992",
+   "canonical": "9007199254740992",
+   "fingerprint": "40bf10a91af57fe74cc86aa003cce6e8e4201d6d8c5808d4da52c5a52a3cb23a"
+  },
+  {
+   "text": "12345678901234567890",
+   "canonical": "12345678901234567000",
+   "fingerprint": "3806faf7bdbf1676b2736cb2b9fb6b094b52f18df60c4683097389dc6b3e358b"
+  },
+  {
+   "text": "18446744073709551616",
+   "canonical": "18446744073709552000",
+   "fingerprint": "03dea418dde750e389e2a3b84cb85a3ce2a70ca87e30176a19d5e1c06dd0d074"
+  },
+  {
+   "text": "-9223372036854775808",
+   "canonical": "-9223372036854776000",
+   "fingerprint": "5e54945e97fecbf33e92c7d98996ea5b158fb0015aba5dd81e15f134430ce824"
+  },
+  {
+   "text": "4.35",
+   "canonical": "4.35",
+   "fingerprint": "8c25d1112160e986ced3b90e74f6937c0f4072e6c1aea28f51646a6bac684d91"
+  },
+  {
+   "text": "2.5e+25",
+   "canonical": "2.5e+25",
+   "fingerprint": "9255a2b993d527722c37588165a3dedb72cd8866203089a752511372e221f6ae"
+  },
+  {
+   "text": "1E3",
+   "canonical": "1000",
+   "fingerprint": "b8e5bbbd0238f235e525358bc730349374bd6367af63af612f8af6b500ce5b96"
+  },
+  {
+   "text": "0.1e1",
+   "canonical": "1",
+   "fingerprint": "7761b1cc25227dfca0bd6d972acc52abb62f24ce50ad5a7a430b05c5a6f5497b"
+  },
+  {
+   "text": "1234.5678",
+   "canonical": "1234.5678",
+   "fingerprint": "d0f44f38a50bac8503363c85551626d8977fc2b0b913b73a650bc487eca08370"
+  },
+  {
+   "text": "-0.0",
+   "canonical": "0",
+   "fingerprint": "3a8b171143bc3fe5972827cf3a413e96e1b4573ae308ee4e2ee652100511049f"
+  },
+  {
+   "text": "3.141592653589793",
+   "canonical": "3.141592653589793",
+   "fingerprint": "2a2183e6d5f973444db137f82f84f81aee31703d42bd14110a6143f68635c58b"
+  },
+  {
+   "text": "1e100",
+   "canonical": "1e+100",
+   "fingerprint": "fb2706e2ba0584593d8181e5864cd68168cabc611ce1f6a5f9c7bb06b016be5c"
+  },
+  {
+   "text": "6.02214076e23",
+   "canonical": "6.02214076e+23",
+   "fingerprint": "2c7380cb8366f1964c141a78d3aafcd2abb29d97cf345c1b83733e0a3a9e6659"
+  },
+  {
+   "text": "255e-3",
+   "canonical": "0.255",
+   "fingerprint": "3705da67210d5d1fb6292928617b2156af6d14d35aa56a2eea71bc1a5e4151cf"
+  },
+  {
+   "text": "\"\"",
+   "canonical": "\"\"",
+   "fingerprint": "365fed66a549fc35b86b7481bbd88d1271a751b02143d45cf7f4ce9bdf7aa51b"
+  },
+  {
+   "text": "\"plain\"",
+   "canonical": "\"plain\"",
+   "fingerprint": "d28cf3d52477d5f8926f24d14735a5bc7d9bf2cf075c1a117c8832afb9360378"
+  },
+  {
+   "text": "\"quote\\\" backslash\\\\ slash\\/\"",
+   "canonical": "\"quote\\\" backslash\\\\ slash/\"",
+   "fingerprint": "f1f001c44f171595e2594176ae28c1b9334a3240adbeed1ae74993a7b700cb06"
+  },
+  {
+   "text": "\"\\b\\f\\n\\r\\t\"",
+   "canonical": "\"\\b\\f\\n\\r\\t\"",
+   "fingerprint": "e589c570e34d947343f6cc3936d7c2b3a4017241038572bc2347b0d1b8310b46"
+  },
+  {
+   "text": "\"\\u0000\\u0001\\u001f\\u007f\\u0080\"",
+   "canonical": "\"\\u0000\\u0001\\u001f\"",
+   "fingerprint": "754d10fbf08fe2444714ca1399a27ae3d5a0ebaaea215ab18743ffa2dc18e920"
+  },
+  {
+   "text": "\"\\u2028\\u2029\"",
+   "canonical": "\"  \"",
+   "fingerprint": "5fb2d0d1cfb96613091bf4fb7a24d9b48cefc311aa7377ef3255aa000415d4ab"
+  },
+  {
+   "text": "\"emoji 😀 and é and 中文\"",
+   "canonical": "\"emoji 😀 and é and 中文\"",
+   "fingerprint": "c577c11dd79735c6f1e3e6763958b62ce02cafd05d2f152d5a05cf8fee7b9695"
+  },
+  {
+   "text": "\"\\ud83d\\ude00\"",
+   "canonical": "\"😀\"",
+   "fingerprint": "806bd38c0fe4a9c46b8a511a2d8e7ae7f532a85cc08c64d3e149cd5c6c9a387a"
+  },
+  {
+   "text": "\"\\uFEFF\\uFFFF\"",
+   "canonical": "\"﻿￿\"",
+   "fingerprint": "18d0397150abca076d05a3eb4f3b2c81131ff83b14ec1e95458064ffbbc2f031"
+  },
+  {
+   "text": "[]",
+   "canonical": "[]",
+   "fingerprint": "445cf8baebc4c11c8a0e0d9e2d8923e837c3fc661f310140badd038b4d594b7a"
+  },
+  {
+   "text": "{}",
+   "canonical": "{}",
+   "fingerprint": "86227fe96722a2247dcfee12c07d89c1b0567bbc9aa6a8d804838f66a3da843f"
+  },
+  {
+   "text": "[1,[2,[3,{}]],\"x\",null]",
+   "canonical": "[1,[2,[3,{}]],\"x\",null]",
+   "fingerprint": "24a826629a380b8007f4fc0af56ac3afe77557bfcf6acea13b27322f7f63c05b"
+  },
+  {
+   "text": "{\"b\":1,\"a\":2,\"c\":{\"z\":[{\"y\":1,\"x\":2}],\"a\":null}}",
+   "canonical": "{\"a\":2,\"b\":1,\"c\":{\"a\":null,\"z\":[{\"x\":2,\"y\":1}]}}",
+   "fingerprint": "d89bcca1340c39992b6dd55119be13fe038f8d62cfa494b9e526009b86ef8d28"
+  },
+  {
+   "text": "{\"10\":1,\"9\":2,\"a\":3,\"B\":4,\"_\":5,\"\":6}",
+   "canonical": "{\"\":6,\"10\":1,\"9\":2,\"B\":4,\"_\":5,\"a\":3}",
+   "fingerprint": "a1583132f3deaf691aeaa2fa962273feec083f6ab385dad3976c534af09e4001"
+  },
+  {
+   "text": "{\"\\uff61\":1,\"😀\":2,\"\\ue000\":3,\"z\":4,\"é\":5}",
+   "canonical": "{\"z\":4,\"é\":5,\"😀\":2,\"\":3,\"｡\":1}",
+   "fingerprint": "faa351d8992fc589076216cf3a793aab4f831d895b1372fefea5abb86fe40783"
+  },
+  {
+   "text": "{\"__proto__\":{\"x\":1},\"constructor\":2}",
+   "canonical": "{\"__proto__\":{\"x\":1},\"constructor\":2}",
+   "fingerprint": "80a524d454bbe99fe21980abd85c85e8a6dd70f7d2813af2517739dbf6147428"
+  },
+  {
+   "text": "{\"a\":1,\"a\":2}",
+   "canonical": "{\"a\":2}",
+   "fingerprint": "33abed3257ff416303a5d97c72d7e05f6c33155d13647c395bfe1ab15f6cc1e1"
+  },
+  {
+   "text": "{\"tool\":\"computer_act\",\"args\":{\"task_ref\":\"task_0123\",\"action\":{\"kind\":\"type\",\"text\":\"Hello, world!\\n\"},\"expect\":[{\"kind\":\"window\",\"title\":\"Mousepad\"}],\"timeout_ms\":1500.0}}",
+   "canonical": "{\"args\":{\"action\":{\"kind\":\"type\",\"text\":\"Hello, world!\\n\"},\"expect\":[{\"kind\":\"window\",\"title\":\"Mousepad\"}],\"task_ref\":\"task_0123\",\"timeout_ms\":1500},\"tool\":\"computer_act\"}",
+   "fingerprint": "7b9a0d47dd9f593f5f06df8f205b44f558e0ae975b5c0fcb122d067f8be24f2b"
+  },
+  {
+   "text": "{\"k\\u0007\":\"\\u000b\",\"nested\":{\"deep\":{\"deeper\":[0.5,-0,1e21,1e-7]}}}",
+   "canonical": "{\"k\\u0007\":\"\\u000b\",\"nested\":{\"deep\":{\"deeper\":[0.5,0,1e+21,1e-7]}}}",
+   "fingerprint": "3db39b083c35000087c5f24df35a6211663fc3ae4610d7c1402c282dcb1fb1d7"
+  },
+  {
+   "text": "{\"a\":null,\"b\":1}",
+   "canonical": "{\"a\":null,\"b\":1}",
+   "fingerprint": "a5dcae1df7e630e9ad931fcaa1b6b31d40d07d11aab6df7a4e04743f805eecb1",
+   "from_undefined": true
+  },
+  {
+   "text": "[null,null]",
+   "canonical": "[null,null]",
+   "fingerprint": "09f8ddbcd767cc4269e0a85b57515432df7db77b8613d966297f8e0ac8de4046",
+   "from_undefined": true
+  },
+  {
+   "text": "{\"outcome\":\"completed\",\"summary\":null,\"criteria\":null,\"artifact_refs\":null}",
+   "canonical": "{\"artifact_refs\":null,\"criteria\":null,\"outcome\":\"completed\",\"summary\":null}",
+   "fingerprint": "5ed67340f136c5e78a85f7ea658f499317dae54295202bda165ab3d54d60dc78",
+   "from_undefined": true
+  }
+ ]
+}

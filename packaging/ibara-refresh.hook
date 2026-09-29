@@ -1,0 +1,14 @@
+# After the ibara package is installed or upgraded: set ibara up again for the
+# person who set it up (nothing before `ibara setup`). Services restart only
+# when what they run from changed; Tailscale is left as the person left it.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = ibara
+
+[Action]
+Description = Setting ibara up again for the new package...
+When = PostTransaction
+Exec = /usr/bin/ibara system refresh
+Depends = ibara

@@ -1,0 +1,19 @@
+[Unit]
+Description=ibara restart, shut down and sleep for this computer
+
+[Socket]
+ListenStream=/run/ibara-power/power.sock
+# ibara setup names the desktop account and its group in
+# ibara-power.socket.d/desktop.conf; only that account's ibarad connects.
+# Until then only root can.
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0711
+Accept=yes
+MaxConnections=2
+MaxConnectionsPerSource=1
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

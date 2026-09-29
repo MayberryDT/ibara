@@ -1,0 +1,15 @@
+[Unit]
+Description=ibara agent entry (SSH on port 2222, on Tailscale addresses only)
+After=tailscaled.service
+
+[Service]
+# Waits for Tailscale: without an address it exits and starts again shortly.
+ExecStart=/usr/lib/ibara/ops/ibara-agent-sshd
+Restart=always
+RestartSec=10
+# As the distribution's sshd.service: stopping or restarting the listener
+# leaves every agent's session running.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

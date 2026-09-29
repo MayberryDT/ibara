@@ -1,0 +1,5 @@
+#!/bin/sh
+# computerctl is `ibara admin` as root: this computer's controller, read and
+# changed with its administrator key (docs/security-and-access.md).
+[ "$(id -u)" -eq 0 ] || exec sudo /usr/bin/ibara admin "$@"
+exec /usr/bin/ibara admin "$@"

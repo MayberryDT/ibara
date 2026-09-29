@@ -1,0 +1,14 @@
+[Unit]
+Description=ibara console: your other computers, from this one
+# The console opens the viewer, terminals and the file chooser in the desktop session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ibarad --role operator
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

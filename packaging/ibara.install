@@ -1,0 +1,8 @@
+post_install() {
+  echo "ibara is installed. To finish, run as yourself (not root): ibara setup"
+}
+
+pre_remove() {
+  # Stop the system parts ibara setup enabled; `ibara uninstall` removes the rest.
+  systemctl disable --now ibara-agent-sshd.service ibara-access.socket ibara-power.socket >/dev/null 2>&1 || true
+}

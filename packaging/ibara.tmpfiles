@@ -1,0 +1,4 @@
+# ibara setup adds /etc/tmpfiles.d/agent-computer.conf and ibara-operator-peer.conf,
+# which name the desktop account.
+d /var/lib/ibara-agent 0750 ibara-agent ibara-agent -
+d /var/lib/ibara-operator 0755 root root -

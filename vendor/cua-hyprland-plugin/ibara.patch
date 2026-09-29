@@ -1,0 +1,360 @@
+diff --git a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
+index fc7e740bb..3ef70c5d2 100644
+--- a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
++++ b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
+@@ -183,7 +183,28 @@ struct InputExperiment::Impl {
+         Clock::time_point start;
+         unsigned duration;
+         DragGeometry geometry;
++        // ibara: a foreground click that points like a person. The pointer
++        // travels to the target (no button held), rests, then clicks. Zero
++        // for a drag.
++        std::uint32_t click_code = 0;
++        unsigned clicks = 0;
++        Clock::time_point next{};
++        // ibara: set just before the first press. Until then the click has
++        // only focused the window and moved the pointer, so a failure or a
++        // revocation is a refusal, not a partial effect.
++        bool pressed = false;
++        bool unpressed_click() const { return click_code && !pressed; }
+     };
++    // ibara: human pointing. Travel time follows Fitts's law (250 ms +
++    // 150 ms x log2(distance / 20 + 1), 350-1400 ms) with a minimum-jerk
++    // (bell-shaped) speed profile; the pointer rests 110 ms on arrival.
++    static constexpr auto kRest = std::chrono::milliseconds(110);
++    static unsigned human_travel_ms(double distance) {
++        if (distance < 2) return 0;
++        const double ms = 250 + 150 * std::log2(distance / 20 + 1);
++        return static_cast<unsigned>(std::clamp(ms, 350.0, 1400.0));
++    }
++    static double min_jerk(double t) { return t * t * t * (10 - 15 * t + 6 * t * t); }
+     int listener = -1;
+     wl_event_source* listen_source = nullptr;
+     wl_event_source* timer = nullptr;
+@@ -228,6 +249,10 @@ struct InputExperiment::Impl {
+     std::vector<WP<CWLPointerResource>> foreground_pointers;
+     std::vector<WP<CWLKeyboardResource>> foreground_keyboards;
+     std::array<std::uint32_t, 4> foreground_modifiers{};
++    // ibara: where this lane last put the pointer, floored as Hyprland reports
++    // moves. warpTo emits no move event, so the listeners need this to tell a
++    // later event at the same spot from the user moving the mouse.
++    std::optional<Vector2D> agent_pointer;
+ 
+     explicit Impl(const std::string& directory, unsigned index) : lane(index) {
+ #ifdef CUA_HYPRLAND_TEST_INPUT
+@@ -243,15 +268,39 @@ struct InputExperiment::Impl {
+         // No private key or input-enabled default exists in this component.
+     }
+ 
++    // ibara patch: Omarchy's default options (compose:caps,
++    // shift:both_capslock_cancel) and an input method's virtual keyboard leave
++    // every key the driver sends where it was, but change the compiled text.
++    // Accept a single-layout keymap whose first two levels match plain US for
++    // every key US binds, except the Caps Lock and Num Lock keys that options own.
++    static bool letter_neutral_keymap(xkb_keymap* map, xkb_keymap* reference) {
++        if (xkb_keymap_num_layouts(map) != 1) return false;
++        for (const char* mod : {XKB_MOD_NAME_SHIFT, XKB_MOD_NAME_CTRL, XKB_MOD_NAME_ALT, XKB_MOD_NAME_LOGO})
++            if (xkb_keymap_mod_get_index(map, mod) == XKB_MOD_INVALID) return false;
++        for (xkb_keycode_t key = xkb_keymap_min_keycode(reference); key <= xkb_keymap_max_keycode(reference); ++key) {
++            const xkb_keysym_t* base = nullptr;
++            if (xkb_keymap_key_get_syms_by_level(reference, key, 0, 0, &base) == 1 &&
++                (base[0] == XKB_KEY_Caps_Lock || base[0] == XKB_KEY_Num_Lock)) continue;
++            for (xkb_level_index_t level = 0; level < 2; ++level) {
++                const xkb_keysym_t* expected = nullptr;
++                const xkb_keysym_t* actual = nullptr;
++                const int want = xkb_keymap_key_get_syms_by_level(reference, key, 0, level, &expected);
++                if (want <= 0) continue;
++                const int got = xkb_keymap_key_get_syms_by_level(map, key, 0, level, &actual);
++                if (got != want || !std::equal(expected, expected + want, actual)) return false;
++            }
++        }
++        return true;
++    }
+     static bool canonical_us_keymap(xkb_context* context, xkb_keymap* map) {
+-        // Compare canonical compiled content, not a layout display name. This
+-        // deliberately excludes variants, options, remaps, and multiple groups.
++        // Compare canonical compiled content first, then the letter-neutral
++        // equivalence above. Variants, remaps and multiple groups still refuse.
+         const xkb_rule_names names{"evdev", "pc105", "us", "", ""};
+         auto* reference = xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+         if (!reference) return false;
+         char* actual = xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1);
+         char* expected = xkb_keymap_get_as_string(reference, XKB_KEYMAP_FORMAT_TEXT_V1);
+-        const bool matches = actual && expected && std::strcmp(actual, expected) == 0;
++        const bool matches = (actual && expected && std::strcmp(actual, expected) == 0) || letter_neutral_keymap(map, reference);
+         std::free(actual); std::free(expected); xkb_keymap_unref(reference);
+         return matches;
+     }
+@@ -589,10 +638,14 @@ struct InputExperiment::Impl {
+     }
+     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
+         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
+-        if (drag && drag->client && !drag->client->dead)
+-            send(*drag->client, failure.reason == ForegroundFailureReason::none ?
+-                refusal(foreground_started ? "foreground_partial_unknown" : reason) :
+-                refusal(foreground_started ? "foreground_partial_unknown" : reason, failure));
++        if (drag && drag->client && !drag->client->dead) {
++            // ibara: a click still travelling or resting sent no button, so it
++            // is refused with its cause, as upstream refuses before its press.
++            const bool partial = foreground_started && !drag->unpressed_click();
++            const auto code = partial ? std::string_view("foreground_partial_unknown")
++                : failure.reason == ForegroundFailureReason::none ? reason : ForegroundFailure::code(false);
++            send(*drag->client, failure.reason == ForegroundFailureReason::none ? refusal(code) : refusal(code, failure));
++        }
+         drag.reset();
+         finish_foreground();
+         if (retain_pointer) release_pointer_button(); else leave_pointer();
+@@ -840,7 +893,13 @@ struct InputExperiment::Impl {
+             foreground_modifiers[2] |= kb->m_modifiersState.locked;
+         }
+         if (needs_keyboard) {
+-            const auto modifier_failure = foreground_key_modifier_failure(foreground_modifiers);
++            // ibara patch: NumLock only changes the keypad, which the driver
++            // never sends. It stays locked for the application, as the user set it.
++            auto checked = foreground_modifiers;
++            for (const char* name : {XKB_MOD_NAME_NUM, "NumLock"})
++                if (const auto index = xkb_keymap_mod_get_index(keymap, name); index != XKB_MOD_INVALID && index < 32)
++                    checked[2] &= ~(1u << index);
++            const auto modifier_failure = foreground_key_modifier_failure(checked);
+             if (modifier_failure != ForegroundFailureReason::none) throw ForegroundFailure{modifier_failure};
+         }
+         xkb_state_update_mask(keyboard_state, foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], 0, 0, foreground_modifiers[3]);
+@@ -860,7 +919,7 @@ struct InputExperiment::Impl {
+         if (focus_failure != ForegroundFailureReason::none) throw ForegroundFailure{focus_failure};
+         if (!needs_pointer) { require_foreground(c); return; }
+         foreground_activating = true;
+-        ::Pointer::mgr()->warpTo({x + c.geometry[0], y + c.geometry[1]});
++        warp_pointer({x + c.geometry[0], y + c.geometry[1]});
+         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
+         const auto warp_failure = foreground_guard(c).dispatch_failure(false);
+         if (warp_failure != ForegroundFailureReason::none) throw ForegroundFailure{warp_failure};
+@@ -873,13 +932,34 @@ struct InputExperiment::Impl {
+         require_foreground(c);
+         const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+         if (!point(c, x, y) || c.surface.lock()->at(local, true).first != c.surface.lock()) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+-        ::Pointer::mgr()->warpTo({x + c.geometry[0], y + c.geometry[1]});
++        warp_pointer({x + c.geometry[0], y + c.geometry[1]});
+         require_foreground(c);
+         for (const auto& weak : foreground_pointers) {
+             const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
+             p->sendMotion(event_ms(), local); p->sendFrame();
+         }
+     }
++    // ibara: one step of a click's travel. Unlike a drag no button holds an
++    // implicit grab, so the compositor may re-pick the pointer focus after a
++    // warp; keep it on the target root, as start_foreground does. Points on
++    // the way may lie over the target's own subsurfaces; only the press point
++    // must hit the root itself (checked on arrival).
++    void travel_motion(Client& c, double x, double y) {
++        const auto root = c.surface.lock();
++        if (!root || !point(c, x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
++        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
++        warp_pointer({x + c.geometry[0], y + c.geometry[1]});
++        g_pSeatManager->setPointerFocus(root, local);
++        require_foreground(c);
++        for (const auto& weak : foreground_pointers) {
++            const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
++            p->sendMotion(event_ms(), local); p->sendFrame();
++        }
++    }
++    void warp_pointer(const Vector2D& to) {
++        ::Pointer::mgr()->warpTo(to);
++        agent_pointer = ::Pointer::mgr()->position().floor();
++    }
+     void foreground_button(Client& c, std::uint32_t code, bool pressed) {
+         require_foreground(c);
+         // Mark ownership before sending, so a later resource failure can unwind.
+@@ -1185,14 +1265,36 @@ struct InputExperiment::Impl {
+             }
+         }
+         if (!consume_grant(c, cap)) return;
++        if (command == "CLICK") {
++            // ibara: start where the pointer is (kept inside the window), then
++            // travel, rest and press from step(). The reply follows the release.
++            // Like the press point, the start must hit the target root itself:
++            // from over one of its subsurfaces (a video, an overlay) the click
++            // starts at the press point instead of being refused. A press point
++            // off the root is refused now, before any effect, as upstream does.
++            const auto root = c.surface.lock();
++            const auto hits_root = [&](double px, double py) {
++                const Vector2D local{px + c.geometry[0] - c.geometry[4], py + c.geometry[1] - c.geometry[5]};
++                return root && point(c, px, py) && root->at(local, true).first == root;
++            };
++            if (root && !hits_root(x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
++            const auto at = ::Pointer::mgr()->position();
++            const double sx = std::clamp(at.x - c.geometry[0], 1.0, std::max(1.0, c.geometry[2] - 2));
++            const double sy = std::clamp(at.y - c.geometry[1], 1.0, std::max(1.0, c.geometry[3] - 2));
++            const bool usable = hits_root(sx, sy);
++            const double fx = usable ? sx : x, fy = usable ? sy : y;
++            start_foreground(c, fx, fy, true, false);
++            const auto travel = human_travel_ms(std::hypot(x - fx, y - fy));
++            drag.emplace(Drag{&c, fx, fy, x, y, Clock::now(), std::max(travel, 1u), DragGeometry{c.revision},
++                static_cast<std::uint32_t>(code), static_cast<unsigned>(clicks)});
++            return;
++        }
+         start_foreground(c, x, y, command != "KEY" && command != "ACTIVATE", command == "KEY");
+         if (command == "KEY") {
+             const std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
+             for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && keys[i] != code) foreground_key(c, keys[i], true);
+             foreground_key(c, code, true); foreground_key(c, code, false);
+             for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && keys[i] != code) foreground_key(c, keys[i], false);
+-        } else if (command == "CLICK") {
+-            for (unsigned i = 0; i < clicks; ++i) { foreground_button(c, code, true); foreground_button(c, code, false); }
+         } else if (command == "SCROLL") {
+             require_foreground(c);
+             for (const auto& weak : foreground_pointers) {
+@@ -1220,7 +1322,11 @@ struct InputExperiment::Impl {
+     }
+     static int tick(void* data) {
+         auto& self = *static_cast<Impl*>(data);
+-        try { self.step(); } catch (...) { self.revoke("internal_error"); }
++        // ibara: a foreground failure keeps its cause in the reply (a click
++        // that has not pressed yet is refused; see revoke).
++        try { self.step(); }
++        catch (const ForegroundFailure& failure) { self.revoke("foreground_partial_unknown", false, failure); }
++        catch (...) { self.revoke("internal_error"); }
+         wl_event_source_timer_update(self.timer, self.retired ? 500 : 16); return 0;
+     }
+     void guard_targets() {
+@@ -1251,7 +1357,26 @@ struct InputExperiment::Impl {
+             const auto d = *drag;
+             const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - d.start).count();
+             const auto progress = std::min(elapsed / d.duration, 1.0);
+-            if (d.client->route == InputRoute::primary_foreground) {
++            if (d.client->route == InputRoute::primary_foreground && d.click_code) {
++                // ibara: travel, rest, then click. Until the press, a failure or
++                // a revocation refuses the click (see revoke).
++                auto& live = *drag;
++                const auto now = Clock::now();
++                if (progress < 1 || live.next == Clock::time_point{}) {
++                    const auto eased = min_jerk(progress);
++                    if (progress < 1) travel_motion(*d.client, d.x1 + (d.x2 - d.x1) * eased, d.y1 + (d.y2 - d.y1) * eased);
++                    else { foreground_motion(*d.client, d.x2, d.y2); live.next = now + kRest; }
++                } else if (now >= live.next) {
++                    // Press and release in one turn, as upstream does: a held
++                    // press lets the page react (focus, a list's popup, an input
++                    // method) before the release, which the focus guard then refuses.
++                    require_foreground(*d.client);
++                    live.pressed = true;
++                    for (unsigned i = 0; i < live.clicks; ++i) { foreground_button(*d.client, live.click_code, true); foreground_button(*d.client, live.click_code, false); }
++                    auto* client = d.client; drag.reset(); ++dispatches;
++                    complete_action(); send(*client, kForegroundDelivered);
++                }
++            } else if (d.client->route == InputRoute::primary_foreground) {
+                 foreground_motion(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress);
+                 if (progress >= 1) {
+                     foreground_button(*d.client, 272, false); drag.reset(); ++dispatches;
+@@ -1288,6 +1413,8 @@ struct InputExperiment::DesktopListeners {
+     CHyprSignalListener lock, unlock, active, layout, added, removed, destroyed;
+     CHyprSignalListener keyboard_layout, pointer_focus, keyboard_focus;
+     CHyprSignalListener mouse_move, mouse_button, mouse_axis, keyboard_key, touch_down, tablet_tip;
++    // ibara: the pointer position the last move event reported.
++    Vector2D seen_pointer = ::Pointer::mgr()->position().floor();
+ 
+     explicit DesktopListeners(InputExperiment& input) : owner(input) {
+         lock = g_pSessionLockManager->m_events.lock.listen([this] { changed(); });
+@@ -1302,7 +1429,7 @@ struct InputExperiment::DesktopListeners {
+             keyboard_focus = g_pSeatManager->m_events.keyboardFocusChange.listen([this] { primary_changed(); });
+             // These notifications precede physical delivery. Retire our owned
+             // press before the user's event can become held on the same resource.
+-            mouse_move = Event::bus()->m_events.input.mouse.move.listen([this](Vector2D, Event::SCallbackInfo&) { external_input(); });
++            mouse_move = Event::bus()->m_events.input.mouse.move.listen([this](Vector2D at, Event::SCallbackInfo&) { pointer_moved(at); });
+             mouse_button = Event::bus()->m_events.input.mouse.button.listen([this](IPointer::SButtonEvent, Event::SCallbackInfo&) { external_input(); });
+             mouse_axis = Event::bus()->m_events.input.mouse.axis.listen([this](IPointer::SAxisEvent, Event::SCallbackInfo&) { external_input(); });
+             keyboard_key = Event::bus()->m_events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent, Event::SCallbackInfo&) { external_input(); });
+@@ -1322,6 +1449,22 @@ struct InputExperiment::DesktopListeners {
+     void changed() {
+         for (auto& lane : owner.lanes_) lane->desktop_transition();
+     }
++    // ibara: Hyprland also emits a move without the pointer moving:
++    // simulateMouseMovement() when a popup maps (a GTK completion list) and
++    // refocus() when a grab ends with follow_mouse = 1. Only a new position is
++    // the user: not where the last event left the pointer, nor where an agent
++    // lane last warped it. m_lastInputMouse cannot tell them apart, because
++    // absolute pointers (tablets, remote control) clear it too.
++    void pointer_moved(const Vector2D& at) {
++        bool agent = false;
++        for (auto& lane : owner.lanes_) {
++            agent = agent || lane->agent_pointer == at;
++            lane->agent_pointer.reset();
++        }
++        const bool moved = at != seen_pointer && !agent;
++        seen_pointer = at;
++        if (moved) external_input();
++    }
+     void external_input() {
+         for (auto& lane : owner.lanes_)
+             if (lane->lease && lane->lease->route == InputRoute::primary_foreground)
+@@ -1344,6 +1487,43 @@ struct InputExperiment::DesktopListeners {
+     }
+ };
+ 
++// ibara: the seat's pointer when no mouse is plugged in. Hyprland offers apps
++// a pointer, and gives pointer focus, only while some pointer device exists,
++// so on a computer without a mouse every foreground click was refused
++// (`physical_pointer`) and no app held a pointer to receive one. This device
++// is registered for the plugin's lifetime on every computer, mouse or not. It
++// never sends an event: it cannot move the pointer or press a button, so
++// nothing it does can count as a person. A person's mouse, touchpad, keys,
++// touch and tablet still interrupt the agent as before.
++struct InputExperiment::AgentPointer {
++    class Device final : public IPointer {
++      public:
++        static SP<Device> create() {
++            auto device = SP<Device>(new Device());
++            device->m_self = device;
++            return device;
++        }
++        bool isVirtual() override { return true; }
++        SP<Aquamarine::IPointer> aq() override { return nullptr; }
++
++      private:
++        Device() { m_deviceName = "ibara agent pointer"; }
++    };
++    SP<Device> device = Device::create();
++
++    AgentPointer() {
++        g_pInputManager->newMouse(SP<IPointer>(device));
++        g_pInputManager->updateCapabilities();
++    }
++    ~AgentPointer() {
++        // Hyprland drops the device on this signal. Nothing may keep it past
++        // here: its code leaves with the module.
++        device->m_events.destroy.emit();
++        device.reset();
++        g_pInputManager->updateCapabilities();
++    }
++};
++
+ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
+     SeatLifetime lifetime(directory);
+     for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
+@@ -1360,11 +1540,13 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
+ #else
+     (void)plugin;
+ #endif
++    agent_pointer_ = std::make_unique<AgentPointer>();
+     desktop_listeners_ = std::make_unique<DesktopListeners>(*this);
+     lifetime.publish();
+ }
+ InputExperiment::~InputExperiment() {
+     desktop_listeners_.reset();
++    agent_pointer_.reset();
+     for (auto& lane : lanes_) { lane->retire(); lane->trace = nullptr; lane->peers = {}; }
+     trace_.reset();
+     // Intentional process-lifetime ownership: callbacks, removed global, and
+diff --git a/libs/cua-driver/hyprland-plugin/src/input_experiment.hpp b/libs/cua-driver/hyprland-plugin/src/input_experiment.hpp
+index d9e66cf36..fba860498 100644
+--- a/libs/cua-driver/hyprland-plugin/src/input_experiment.hpp
++++ b/libs/cua-driver/hyprland-plugin/src/input_experiment.hpp
+@@ -22,8 +22,10 @@ class InputExperiment {
+   private:
+     struct Impl;
+     struct DesktopListeners;
++    struct AgentPointer;
+     std::array<std::unique_ptr<Impl>, 2> lanes_;
+     std::unique_ptr<PrimaryTrace> trace_;
++    std::unique_ptr<AgentPointer> agent_pointer_;
+     std::unique_ptr<DesktopListeners> desktop_listeners_;
+ };
+ } // namespace cua::hyprland

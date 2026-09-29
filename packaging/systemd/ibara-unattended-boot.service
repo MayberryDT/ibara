@@ -1,0 +1,12 @@
+[Unit]
+Description=ibara: drop the ask-disk-password boot entry once the disk has unlocked by itself
+# Enabled by `ibara unattended-boot enable`; it disables itself once the entry is gone.
+ConditionPathExists=/etc/ibara/unattended-boot.json
+After=local-fs.target systemd-journal-flush.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ibara system unattended-boot boot-check
+
+[Install]
+WantedBy=multi-user.target

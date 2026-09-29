@@ -1,0 +1,16 @@
+name: Idea or request
+description: Something ibara could do, or do better.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you want to do
+      description: Describe the task you are trying to get done, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How ibara could help
+      description: Your idea for a change, if you have one.

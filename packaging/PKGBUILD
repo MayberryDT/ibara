@@ -1,0 +1,123 @@
+# Maintainer: Tyler Mayberry
+#
+# The ibara package: ibarad and ibara, the root socket units (access, power),
+# the agent entry, the user services (agent-computer.service for this
+# computer, ibara-operator.service for the console), sysusers, tmpfiles, the
+# /dev/uinput rule, the pacman hooks (set up again after an upgrade; rebuild
+# Cua's Hyprland plugin after Hyprland changes), the plugin's source and the
+# console plugin for Omarchy's bar. No Node or Python. Take Control comes with
+# it: ibara-stream and ibara-view are built at the same version from their
+# forks by packaging/release.sh, and installed together with it.
+#
+# Built by packaging/release.sh from this core checkout and a checkout of the
+# console plugin (omarchy-ibara):
+#
+#   IBARA_PLUGIN_DIR=/path/to/omarchy-ibara makepkg
+#
+# `ibara setup` finishes the installation for the person using the computer.
+
+_core=${IBARA_CORE_DIR:-$startdir/..}
+_plugin=${IBARA_PLUGIN_DIR:-}
+
+pkgname=ibara
+pkgver=0.1.0
+pkgrel=${IBARA_PKGREL:-1}
+pkgdesc='Use your computers from any other, by you and your agents'
+arch=('x86_64')
+# The project's page: the GitHub repository whose releases packaging/release.env names.
+url=$(. "$_core/packaging/release.env" && printf '%s' "${IBARA_BASE_URL%/releases/latest/download}")
+license=('GPL-3.0-only' 'MIT')
+depends=(
+  'glibc' 'gcc-libs'
+  'hyprland' 'grim' 'at-spi2-core'
+  'cua-driver-bin>=0.28.2'
+  'openssh' 'openssl' 'acl' 'sudo' 'curl' 'pacman'
+  'tailscale'
+  # Cua's Hyprland plugin is built on each computer for its exact Hyprland.
+  'cmake' 'ninja' 'gcc' 'pkgconf'
+  # The apps agents open: the editor and the terminal.
+  'mousepad' 'foot'
+  # Take Control of this computer, and the viewer for taking control of
+  # another: the ones built with this release.
+  "ibara-stream=$pkgver-$pkgrel" "ibara-view=$pkgver-$pkgrel"
+  # Live Video (Preview): the hardware H.264 encoder on this computer, and
+  # the player the console plays another computer's video with.
+  'wf-recorder' 'qt6-multimedia' 'qt6-multimedia-ffmpeg'
+)
+optdepends=(
+  'ufw: firewall rules keeping the agent entry, pairing and streaming on the tailnet'
+  'chromium: web pages agents can read and use'
+)
+makedepends=('cargo' 'git')
+install=ibara.install
+options=('!lto' '!debug')
+
+
+prepare() {
+  [[ -n $_plugin && -f $_plugin/manifest.json ]] || {
+    echo 'Set IBARA_PLUGIN_DIR to a checkout of the console plugin (omarchy-ibara).' >&2
+    return 1
+  }
+  [[ $(sed -n 's/^version = "\(.*\)"/\1/p' "$_core/Cargo.toml" | head -1) == "$pkgver" ]] || {
+    echo "pkgver $pkgver differs from Cargo.toml; change both together." >&2
+    return 1
+  }
+  cd "$_core"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$_core"
+  export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$srcdir/target}
+  # The programs name no folder of the computer that built them (panic
+  # locations): cargo's home, this checkout and the target folder get neutral
+  # names. makepkg sets RUSTFLAGS itself, so they are added here.
+  local cargo_home
+  cargo_home=$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$(realpath "$_core")=/ibara --remap-path-prefix=$(realpath -m "$CARGO_TARGET_DIR")=/target"
+  cargo build --frozen --release --bins
+}
+
+package() {
+  cd "$_core"
+  local built=${CARGO_TARGET_DIR:-$srcdir/target}/release
+  local lib=$pkgdir/usr/lib/ibara
+
+  install -Dm755 "$built/ibara" "$lib/bin/ibara"
+  install -Dm755 "$built/ibarad" "$lib/bin/ibarad"
+  install -d "$pkgdir/usr/bin"
+  ln -s ../lib/ibara/bin/ibara "$pkgdir/usr/bin/ibara"
+  ln -s ../lib/ibara/bin/ibarad "$pkgdir/usr/bin/ibarad"
+  install -Dm755 packaging/ops/computerctl "$pkgdir/usr/bin/computerctl"
+  for script in entry.sh ibara-op-shell ibara-agent-sshd ibara-chrome-native ibara-editor cua-plugin.sh; do
+    install -Dm755 "packaging/ops/$script" "$lib/ops/$script"
+  done
+
+  # Cua's Hyprland plugin source (built on each computer) and the browser page reader.
+  git ls-files -z vendor/cua-hyprland-plugin | while IFS= read -r -d '' file; do
+    install -Dm644 "$file" "$lib/cua-hyprland-plugin/${file#vendor/cua-hyprland-plugin/}"
+  done
+  install -Dm644 -t "$lib/chrome-extension" chrome-extension/manifest.json chrome-extension/worker.js chrome-extension/document.js
+
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/system" \
+    packaging/systemd/ibara-agent-sshd.service \
+    packaging/systemd/ibara-access.socket packaging/systemd/ibara-access@.service \
+    packaging/systemd/ibara-power.socket packaging/systemd/ibara-power@.service \
+    packaging/systemd/ibara-unattended-boot.service
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" \
+    packaging/systemd/agent-computer.service packaging/systemd/ibara-operator.service
+  install -Dm644 packaging/ibara.sysusers "$pkgdir/usr/lib/sysusers.d/ibara.conf"
+  install -Dm644 packaging/ibara.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/ibara.conf"
+  install -Dm644 packaging/60-ibara-uinput.rules "$pkgdir/usr/lib/udev/rules.d/60-ibara-uinput.rules"
+  install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" packaging/ibara-refresh.hook packaging/ibara-cua.hook
+  install -Dm644 skills/ibara/SKILL.md "$pkgdir/usr/share/ibara/skills/ibara/SKILL.md"
+
+  # The console plugin: what Omarchy's shell loads, nothing from its tests.
+  local plugin=$pkgdir/usr/share/ibara/omarchy-plugin
+  git -C "$_plugin" ls-files -z -- '*.qml' '*.js' manifest.json preview.svg LICENSE README.md |
+    while IFS= read -r -d '' file; do
+      [[ $file == */* ]] && continue
+      install -Dm644 "$_plugin/$file" "$plugin/$file"
+    done
+  install -Dm644 "$_plugin/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/omarchy-plugin-LICENSE"
+}

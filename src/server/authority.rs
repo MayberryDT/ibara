@@ -587,7 +587,8 @@ fn principal_from(node: &str, max: usize) -> String {
 /// The principal for a requesting computer: the name its key already has here,
 /// else its node name, or `name-2` … `name-9` when another computer already holds
 /// that name or the name is the local owner's. Its own earlier pairing (same
-/// key, or same Tailscale node) keeps its name and is replaced.
+/// key, or same Tailscale node, or for the owner's own computer a pairing of
+/// that name that recorded no Tailscale node) keeps its name and is replaced.
 fn choose_principal<E: Engine + 'static>(server: &Server<E>, current: &Map<String, Value>, request: &Enrollment<'_>) -> Result<String> {
     // The same key, whatever the computer is called now: its earlier name, so root
     // never holds one key under two names.
@@ -600,10 +601,15 @@ fn choose_principal<E: Engine + 'static>(server: &Server<E>, current: &Map<Strin
             continue;
         }
         let ours = match current.get(&candidate) {
-            Some(record) => {
-                record.pointer("/tailscale/stable_id").and_then(Value::as_str) == Some(request.stable_id)
-                    || holds_key(server, &candidate, record, &request.key.fingerprint)
-            }
+            Some(record) => match record.pointer("/tailscale/stable_id").and_then(Value::as_str) {
+                Some(recorded) => recorded == request.stable_id || holds_key(server, &candidate, record, &request.key.fingerprint),
+                // A pairing from before tailnet pairing recorded no computer. The
+                // owner's own computer of that name (Tailscale names are unique in
+                // a tailnet) is the computer it was, as after ibara was reinstalled
+                // there with its data deleted: it takes the pairing over, with the
+                // rights its own request earns.
+                None => request.own_computer || holds_key(server, &candidate, record, &request.key.fingerprint),
+            },
             None => server.engine.access_pairing_key(&candidate).is_none_or(|key| key == request.key.fingerprint),
         };
         if ours {

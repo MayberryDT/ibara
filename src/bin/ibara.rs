@@ -30,12 +30,45 @@ fn main() -> ExitCode {
         "unattended-boot" => ibara::install::unattended_boot_main(args),
         // End-to-end runs of the agent contract (src/harness/).
         "harness" => code(ibara::harness::main(args)),
+        "--help" | "-h" | "help" => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        "--version" | "-V" => {
+            println!("ibara {}", version());
+            ExitCode::SUCCESS
+        }
         _ => {
-            eprintln!(
-                "Usage: ibara <setup|update|rollback|uninstall|client|operator|control|mcp|prompt|agent-entry|admin|access-system|power-system|chrome-host|browser-setup|backup-journals|join|away|video|unattended-boot|harness> …\n\nTo connect an agent, copy the prompt from Connect an Agent in the ibara console and paste it to your agent;\nit connects itself. ibara prompt prints the same prompt."
-            );
+            eprint!("{USAGE}");
             ExitCode::from(64)
         }
+    }
+}
+
+/// The commands a person runs. The rest are started by ibara itself and stay unlisted.
+const USAGE: &str = "Usage: ibara COMMAND …
+
+Commands:
+  setup             Set ibara up for you on this computer (run after installing or updating)
+  update            Install the latest ibara release
+  rollback          Go back to the release installed before this one
+  uninstall         Remove ibara (--delete-data also removes its data)
+  prompt            Print the prompt that connects an agent
+  mcp               The agent connection an agent's settings start
+  client            Send and get files, and name computers
+  join              Answer a request to add this computer
+  unattended-boot   Let this computer start ibara before anyone signs in
+  --version         Print ibara's version
+
+To connect an agent, copy the prompt from Connect an Agent in the ibara console and paste it to your agent;
+it connects itself. ibara prompt prints the same prompt.
+";
+
+/// `pkgver-pkgrel` for a packaged build (the PKGBUILD sets IBARA_PKGREL), `pkgver` otherwise.
+fn version() -> String {
+    match option_env!("IBARA_PKGREL") {
+        Some(rel) if !rel.is_empty() => format!("{}-{rel}", env!("CARGO_PKG_VERSION")),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 

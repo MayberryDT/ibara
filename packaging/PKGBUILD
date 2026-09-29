@@ -31,7 +31,7 @@ depends=(
   'glibc' 'gcc-libs'
   'hyprland' 'grim' 'at-spi2-core'
   'cua-driver-bin>=0.28.2'
-  'openssh' 'openssl' 'acl' 'sudo' 'curl' 'pacman'
+  'openssh' 'openssl' 'acl' 'sudo' 'curl' 'jq' 'pacman'
   'tailscale'
   # Cua's Hyprland plugin is built on each computer for its exact Hyprland.
   'cmake' 'ninja' 'gcc' 'pkgconf'
@@ -75,6 +75,8 @@ build() {
   local cargo_home
   cargo_home=$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$(realpath "$_core")=/ibara --remap-path-prefix=$(realpath -m "$CARGO_TARGET_DIR")=/target"
+  # `ibara --version` prints pkgver-pkgrel.
+  export IBARA_PKGREL=$pkgrel
   cargo build --frozen --release --bins
 }
 

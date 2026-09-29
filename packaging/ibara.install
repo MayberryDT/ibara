@@ -1,5 +1,7 @@
 post_install() {
-  echo "ibara is installed. To finish, run as yourself (not root): ibara setup"
+  # install.sh runs ibara setup itself right after pacman.
+  [ -n "${IBARA_INSTALLER:-}" ] ||
+    echo "ibara is installed. To finish, run as yourself (not root): ibara setup"
 }
 
 pre_remove() {

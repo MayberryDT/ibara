@@ -23,6 +23,8 @@
 #include <src/protocols/core/Seat.hpp>
 #include <src/protocols/core/DataDevice.hpp>
 #include <src/layout/LayoutManager.hpp>
+#include <src/desktop/view/Popup.hpp>
+#include <src/desktop/view/WLSurface.hpp>
 #include <linux/input-event-codes.h>
 #include <wayland.hpp>
 #include <wayland-server-core.h>
@@ -811,6 +813,48 @@ struct InputExperiment::Impl {
         return foreground_resources_match(seat->m_pointers, foreground_pointers) &&
             foreground_resources_match(seat->m_keyboards, foreground_keyboards);
     }
+    // ibara: the seat grab is one of the target's own popups (a GTK popover
+    // or menu of this window). Hyprland's xdg-shell grab holds each grabbing
+    // popup and its parent, so it accepts the target root only for a popup
+    // of this window; a grab of another client, or of another window of the
+    // same client, does not accept it.
+    static bool own_grab(const SP<CWLSurfaceResource>& root) {
+        const auto& grab = g_pSeatManager->m_seatGrab;
+        return root && grab && grab->accepts(root);
+    }
+    // ibara: `surface` is the root, or one of its own popups under its grab,
+    // where a person's key or click would go while the popup is open.
+    static bool own_surface(const SP<CWLSurfaceResource>& root, const SP<CWLSurfaceResource>& surface) {
+        if (!root || !surface) return false;
+        return surface == root ||
+            (own_grab(root) && surface->client() == root->client() && g_pSeatManager->m_seatGrab->accepts(surface));
+    }
+    struct PointerHit {
+        SP<CWLSurfaceResource> surface;
+        Vector2D local;
+    };
+    // ibara: the surface a point of the target hits and the point on it. While
+    // one of the window's own popups holds the grab, a point on a popup hits
+    // that popup, as Hyprland routes a person's pointer there; elsewhere it
+    // must hit the root itself. Nothing when the point is on one of the
+    // root's subsurfaces (a video, an overlay) or a popup the grab does not hold.
+    PointerHit pointer_hit(Client& c, double x, double y) const {
+        const auto root = c.surface.lock(); const auto window = c.window.lock();
+        if (!root || !window || !point(c, x, y)) return {};
+        if (own_grab(root) && window->m_popupHead) {
+            const Vector2D global{x + c.geometry[0], y + c.geometry[1]};
+            if (const auto popup = window->m_popupHead->at(global, true)) {
+                const auto view = popup->wlSurface();
+                const auto surface = view ? view->resource() : nullptr;
+                const auto local = global - popup->coordsGlobal();
+                if (own_surface(root, surface) && surface->at(local, true).first == surface) return {surface, local};
+                return {};
+            }
+        }
+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        if (root->at(local, true).first == root) return {root, local};
+        return {};
+    }
     ForegroundGuard foreground_guard(const Client& c) const {
         const auto root = c.surface.lock();
         const auto geometry = target_geometry(c.window.lock(), root);
@@ -826,13 +870,15 @@ struct InputExperiment::Impl {
             .peer_conflict = agent_conflict(c),
             .physical_keys = pressed,
             .physical_buttons = g_pInputManager->hasHeldButtons(),
-            .grab = bool(g_pSeatManager->m_seatGrab) || bool(g_layoutManager->dragController()->target()) ||
+            // ibara: the target's own popup grab is not in the way: keys and
+            // points go to the popup, as a person's would.
+            .grab = (g_pSeatManager->m_seatGrab && !own_grab(root)) || bool(g_layoutManager->dragController()->target()) ||
                 !g_pInputManager->m_exclusiveLSes.empty(),
             .dnd = PROTO::data && PROTO::data->dndActive(),
             .constraint = g_pInputManager->isConstrained(),
-            .exact_keyboard_focus = root && g_pSeatManager->m_state.keyboardFocus == root &&
+            .exact_keyboard_focus = own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()) &&
                 Desktop::focusState()->window() == c.window.lock() && Desktop::focusState()->surface() == root,
-            .exact_pointer_focus = root && g_pSeatManager->m_state.pointerFocus == root,
+            .exact_pointer_focus = own_surface(root, g_pSeatManager->m_state.pointerFocus.lock()),
         };
     }
     void require_foreground(Client& c) {
@@ -848,15 +894,16 @@ struct InputExperiment::Impl {
         foreground_activating = false;
         if (!foreground_started) return;
         // Release only our own synthetic state, and only while these resources
-        // still address the original root. A focus loss must not send to its successor.
+        // still address the original root or its own popup. A focus loss must
+        // not send to its successor.
         const auto root = foreground_surface.lock();
-        if (root && root->good() && g_pSeatManager->m_state.pointerFocus == root)
+        if (root && root->good() && own_surface(root, g_pSeatManager->m_state.pointerFocus.lock()))
             for (const auto& weak : foreground_pointers)
                 if (const auto p = weak.lock(); p && p->good() && held_button) {
                     p->sendButton(event_ms(), held_button, WL_POINTER_BUTTON_STATE_RELEASED);
                     p->sendFrame();
                 }
-        if (foreground_keyboard_used && root && root->good() && g_pSeatManager->m_state.keyboardFocus == root)
+        if (foreground_keyboard_used && root && root->good() && own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()))
             for (const auto& weak : foreground_keyboards)
                 if (const auto k = weak.lock(); k && k->good()) {
                     for (auto code : held_keys) k->sendKey(event_ms(), code, WL_KEYBOARD_KEY_STATE_RELEASED);
@@ -875,8 +922,8 @@ struct InputExperiment::Impl {
         if (!physical) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
         if (!keyboard_state) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
         if (needs_pointer && !g_pSeatManager->m_mouse) throw ForegroundFailure{ForegroundFailureReason::physical_pointer};
-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-        if (needs_pointer && (!point(c, x, y) || root->at(local, true).first != root)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+        const auto hit = needs_pointer ? pointer_hit(c, x, y) : PointerHit{};
+        if (needs_pointer && !hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
         const auto seat = g_pSeatManager->seatResourceForClient(root->client());
         if (!seat || !seat->good()) throw ForegroundFailure{ForegroundFailureReason::seat_resource};
         foreground_pointers.clear(); foreground_keyboards.clear();
@@ -910,7 +957,9 @@ struct InputExperiment::Impl {
         foreground_started = true;
         foreground_activating = true;
         // Activation intentionally persists. Never save, borrow, or restore focus.
-        if (g_pSeatManager->m_state.keyboardFocus != root || Desktop::focusState()->window() != c.window.lock() ||
+        // ibara: the keyboard stays on the window's own open popup, which a
+        // window focus would take it from.
+        if (!own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()) || Desktop::focusState()->window() != c.window.lock() ||
             Desktop::focusState()->surface() != root)
             Desktop::focusState()->fullWindowFocus(c.window.lock(), Desktop::FOCUS_REASON_OTHER, root);
         foreground_activating = false;
@@ -923,37 +972,44 @@ struct InputExperiment::Impl {
         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
         const auto warp_failure = foreground_guard(c).dispatch_failure(false);
         if (warp_failure != ForegroundFailureReason::none) throw ForegroundFailure{warp_failure};
-        g_pSeatManager->setPointerFocus(root, local);
+        g_pSeatManager->setPointerFocus(hit.surface, hit.local);
         foreground_activating = false;
         require_foreground(c);
         foreground_motion(c, x, y);
     }
     void foreground_motion(Client& c, double x, double y) {
         require_foreground(c);
-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-        if (!point(c, x, y) || c.surface.lock()->at(local, true).first != c.surface.lock()) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+        const auto hit = pointer_hit(c, x, y);
+        if (!hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+        // ibara: a held button keeps the surface it pressed on, as a person's
+        // implicit grab does; moving onto another surface (the root from its
+        // popup) is refused, as moving onto a subsurface is.
+        if (g_pSeatManager->m_state.pointerFocus != hit.surface && held_button) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
         warp_pointer({x + c.geometry[0], y + c.geometry[1]});
+        if (g_pSeatManager->m_state.pointerFocus != hit.surface) g_pSeatManager->setPointerFocus(hit.surface, hit.local);
         require_foreground(c);
         for (const auto& weak : foreground_pointers) {
             const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
-            p->sendMotion(event_ms(), local); p->sendFrame();
+            p->sendMotion(event_ms(), hit.local); p->sendFrame();
         }
     }
     // ibara: one step of a click's travel. Unlike a drag no button holds an
     // implicit grab, so the compositor may re-pick the pointer focus after a
-    // warp; keep it on the target root, as start_foreground does. Points on
-    // the way may lie over the target's own subsurfaces; only the press point
-    // must hit the root itself (checked on arrival).
+    // warp; keep it on the target root, or on the window's own popup under
+    // the point while that popup holds the grab, as start_foreground does.
+    // Points on the way may lie over the target's own subsurfaces; only the
+    // press point must hit the root or its popup itself (checked on arrival).
     void travel_motion(Client& c, double x, double y) {
         const auto root = c.surface.lock();
         if (!root || !point(c, x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        auto hit = pointer_hit(c, x, y);
+        if (!hit.surface) hit = {root, {x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]}};
         warp_pointer({x + c.geometry[0], y + c.geometry[1]});
-        g_pSeatManager->setPointerFocus(root, local);
+        g_pSeatManager->setPointerFocus(hit.surface, hit.local);
         require_foreground(c);
         for (const auto& weak : foreground_pointers) {
             const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
-            p->sendMotion(event_ms(), local); p->sendFrame();
+            p->sendMotion(event_ms(), hit.local); p->sendFrame();
         }
     }
     void warp_pointer(const Vector2D& to) {
@@ -1268,15 +1324,13 @@ struct InputExperiment::Impl {
         if (command == "CLICK") {
             // ibara: start where the pointer is (kept inside the window), then
             // travel, rest and press from step(). The reply follows the release.
-            // Like the press point, the start must hit the target root itself:
-            // from over one of its subsurfaces (a video, an overlay) the click
-            // starts at the press point instead of being refused. A press point
-            // off the root is refused now, before any effect, as upstream does.
+            // Like the press point, the start must hit the target root itself
+            // (or its own popup while that popup holds the grab): from over one
+            // of its subsurfaces (a video, an overlay) the click starts at the
+            // press point instead of being refused. A press point off the root
+            // is refused now, before any effect, as upstream does.
             const auto root = c.surface.lock();
-            const auto hits_root = [&](double px, double py) {
-                const Vector2D local{px + c.geometry[0] - c.geometry[4], py + c.geometry[1] - c.geometry[5]};
-                return root && point(c, px, py) && root->at(local, true).first == root;
-            };
+            const auto hits_root = [&](double px, double py) { return bool(pointer_hit(c, px, py).surface); };
             if (root && !hits_root(x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
             const auto at = ::Pointer::mgr()->position();
             const double sx = std::clamp(at.x - c.geometry[0], 1.0, std::max(1.0, c.geometry[2] - 2));

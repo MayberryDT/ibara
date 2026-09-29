@@ -626,7 +626,7 @@ impl Router {
                     words.push(format!("{} offline", target.label));
                     computers.push(json!({
                         "id": target.cmp_id(), "name": target.label, "state": "offline",
-                        "capabilities": format!("not reachable: {}", clip(&why, 160)),
+                        "capabilities": if why.contains("not reachable") { clip(&why, 240) } else { format!("not reachable: {}", clip(&why, 220)) },
                     }));
                 }
             }
@@ -1168,8 +1168,24 @@ async fn open(database: &Path, computer: &str, params: Value) -> Result<Upstream
             upstream.shutdown().await;
             // Let the stderr task drain what ssh said last.
             let _ = tokio::time::timeout(Duration::from_millis(500), diagnostics).await;
-            let tail = lock(&tail).trim().to_string();
-            Err(unreachable_route(if tail.is_empty() { reason } else { format!("{reason} {tail}") }))
+            let tail = lock(&tail).clone();
+            Err(unreachable_route(match route_trouble(&tail) {
+                Some(plain) => format!("{reason} {plain}"),
+                None => reason,
+            }))
         }
     }
+}
+
+/// What ssh's last words mean for a person, in plain words, or its last whole
+/// line. The kept tail can start mid-line, so a partial first line is dropped.
+fn route_trouble(tail: &str) -> Option<String> {
+    if tail.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || tail.contains("Host key verification failed") {
+        return Some(
+            "Its identity changed since it was added, as after ibara was reinstalled there. Remove it from the fleet in the console (Remove Computer) and add it again from Add Computer."
+                .into(),
+        );
+    }
+    let whole = if tail.len() >= 400 { tail.split_once('\n').map_or("", |(_, rest)| rest) } else { tail };
+    whole.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('@')).next_back().map(|l| clip(l, 200))
 }

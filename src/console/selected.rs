@@ -5,7 +5,7 @@
 use super::envelope::{Fault, Handled, clip};
 use super::process::which;
 use super::viewer::{KEYS_CHORD, ibara_view, identity_dir, launch_ibara_view, launch_viewer, viewer_identity};
-use super::{Ctx, clipboard, option, validated_id};
+use super::{Console, Ctx, clipboard, option, validated_id};
 use crate::operator::directory::{ListedComputer, OperatorDirectory};
 use crate::operator::{js, pattern};
 use serde_json::{Value, json};
@@ -339,7 +339,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
         clipboard::stop(&ctx.console, &computer);
         // The stream has ended; a viewer left running would block the next one.
-        let closed = close_viewer(ctx, &computer);
+        let closed = close_viewer(&ctx.console, &computer);
         return Ok(ctx.ready(with(&data, &[("viewer_started", json!(false)), ("viewer_closed", json!(closed))])));
     }
     let ready = reply.get("viewer_ready") == Some(&json!(true))
@@ -510,8 +510,8 @@ fn remember_viewer(ctx: &Ctx, computer: &str, pid: u32) {
 
 /// End the viewer this console started for `computer`, if it is still that
 /// viewer (ibara-view, or Moonlight for an older computer). Whether one was ended.
-fn close_viewer(ctx: &Ctx, computer: &str) -> bool {
-    let Some(pid) = ctx.console.viewers.lock().unwrap_or_else(|e| e.into_inner()).remove(computer) else { return false };
+pub(super) fn close_viewer(console: &Console, computer: &str) -> bool {
+    let Some(pid) = console.viewers.lock().unwrap_or_else(|e| e.into_inner()).remove(computer) else { return false };
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let Ok(pid) = i32::try_from(pid) else { return false };
     // SAFETY: signals a process this console started, checked by name first.

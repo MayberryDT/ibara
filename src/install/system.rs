@@ -99,12 +99,14 @@ fn set_up(desktop: &Account, by_person: bool) -> Result<(), String> {
 }
 
 /// After the ibara package was installed or upgraded (pacman hook): set up
-/// again for the person who set this computer up; nothing when setup never ran.
+/// again for the person who set this computer up. Quiet when setup never ran
+/// (the package's install note says to run it) and under install.sh, which
+/// runs setup itself next (IBARA_INSTALLER).
 fn refresh() -> Result<(), String> {
-    let Some(owner) = station_owner() else {
-        println!("ibara is installed. To finish, run as yourself: ibara setup");
+    if std::env::var_os("IBARA_INSTALLER").is_some() {
         return Ok(());
-    };
+    }
+    let Some(owner) = station_owner() else { return Ok(()) };
     set_up(&Account::desktop(&owner)?, false)
 }
 

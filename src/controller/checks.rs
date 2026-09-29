@@ -320,7 +320,12 @@ impl Controller {
         match check {
             Check::FileExists(c) => match self.resolve_path(&task.task_ref, &c.path) {
                 Ok(path) if path.is_file() => Evaluated::met(format!("{} exists", c.path)),
-                Ok(_) => Evaluated::unmet(format!("{} does not exist", c.path)),
+                // A relative path is the task's workspace, not the home folder: say where it looked.
+                Ok(path) => Evaluated::unmet(if c.path.starts_with('/') || c.path.starts_with('~') {
+                    format!("{} does not exist", c.path)
+                } else {
+                    format!("{} does not exist (a relative path is in the task's workspace: {}; use ~/ for the home folder)", c.path, path.display())
+                }),
                 Err(e) => Evaluated::unknown(e.message),
             },
             Check::FileContent(c) => match self.resolve_path(&task.task_ref, &c.path).map(|p| read_bounded(&p)) {

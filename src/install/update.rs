@@ -356,8 +356,10 @@ pub fn rollback(args: &[String]) -> Result<(), String> {
     }
     let me = Account::current()?;
     let installed = installed_version().ok_or("The ibara package is not installed.")?;
+    // Said before sudo asks for a password it would not need.
+    let (earlier, _) = earlier_release(&installed)?;
     let plugin_before = super::user::plugin_digest();
-    println!("Going back to the ibara version before {installed} needs your password once (sudo).");
+    println!("Going back from ibara {installed} to {earlier} needs your password once (sudo).");
     as_root(&["rollback", &me.name])?;
     let now = installed_version().unwrap_or_default();
     restore_journals_if_newer(&me, &now)?;
@@ -372,16 +374,21 @@ pub fn rollback(args: &[String]) -> Result<(), String> {
 /// its packages together.
 pub fn system_rollback(desktop: &Account) -> Result<(), String> {
     let installed = installed_version().ok_or("The ibara package is not installed.")?;
-    let has_ibara = |files: &[PathBuf]| files.iter().any(|f| f.file_name().is_some_and(|n| package_version("ibara", &n.to_string_lossy()).is_some()));
-    let (version, files) = cached()
-        .into_iter()
-        .find(|(v, files)| vercmp(v, &installed).is_ok_and(|c| c < 0) && has_ibara(files))
-        .ok_or("No earlier version of ibara is kept on this computer.")?;
+    let (version, files) = earlier_release(&installed)?;
     refuse_while_busy()?;
     // The controller stops, so its journals can be swapped if they must be.
     let _ = output(&mut desktop.userctl(&["stop", USER_UNITS[0]]));
     println!("Installing ibara {version}…");
     interactive(Command::new("pacman").args(["-U", "--noconfirm"]).args(&files))
+}
+
+/// The newest kept release older than `installed` that has the ibara package.
+fn earlier_release(installed: &str) -> Result<(String, Vec<PathBuf>), String> {
+    let has_ibara = |files: &[PathBuf]| files.iter().any(|f| f.file_name().is_some_and(|n| package_version("ibara", &n.to_string_lossy()).is_some()));
+    cached()
+        .into_iter()
+        .find(|(v, files)| vercmp(v, installed).is_ok_and(|c| c < 0) && has_ibara(files))
+        .ok_or_else(|| format!("There is no earlier ibara release to go back to: {installed} is the only one kept on this computer."))
 }
 
 /// `meta.core_schema_version` of a journal, opened read-only.

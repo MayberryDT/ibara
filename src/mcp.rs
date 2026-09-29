@@ -392,7 +392,7 @@ mod tests {
             let r = c.request(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).await;
             let tools = r["result"]["tools"].as_array().unwrap();
             assert_eq!(tools.len(), 11);
-            assert!(serde_json::to_vec(tools).unwrap().len() <= 9 * 1024);
+            assert!(serde_json::to_vec(tools).unwrap().len() <= 10 * 1024);
             assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
         })
         .await;

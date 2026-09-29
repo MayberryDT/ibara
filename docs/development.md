@@ -71,7 +71,7 @@ CI runs the same `cargo test --locked` as an ordinary user in an `archlinux:base
 2. Change its entry in `TOOLS` in `src/contract/schema.rs`: a short summary of when to use it, the long description and one example. A test parses every example.
 3. Add any new result type to `src/contract/envelope.rs`, and a short rendering of it to `src/contract/render.rs`.
 4. Update [agent tools](agent-tools.md).
-5. Run `cargo test`. It checks that every schema is valid and that the whole tool list stays within 9 KiB.
+5. Run `cargo test`. It checks that every schema is valid and that the whole tool list stays within 10 KiB.
 
 [Internals](internals.md#contract-and-mcp) explains the parsing and schema rules.
 

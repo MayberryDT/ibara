@@ -35,7 +35,7 @@ pub const CONNECT_PROMPT: &str = concat!(
     "## ibara\n",
     "The MCP server `ibara` lets you use real computers your person owns: desktop apps, a signed-in browser, the screen and files. When a task needs real input, a real browser session, a visual check or work on another computer, call ibara's `computer_status` and follow the ibara skill (/usr/share/ibara/skills/ibara/SKILL.md). Keep code, git, tests and pages you can fetch where you are.\n",
     "<!-- ibara:end -->\n\n",
-    "Then load the server (restart yourself if you must) and call its `computer_status` tool. Tell me which computers you can use and which of the three steps you did."
+    "Then call ibara's `computer_status` tool. If its tools won't appear until you restart, say so and ask me to restart you and paste this prompt again; doing it twice is safe. Tell me which computers you can use and which of the three steps you did."
 );
 
 /// The console's `connect-prompt`.

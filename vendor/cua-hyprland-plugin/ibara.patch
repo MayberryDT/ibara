@@ -1,8 +1,17 @@
 diff --git a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
-index fc7e740bb..3ef70c5d2 100644
+index fc7e740bb..7df7e0150 100644
 --- a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
 +++ b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
-@@ -183,7 +183,28 @@ struct InputExperiment::Impl {
+@@ -23,6 +23,8 @@
+ #include <src/protocols/core/Seat.hpp>
+ #include <src/protocols/core/DataDevice.hpp>
+ #include <src/layout/LayoutManager.hpp>
++#include <src/desktop/view/Popup.hpp>
++#include <src/desktop/view/WLSurface.hpp>
+ #include <linux/input-event-codes.h>
+ #include <wayland.hpp>
+ #include <wayland-server-core.h>
+@@ -183,7 +185,28 @@ struct InputExperiment::Impl {
          Clock::time_point start;
          unsigned duration;
          DragGeometry geometry;
@@ -31,7 +40,7 @@ index fc7e740bb..3ef70c5d2 100644
      int listener = -1;
      wl_event_source* listen_source = nullptr;
      wl_event_source* timer = nullptr;
-@@ -228,6 +249,10 @@ struct InputExperiment::Impl {
+@@ -228,6 +251,10 @@ struct InputExperiment::Impl {
      std::vector<WP<CWLPointerResource>> foreground_pointers;
      std::vector<WP<CWLKeyboardResource>> foreground_keyboards;
      std::array<std::uint32_t, 4> foreground_modifiers{};
@@ -42,7 +51,7 @@ index fc7e740bb..3ef70c5d2 100644
  
      explicit Impl(const std::string& directory, unsigned index) : lane(index) {
  #ifdef CUA_HYPRLAND_TEST_INPUT
-@@ -243,15 +268,39 @@ struct InputExperiment::Impl {
+@@ -243,15 +270,39 @@ struct InputExperiment::Impl {
          // No private key or input-enabled default exists in this component.
      }
  
@@ -85,7 +94,7 @@ index fc7e740bb..3ef70c5d2 100644
          std::free(actual); std::free(expected); xkb_keymap_unref(reference);
          return matches;
      }
-@@ -589,10 +638,14 @@ struct InputExperiment::Impl {
+@@ -589,10 +640,14 @@ struct InputExperiment::Impl {
      }
      void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
          if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
@@ -104,7 +113,106 @@ index fc7e740bb..3ef70c5d2 100644
          drag.reset();
          finish_foreground();
          if (retain_pointer) release_pointer_button(); else leave_pointer();
-@@ -840,7 +893,13 @@ struct InputExperiment::Impl {
+@@ -758,6 +813,48 @@ struct InputExperiment::Impl {
+         return foreground_resources_match(seat->m_pointers, foreground_pointers) &&
+             foreground_resources_match(seat->m_keyboards, foreground_keyboards);
+     }
++    // ibara: the seat grab is one of the target's own popups (a GTK popover
++    // or menu of this window). Hyprland's xdg-shell grab holds each grabbing
++    // popup and its parent, so it accepts the target root only for a popup
++    // of this window; a grab of another client, or of another window of the
++    // same client, does not accept it.
++    static bool own_grab(const SP<CWLSurfaceResource>& root) {
++        const auto& grab = g_pSeatManager->m_seatGrab;
++        return root && grab && grab->accepts(root);
++    }
++    // ibara: `surface` is the root, or one of its own popups under its grab,
++    // where a person's key or click would go while the popup is open.
++    static bool own_surface(const SP<CWLSurfaceResource>& root, const SP<CWLSurfaceResource>& surface) {
++        if (!root || !surface) return false;
++        return surface == root ||
++            (own_grab(root) && surface->client() == root->client() && g_pSeatManager->m_seatGrab->accepts(surface));
++    }
++    struct PointerHit {
++        SP<CWLSurfaceResource> surface;
++        Vector2D local;
++    };
++    // ibara: the surface a point of the target hits and the point on it. While
++    // one of the window's own popups holds the grab, a point on a popup hits
++    // that popup, as Hyprland routes a person's pointer there; elsewhere it
++    // must hit the root itself. Nothing when the point is on one of the
++    // root's subsurfaces (a video, an overlay) or a popup the grab does not hold.
++    PointerHit pointer_hit(Client& c, double x, double y) const {
++        const auto root = c.surface.lock(); const auto window = c.window.lock();
++        if (!root || !window || !point(c, x, y)) return {};
++        if (own_grab(root) && window->m_popupHead) {
++            const Vector2D global{x + c.geometry[0], y + c.geometry[1]};
++            if (const auto popup = window->m_popupHead->at(global, true)) {
++                const auto view = popup->wlSurface();
++                const auto surface = view ? view->resource() : nullptr;
++                const auto local = global - popup->coordsGlobal();
++                if (own_surface(root, surface) && surface->at(local, true).first == surface) return {surface, local};
++                return {};
++            }
++        }
++        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
++        if (root->at(local, true).first == root) return {root, local};
++        return {};
++    }
+     ForegroundGuard foreground_guard(const Client& c) const {
+         const auto root = c.surface.lock();
+         const auto geometry = target_geometry(c.window.lock(), root);
+@@ -773,13 +870,15 @@ struct InputExperiment::Impl {
+             .peer_conflict = agent_conflict(c),
+             .physical_keys = pressed,
+             .physical_buttons = g_pInputManager->hasHeldButtons(),
+-            .grab = bool(g_pSeatManager->m_seatGrab) || bool(g_layoutManager->dragController()->target()) ||
++            // ibara: the target's own popup grab is not in the way: keys and
++            // points go to the popup, as a person's would.
++            .grab = (g_pSeatManager->m_seatGrab && !own_grab(root)) || bool(g_layoutManager->dragController()->target()) ||
+                 !g_pInputManager->m_exclusiveLSes.empty(),
+             .dnd = PROTO::data && PROTO::data->dndActive(),
+             .constraint = g_pInputManager->isConstrained(),
+-            .exact_keyboard_focus = root && g_pSeatManager->m_state.keyboardFocus == root &&
++            .exact_keyboard_focus = own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()) &&
+                 Desktop::focusState()->window() == c.window.lock() && Desktop::focusState()->surface() == root,
+-            .exact_pointer_focus = root && g_pSeatManager->m_state.pointerFocus == root,
++            .exact_pointer_focus = own_surface(root, g_pSeatManager->m_state.pointerFocus.lock()),
+         };
+     }
+     void require_foreground(Client& c) {
+@@ -795,15 +894,16 @@ struct InputExperiment::Impl {
+         foreground_activating = false;
+         if (!foreground_started) return;
+         // Release only our own synthetic state, and only while these resources
+-        // still address the original root. A focus loss must not send to its successor.
++        // still address the original root or its own popup. A focus loss must
++        // not send to its successor.
+         const auto root = foreground_surface.lock();
+-        if (root && root->good() && g_pSeatManager->m_state.pointerFocus == root)
++        if (root && root->good() && own_surface(root, g_pSeatManager->m_state.pointerFocus.lock()))
+             for (const auto& weak : foreground_pointers)
+                 if (const auto p = weak.lock(); p && p->good() && held_button) {
+                     p->sendButton(event_ms(), held_button, WL_POINTER_BUTTON_STATE_RELEASED);
+                     p->sendFrame();
+                 }
+-        if (foreground_keyboard_used && root && root->good() && g_pSeatManager->m_state.keyboardFocus == root)
++        if (foreground_keyboard_used && root && root->good() && own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()))
+             for (const auto& weak : foreground_keyboards)
+                 if (const auto k = weak.lock(); k && k->good()) {
+                     for (auto code : held_keys) k->sendKey(event_ms(), code, WL_KEYBOARD_KEY_STATE_RELEASED);
+@@ -822,8 +922,8 @@ struct InputExperiment::Impl {
+         if (!physical) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
+         if (!keyboard_state) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
+         if (needs_pointer && !g_pSeatManager->m_mouse) throw ForegroundFailure{ForegroundFailureReason::physical_pointer};
+-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+-        if (needs_pointer && (!point(c, x, y) || root->at(local, true).first != root)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
++        const auto hit = needs_pointer ? pointer_hit(c, x, y) : PointerHit{};
++        if (needs_pointer && !hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+         const auto seat = g_pSeatManager->seatResourceForClient(root->client());
+         if (!seat || !seat->good()) throw ForegroundFailure{ForegroundFailureReason::seat_resource};
+         foreground_pointers.clear(); foreground_keyboards.clear();
+@@ -840,7 +940,13 @@ struct InputExperiment::Impl {
              foreground_modifiers[2] |= kb->m_modifiersState.locked;
          }
          if (needs_keyboard) {
@@ -119,7 +227,18 @@ index fc7e740bb..3ef70c5d2 100644
              if (modifier_failure != ForegroundFailureReason::none) throw ForegroundFailure{modifier_failure};
          }
          xkb_state_update_mask(keyboard_state, foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], 0, 0, foreground_modifiers[3]);
-@@ -860,7 +919,7 @@ struct InputExperiment::Impl {
+@@ -851,7 +957,9 @@ struct InputExperiment::Impl {
+         foreground_started = true;
+         foreground_activating = true;
+         // Activation intentionally persists. Never save, borrow, or restore focus.
+-        if (g_pSeatManager->m_state.keyboardFocus != root || Desktop::focusState()->window() != c.window.lock() ||
++        // ibara: the keyboard stays on the window's own open popup, which a
++        // window focus would take it from.
++        if (!own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()) || Desktop::focusState()->window() != c.window.lock() ||
+             Desktop::focusState()->surface() != root)
+             Desktop::focusState()->fullWindowFocus(c.window.lock(), Desktop::FOCUS_REASON_OTHER, root);
+         foreground_activating = false;
+@@ -860,26 +968,54 @@ struct InputExperiment::Impl {
          if (focus_failure != ForegroundFailureReason::none) throw ForegroundFailure{focus_failure};
          if (!needs_pointer) { require_foreground(c); return; }
          foreground_activating = true;
@@ -128,33 +247,49 @@ index fc7e740bb..3ef70c5d2 100644
          if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
          const auto warp_failure = foreground_guard(c).dispatch_failure(false);
          if (warp_failure != ForegroundFailureReason::none) throw ForegroundFailure{warp_failure};
-@@ -873,13 +932,34 @@ struct InputExperiment::Impl {
+-        g_pSeatManager->setPointerFocus(root, local);
++        g_pSeatManager->setPointerFocus(hit.surface, hit.local);
+         foreground_activating = false;
          require_foreground(c);
-         const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-         if (!point(c, x, y) || c.surface.lock()->at(local, true).first != c.surface.lock()) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+         foreground_motion(c, x, y);
+     }
+     void foreground_motion(Client& c, double x, double y) {
+         require_foreground(c);
+-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+-        if (!point(c, x, y) || c.surface.lock()->at(local, true).first != c.surface.lock()) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
 -        ::Pointer::mgr()->warpTo({x + c.geometry[0], y + c.geometry[1]});
++        const auto hit = pointer_hit(c, x, y);
++        if (!hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
++        // ibara: a held button keeps the surface it pressed on, as a person's
++        // implicit grab does; moving onto another surface (the root from its
++        // popup) is refused, as moving onto a subsurface is.
++        if (g_pSeatManager->m_state.pointerFocus != hit.surface && held_button) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
 +        warp_pointer({x + c.geometry[0], y + c.geometry[1]});
++        if (g_pSeatManager->m_state.pointerFocus != hit.surface) g_pSeatManager->setPointerFocus(hit.surface, hit.local);
          require_foreground(c);
          for (const auto& weak : foreground_pointers) {
              const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
-             p->sendMotion(event_ms(), local); p->sendFrame();
+-            p->sendMotion(event_ms(), local); p->sendFrame();
++            p->sendMotion(event_ms(), hit.local); p->sendFrame();
          }
      }
 +    // ibara: one step of a click's travel. Unlike a drag no button holds an
 +    // implicit grab, so the compositor may re-pick the pointer focus after a
-+    // warp; keep it on the target root, as start_foreground does. Points on
-+    // the way may lie over the target's own subsurfaces; only the press point
-+    // must hit the root itself (checked on arrival).
++    // warp; keep it on the target root, or on the window's own popup under
++    // the point while that popup holds the grab, as start_foreground does.
++    // Points on the way may lie over the target's own subsurfaces; only the
++    // press point must hit the root or its popup itself (checked on arrival).
 +    void travel_motion(Client& c, double x, double y) {
 +        const auto root = c.surface.lock();
 +        if (!root || !point(c, x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
-+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
++        auto hit = pointer_hit(c, x, y);
++        if (!hit.surface) hit = {root, {x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]}};
 +        warp_pointer({x + c.geometry[0], y + c.geometry[1]});
-+        g_pSeatManager->setPointerFocus(root, local);
++        g_pSeatManager->setPointerFocus(hit.surface, hit.local);
 +        require_foreground(c);
 +        for (const auto& weak : foreground_pointers) {
 +            const auto p = weak.lock(); if (!p || !p->good()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
-+            p->sendMotion(event_ms(), local); p->sendFrame();
++            p->sendMotion(event_ms(), hit.local); p->sendFrame();
 +        }
 +    }
 +    void warp_pointer(const Vector2D& to) {
@@ -164,22 +299,20 @@ index fc7e740bb..3ef70c5d2 100644
      void foreground_button(Client& c, std::uint32_t code, bool pressed) {
          require_foreground(c);
          // Mark ownership before sending, so a later resource failure can unwind.
-@@ -1185,14 +1265,36 @@ struct InputExperiment::Impl {
+@@ -1185,14 +1321,34 @@ struct InputExperiment::Impl {
              }
          }
          if (!consume_grant(c, cap)) return;
 +        if (command == "CLICK") {
 +            // ibara: start where the pointer is (kept inside the window), then
 +            // travel, rest and press from step(). The reply follows the release.
-+            // Like the press point, the start must hit the target root itself:
-+            // from over one of its subsurfaces (a video, an overlay) the click
-+            // starts at the press point instead of being refused. A press point
-+            // off the root is refused now, before any effect, as upstream does.
++            // Like the press point, the start must hit the target root itself
++            // (or its own popup while that popup holds the grab): from over one
++            // of its subsurfaces (a video, an overlay) the click starts at the
++            // press point instead of being refused. A press point off the root
++            // is refused now, before any effect, as upstream does.
 +            const auto root = c.surface.lock();
-+            const auto hits_root = [&](double px, double py) {
-+                const Vector2D local{px + c.geometry[0] - c.geometry[4], py + c.geometry[1] - c.geometry[5]};
-+                return root && point(c, px, py) && root->at(local, true).first == root;
-+            };
++            const auto hits_root = [&](double px, double py) { return bool(pointer_hit(c, px, py).surface); };
 +            if (root && !hits_root(x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
 +            const auto at = ::Pointer::mgr()->position();
 +            const double sx = std::clamp(at.x - c.geometry[0], 1.0, std::max(1.0, c.geometry[2] - 2));
@@ -203,7 +336,7 @@ index fc7e740bb..3ef70c5d2 100644
          } else if (command == "SCROLL") {
              require_foreground(c);
              for (const auto& weak : foreground_pointers) {
-@@ -1220,7 +1322,11 @@ struct InputExperiment::Impl {
+@@ -1220,7 +1376,11 @@ struct InputExperiment::Impl {
      }
      static int tick(void* data) {
          auto& self = *static_cast<Impl*>(data);
@@ -216,7 +349,7 @@ index fc7e740bb..3ef70c5d2 100644
          wl_event_source_timer_update(self.timer, self.retired ? 500 : 16); return 0;
      }
      void guard_targets() {
-@@ -1251,7 +1357,26 @@ struct InputExperiment::Impl {
+@@ -1251,7 +1411,26 @@ struct InputExperiment::Impl {
              const auto d = *drag;
              const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - d.start).count();
              const auto progress = std::min(elapsed / d.duration, 1.0);
@@ -244,7 +377,7 @@ index fc7e740bb..3ef70c5d2 100644
                  foreground_motion(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress);
                  if (progress >= 1) {
                      foreground_button(*d.client, 272, false); drag.reset(); ++dispatches;
-@@ -1288,6 +1413,8 @@ struct InputExperiment::DesktopListeners {
+@@ -1288,6 +1467,8 @@ struct InputExperiment::DesktopListeners {
      CHyprSignalListener lock, unlock, active, layout, added, removed, destroyed;
      CHyprSignalListener keyboard_layout, pointer_focus, keyboard_focus;
      CHyprSignalListener mouse_move, mouse_button, mouse_axis, keyboard_key, touch_down, tablet_tip;
@@ -253,7 +386,7 @@ index fc7e740bb..3ef70c5d2 100644
  
      explicit DesktopListeners(InputExperiment& input) : owner(input) {
          lock = g_pSessionLockManager->m_events.lock.listen([this] { changed(); });
-@@ -1302,7 +1429,7 @@ struct InputExperiment::DesktopListeners {
+@@ -1302,7 +1483,7 @@ struct InputExperiment::DesktopListeners {
              keyboard_focus = g_pSeatManager->m_events.keyboardFocusChange.listen([this] { primary_changed(); });
              // These notifications precede physical delivery. Retire our owned
              // press before the user's event can become held on the same resource.
@@ -262,7 +395,7 @@ index fc7e740bb..3ef70c5d2 100644
              mouse_button = Event::bus()->m_events.input.mouse.button.listen([this](IPointer::SButtonEvent, Event::SCallbackInfo&) { external_input(); });
              mouse_axis = Event::bus()->m_events.input.mouse.axis.listen([this](IPointer::SAxisEvent, Event::SCallbackInfo&) { external_input(); });
              keyboard_key = Event::bus()->m_events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent, Event::SCallbackInfo&) { external_input(); });
-@@ -1322,6 +1449,22 @@ struct InputExperiment::DesktopListeners {
+@@ -1322,6 +1503,22 @@ struct InputExperiment::DesktopListeners {
      void changed() {
          for (auto& lane : owner.lanes_) lane->desktop_transition();
      }
@@ -285,7 +418,7 @@ index fc7e740bb..3ef70c5d2 100644
      void external_input() {
          for (auto& lane : owner.lanes_)
              if (lane->lease && lane->lease->route == InputRoute::primary_foreground)
-@@ -1344,6 +1487,43 @@ struct InputExperiment::DesktopListeners {
+@@ -1344,6 +1541,43 @@ struct InputExperiment::DesktopListeners {
      }
  };
  
@@ -329,7 +462,7 @@ index fc7e740bb..3ef70c5d2 100644
  InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
      SeatLifetime lifetime(directory);
      for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
-@@ -1360,11 +1540,13 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
+@@ -1360,11 +1594,13 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
  #else
      (void)plugin;
  #endif

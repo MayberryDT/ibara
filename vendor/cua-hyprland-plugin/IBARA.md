@@ -58,6 +58,18 @@ ibara's changes are `ibara.patch`:
   an event, so it cannot move the pointer, press a button or interrupt the
   agent; a mouse, a touchpad or any other kernel pointer device (Take
   Control's passthrough pointer, `ydotool`) still interrupts it as before.
+- **The window's own popup takes keys and points (29 September 2026).**
+  Upstream refuses all foreground input while any seat grab exists
+  (`foreground_grab`). A GTK popover or menu holds one: Files' rename box
+  (F2) then refused every key, Escape included, and every click. A grab that
+  accepts the target window's own surface is that window's popup (Hyprland's
+  xdg-shell grab holds each grabbing popup and its parent), and is no longer
+  in the way: keys go where Hyprland put the keyboard (the popup, or the
+  window itself), a window focus that would take the keyboard from the popup
+  is skipped, and a point on one of the window's popups under the grab goes
+  to that popup in its own coordinates, as a person's would. A drag keeps the
+  surface it pressed on. A grab by another client or another window, a
+  window drag and a panel with exclusive input still refuse.
 
 Build and load it with `deploy/cua-plugin.sh` on each computer. The module must
 match the running Hyprland's ABI and GCC, so rebuild after every Hyprland

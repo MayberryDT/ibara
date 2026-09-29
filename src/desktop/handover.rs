@@ -802,8 +802,8 @@ case "$*" in
   *"invisible = true"*) touch "$dir/set_invisible"; later hide;;
   *"invisible = false"*) rm -f "$dir/set_invisible"; later show;;
   *cursor.move*) xy=$(printf '%s' "$*" | sed -n 's/.*x = \(-*[0-9]*\), y = \(-*[0-9]*\).*/\1 \2/p'); echo "$xy" >"$dir/pos"; log warp $xy;;
-  "-j clients") if [ -f "$dir/focus" ]; then echo '[{WINDOW},'"$(cat "$dir/focus")"']'; else echo '[{WINDOW}]'; fi;;
-  "-j activewindow") if [ -f "$dir/focus" ]; then cat "$dir/focus"; else echo '{WINDOW}'; fi;;
+  "-j clients") w=$(cat "$dir/window" 2>/dev/null || echo '{WINDOW}'); if [ -f "$dir/focus" ]; then echo "[$w,$(cat "$dir/focus")]"; else echo "[$w]"; fi;;
+  "-j activewindow") if [ -f "$dir/focus" ]; then cat "$dir/focus"; else cat "$dir/window" 2>/dev/null || echo '{WINDOW}'; fi;;
   "-j monitors") if [ -f "$dir/monitors" ]; then cat "$dir/monitors"; else echo '{MONITORS}'; fi;;
   *send_shortcut*)
     # Into whatever holds the keyboard: the app's model (`menu.sh`) of an open menu.
@@ -948,18 +948,24 @@ mcp)
             log key
           fi
         fi;;
-      click)
+      click|double_click|right_click)
         case "$line" in
           *'"element_token"'*)
             case "$line" in *'"session"'*) [ -f "$dir/appeared" ] && drawn; log named at $(cat "$dir/named_xy" 2>/dev/null || echo 0 0);; esac
             token=$(printf '%s' "$line" | sed -n 's/.*"element_token":"\([^"]*\)".*/\1/p')
             echo "$token" >>"$dir/clicked"
-            [ -f "$dir/menu.sh" ] && sh "$dir/menu.sh" click "$token"
-            log click;;
+            # `refuse` holds Cua's refusal of the accessibility route (its structured content).
+            if [ -f "$dir/refuse" ]; then
+              reply='"result":{{"isError":true,"content":[{{"type":"text","text":"refused"}}],"structuredContent":'"$(cat "$dir/refuse")"'}}'
+            else
+              [ -f "$dir/menu.sh" ] && sh "$dir/menu.sh" click "$token"
+              log click
+            fi;;
           *)
             xy=$(printf '%s' "$line" | sed -n 's/.*"x":\([-0-9.]*\),"y":\([-0-9.]*\).*/\1 \2/p')
             case "$line" in *'"session"'*) [ -f "$dir/appeared" ] && drawn; go $xy;; esac
             for step in 1 2 3; do sleep 0.05; echo "$xy" >"$dir/pos"; log plugin $xy; done
+            log pointer $tool $xy
             log click;;
         esac;;
     esac
@@ -1803,6 +1809,73 @@ mv "$dir/elements.new" "$dir/elements"
         assert_eq!(screen.named_at(), "0 315");
         screen.assert_on_screen();
         screen.assert_one_cursor();
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    /// A window at 100,50 whose app gives its boxes in the window's own
+    /// coordinates, as GTK apps do through Cua 0.29.1 on Hyprland: the
+    /// window's top element at 0,0 and a folder at `x`,300 (80×30), with a
+    /// menu. Cua refuses the folder's accessibility click with `refusal`
+    /// (its structured content).
+    fn gtk_folder(screen: &Screen, x: i64, refusal: &str) -> ElementTarget {
+        let window = r#"{"address":"0x1","mapped":true,"hidden":false,"at":[100,50],"size":[1000,800],"workspace":{"id":1,"name":"1"},"class":"app","title":"App","pid":100,"monitor":0}"#;
+        std::fs::write(screen.dir.join("window"), window).unwrap();
+        let elements = format!(
+            r#"{{"elements":[{{"element_index":0,"role":"frame","label":"App","element_token":"t0","frame":{{"x":0,"y":0,"w":1000,"h":800}}}},{{"element_index":1,"parent_index":0,"role":"grid cell","label":"Documents","element_token":"t1","frame":{{"x":{x},"y":300,"w":80,"h":30}},"actions":["listitem.scroll-to","view.popup-menu"]}}],"elements_complete":true}}"#
+        );
+        std::fs::write(screen.dir.join("elements"), elements).unwrap();
+        std::fs::write(screen.dir.join("refuse"), refusal).unwrap();
+        ElementTarget {
+            surface: screen.surface.clone(),
+            selector: serde_json::json!({"pid": 100, "window_id": 1, "identity": {"path": [["frame", "App"]], "role": "grid cell", "label": "Documents", "ordinal": 1}}),
+            role: "grid cell".into(),
+            name: "Documents".into(),
+            actions: vec!["listitem.scroll-to".into(), "view.popup-menu".into()],
+        }
+    }
+
+    /// Cua 0.29.1's refusal of an element click it would send only as
+    /// background input, which it offers to no app ibara drives.
+    const NOT_QUALIFIED: &str = r#"{"ok":false,"code":"background_unavailable","reason":"client_not_qualified","detail":"client_not_qualified","route":"synthetic_events","verified":false,"effect":"refused"}"#;
+
+    fn tried_by_accessibility(screen: &Screen) -> usize {
+        std::fs::read_to_string(screen.dir.join("clicked")).unwrap_or_default().lines().count()
+    }
+
+    #[tokio::test]
+    async fn an_element_cua_will_not_click_through_accessibility_is_clicked_once_by_the_pointer_at_its_center() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        let folder = ClickTarget::Element(gtk_folder(&screen, 200, NOT_QUALIFIED));
+        // The folder's center: 240,315 in the window, 340,365 on the screen.
+        let at = Some((340.0 / 1920.0, 365.0 / 1080.0));
+        assert_eq!(screen.desktop.click(&folder, Button::Left, false, None).await.unwrap(), at);
+        assert_eq!(tried_by_accessibility(&screen), 1, "accessibility is asked once");
+        assert_eq!(screen.events("pointer click 240 315"), 1, "{:#?}", screen.log());
+        // Cua has no accessibility route for these: the pointer alone.
+        assert_eq!(screen.desktop.click(&folder, Button::Left, true, None).await.unwrap(), at);
+        assert_eq!(screen.desktop.click(&folder, Button::Right, false, None).await.unwrap(), at);
+        assert_eq!(tried_by_accessibility(&screen), 1);
+        assert_eq!(screen.events("pointer double_click 240 315"), 1, "{:#?}", screen.log());
+        assert_eq!(screen.events("pointer right_click 240 315"), 1, "{:#?}", screen.log());
+        assert_eq!(screen.events("click"), 3, "one click each");
+        screen.assert_one_cursor();
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_element_click_refused_for_another_reason_or_outside_its_window_is_not_sent_by_the_pointer() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        let held = r#"{"ok":false,"code":"foreground_unavailable","reason":"primary_target_busy","detail":"foreground_constraint","effect":"refused"}"#;
+        for (case, x, refusal, reason) in [("another reason", 200, held, "constraint"), ("outside its window", 1200, NOT_QUALIFIED, "client_not_qualified")] {
+            let folder = ClickTarget::Element(gtk_folder(&screen, x, refusal));
+            let refused = screen.desktop.click(&folder, Button::Left, false, None).await.unwrap_err();
+            assert_eq!(refused.details.get("reason"), Some(&serde_json::json!(reason)), "{case}: {refused:?}");
+            assert_eq!(refused.details["execution_not_started"], serde_json::json!(true), "{case}: {refused:?}");
+        }
+        assert_eq!(tried_by_accessibility(&screen), 2);
+        assert_eq!(screen.events("click"), 0, "the pointer sent nothing: {:#?}", screen.log());
         screen.desktop.reset_input().await.unwrap();
     }
 

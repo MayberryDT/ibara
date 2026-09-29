@@ -145,6 +145,17 @@ impl Attention {
     }
 }
 
+impl Fleet {
+    /// Forget what was kept for `computer`: it left the directory or answers as a new computer.
+    pub(super) fn forget(&self, computer: &str) {
+        self.epochs.lock().unwrap_or_else(|p| p.into_inner()).remove(computer);
+        self.shown.lock().unwrap_or_else(|p| p.into_inner()).remove(computer);
+        let mut attention = self.attention.lock().unwrap_or_else(|p| p.into_inner());
+        attention.computers.remove(computer);
+        attention.answered.retain(|(c, _), _| c != computer);
+    }
+}
+
 fn stale(error: &IbaraError) -> bool {
     error.code == "STALE_TARGET" || error.message.contains("binding changed") || error.message.contains("generation changed")
 }

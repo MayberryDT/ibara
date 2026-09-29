@@ -948,6 +948,25 @@ impl OperatorDirectory {
         Ok(())
     }
 
+    /// Take a computer out of this directory: its row, and what was kept here
+    /// about it (a chosen name, how to wake it, a legacy import). Pairing it
+    /// again adds it as a new computer. The removed row, for its pinned host key.
+    pub fn remove_computer(&mut self, computer_id: &str) -> Result<ComputerRecord> {
+        if !pattern::id(computer_id) {
+            return Err(fail("An explicit computer ID is required."));
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(removed) = get_computer(&tx, computer_id)? else {
+            return Err(fail("No computer has that ID."));
+        };
+        tx.execute("DELETE FROM computers WHERE computer_id = ?", [computer_id])?;
+        for key in [operator_label_key(computer_id), wake_key(computer_id), format!("legacy_import:{computer_id}")] {
+            tx.execute("DELETE FROM directory_meta WHERE key = ?", [key])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// `bindOperation(computerId, {requestId, recordId})` (operator-directory.mjs:355):
     /// the immutable route envelope for one operation. `request_id` defaults to a fresh
     /// `request_<uuid>`.
@@ -1300,6 +1319,28 @@ pub(crate) mod tests {
         rebound["binding_revision"] = json!(2);
         let record = dir.register_verified_computer(&rebound, "ibara_0123456789", 1).unwrap();
         assert_eq!((record.label.as_str(), record.binding_revision), ("Desk", 2));
+    }
+
+    #[test]
+    fn a_removed_computer_leaves_nothing_here_and_can_be_added_again_as_new() {
+        let tmp = TempDir::new("remove");
+        let mut dir = OperatorDirectory::open(&tmp.0.join("operator.sqlite")).unwrap();
+        let record = verified_record(&tmp.0, "computer_a", "ibara_0123456789");
+        dir.register_verified_computer(&record, "ibara_0123456789", 0).unwrap();
+        dir.rename_computer("computer_a", "Desk").unwrap();
+        let wake = json!({"mac": "02:00:00:00:00:01", "ifname": "wlp2s0", "kind": "wifi", "subnet": "10.0.0.0/24", "from_off": false});
+        dir.set_wake("computer_a", &wake).unwrap();
+        assert_eq!(dir.remove_computer("computer_b").err().unwrap().message, "No computer has that ID.");
+        assert_eq!(dir.remove_computer("bad id").err().unwrap().message, "An explicit computer ID is required.");
+        let removed = dir.remove_computer("computer_a").unwrap();
+        assert_eq!(removed.known_hosts_file_ref, format!("file:{}", tmp.0.join("known_hosts").display()));
+        assert!(dir.get_computer("computer_a").unwrap().is_none());
+        let kept: i64 = dir.db.query_row("SELECT count(*) FROM directory_meta WHERE key LIKE '%computer_a%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 0, "the chosen name and wake information go with the computer");
+        assert_eq!(dir.remove_computer("computer_a").err().unwrap().message, "No computer has that ID.");
+        // Added again: a first binding, with the name the computer gives itself.
+        let again = dir.register_verified_computer(&record, "ibara_0123456789", 0).unwrap();
+        assert_eq!((again.label.as_str(), again.binding_revision), ("Tulip1", 1));
     }
 
     #[test]

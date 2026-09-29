@@ -278,6 +278,10 @@ fn legacy_fingerprint(principal: &str) -> std::result::Result<String, i32> {
 
 /// `ibara agent-entry …`: see the module documentation.
 pub fn agent_entry(args: Vec<OsString>) -> i32 {
+    if asks_help(&args) {
+        println!("ibara agent-entry is started by ibara itself when an agent connects over SSH, not by people.");
+        return 0;
+    }
     let args: Vec<String> = args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
     let entry = match args.first().map(String::as_str) {
         Some("--legacy") => legacy(&args[1..]),
@@ -303,8 +307,17 @@ pub fn admin(args: Vec<OsString>) -> i32 {
 }
 
 /// `ibara chrome-host <origin>`: the Chrome native messaging host.
-pub fn chrome_host(_args: Vec<OsString>) -> i32 {
+pub fn chrome_host(args: Vec<OsString>) -> i32 {
+    if asks_help(&args) {
+        println!("ibara chrome-host is started by Chrome for ibara's browser extension, not by people.");
+        return 0;
+    }
     block_on(crate::desktop::chrome::chrome_host_main())
+}
+
+/// `--help`, `-h` or `help` as the only argument.
+fn asks_help(args: &[OsString]) -> bool {
+    matches!(args, [one] if matches!(one.to_str(), Some("--help" | "-h" | "help")))
 }
 
 /// `ibara backup-journals <source state dir> <destination dir> <previous release>`.

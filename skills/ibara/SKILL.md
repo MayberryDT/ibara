@@ -25,10 +25,10 @@ A task holds the computer: your person sees it in their console, and no other ag
 
 1. **Prepare before you begin.** Have the URLs, text and your definition of done ready before `computer_begin`.
 2. **Begin with checks that prove the result.** Give `computer_begin` a `goal` and `checks`. Prefer typed checks (`file_exists`, `file_content`, `url`, `text_present`, `element`, `delivered`); ibara proves those itself. Checks without a type are yours to assess honestly at finish, and so is a typed check ibara can't read: text in a terminal, which has no accessibility tree, is `unknown` until your assessment decides it. The reply has your `task_ref` and the first frame.
-   - Every call that acts takes a `request_id`. Use a new one for each new request; reuse one only to resend that same request.
+   - Every call that acts takes a `request_id`. Make each new one unique, not just new in this conversation (ibara remembers ids across sessions): add something random, such as `begin-7f3a`. Reuse one only to resend that same request.
 3. **Act from the frame.**
    - Pick element refs (`e12`) and choices (`c3`) from the latest frame instead of coordinates.
-   - Open apps with a `launch` action (`editor`, `terminal`, `browser`, `files`) rather than hunting for icons.
+   - Open apps with a `launch` action (`editor`, `terminal`, `browser`, `files`) rather than hunting for icons. The editor ibara opens (Mousepad) keeps its own settings, apart from the person's: check a setting in the editor itself (its menus, or reopen it), not with `gsettings` or `dconf`.
    - Batch up to 8 steps with an `expect` on each, so ibara stops at the first surprise.
    - Need to see more? Ask for the cheapest view that answers the question: `computer_observe` `situation`, then `elements` with a `query`, then an `image` of one surface. Use `screen` last.
    - Click a point `{x, y}` only on a picture you just took with `computer_observe` (`view: image` or `screen`), in that picture's pixels.

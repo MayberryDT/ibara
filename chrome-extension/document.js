@@ -51,10 +51,19 @@ export async function documentOperation(message) {
         const style = getComputedStyle(el);
         return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && el.getClientRects().length > 0;
     };
+    // An element's text, and its card text below, once per read: every
+    // element inside asks again, and a long page (a Wikipedia article, a
+    // repository page) otherwise clones its whole body for each link.
+    const contents = new Map();
     const content = (el) => {
-        const clone = el.cloneNode(true);
-        clone.querySelectorAll('input,textarea,select,script,style,[hidden],[aria-hidden="true"]').forEach(n => n.remove());
-        return normalize(clone.textContent);
+        let text = contents.get(el);
+        if (text === undefined) {
+            const clone = el.cloneNode(true);
+            clone.querySelectorAll('input,textarea,select,script,style,[hidden],[aria-hidden="true"]').forEach(n => n.remove());
+            text = normalize(clone.textContent);
+            contents.set(el, text);
+        }
+        return text;
     };
     const explicitName = (el) => {
         const refs = normalize(el.getAttribute('aria-labelledby')).split(' ').filter(Boolean);
@@ -137,6 +146,30 @@ export async function documentOperation(message) {
             default: return /^H[1-6]$/.test(el.tagName) ? 'heading' : '';
         }
     };
+    // A short element headed by one visible heading, or with a small action
+    // group and text of its own: the card an element inside it belongs to.
+    // '' when it is not one.
+    const cards = new Map();
+    const card = (p) => {
+        let text = cards.get(p);
+        if (text !== undefined)
+            return text;
+        text = content(p);
+        if (text.length > 400)
+            text = '';
+        else {
+            const headings = p.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]');
+            const controls = Array.from(p.querySelectorAll('a[href],button,[role="link"],[role="button"]'));
+            // Many cards identify records with plain text, not a heading. Require
+            // a small action group and independent text beyond its control labels.
+            const remaining = controls.reduce((s, control) => s.replace(content(control), ''), text).trim();
+            const plainCard = controls.length > 0 && controls.length <= 4 && remaining.length >= 3;
+            if (!((headings.length === 1 && visible(headings[0])) || plainCard))
+                text = '';
+        }
+        cards.set(p, text);
+        return text;
+    };
     const containers = new Set(['form', 'group', 'region', 'dialog', 'navigation', 'main', 'complementary', 'row', 'listitem']);
     const needle = normalize(query).toLowerCase();
     const elements = document.querySelectorAll('button,input,textarea,select,a[href],fieldset,form,section,dialog,nav,main,aside,img,h1,h2,h3,h4,h5,h6,[role]');
@@ -160,17 +193,8 @@ export async function documentOperation(message) {
                 // Keep textual context separately for a role-scoped exact text filter.
                 ancestors.unshift({ role: pr, name: pn, ...(pr === 'listitem' && !pn ? { text: content(p) } : {}) });
             }
-            if (!context && ['DIV', 'ARTICLE', 'SECTION', 'LI'].includes(p.tagName)) {
-                const headings = p.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]');
-                const text = content(p);
-                const controls = Array.from(p.querySelectorAll('a[href],button,[role="link"],[role="button"]'));
-                // Many cards identify records with plain text, not a heading. Require
-                // a small action group and independent text beyond its control labels.
-                const remaining = controls.reduce((s, control) => s.replace(content(control), ''), text).trim();
-                const plainCard = controls.length > 0 && controls.length <= 4 && remaining.length >= 3;
-                if (text.length <= 400 && ((headings.length === 1 && visible(headings[0])) || plainCard))
-                    context = text;
-            }
+            if (!context && ['DIV', 'ARTICLE', 'SECTION', 'LI'].includes(p.tagName))
+                context = card(p);
         }
         if (needle && ![r, n, context, ...ancestors.map(a => `${a.role} ${a.text || a.name}`)].join(' ').toLowerCase().includes(needle))
             continue;

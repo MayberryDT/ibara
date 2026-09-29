@@ -25,7 +25,7 @@ There are 3 ways a pairing is accepted:
 | Someone else's computer | A person at your computer accepts a 6-digit code that both screens show, within 5 minutes | Watch and Files |
 | A friend with an invite code you made | The code, used once before it expires | Exactly the level you chose, until the invite ends |
 
-Invite levels are Watch; Use with Approval (files, Take Control and agent tasks each ask first); and Take Control (agent tasks ask first). An invite never includes Administer. Codes are 8 characters, and ibara keeps only their SHA-256. 5 wrong codes lock a computer out, even if it then brings a good one.
+Invite levels are Watch; Use with Approval (files, Take Control and agent tasks each ask first); and Take Control (agent tasks ask first). An invite never includes Administer. Codes are 8 characters, and ibara keeps only their SHA-256. 5 wrong codes within 10 minutes lock a computer out for up to 10 minutes, even if it then brings a good one.
 
 A program running as your desktop user counts as you. Another account on the asking computer, such as the agent account, cannot vouch for itself: its request waits for a person like anyone else's.
 
@@ -123,7 +123,7 @@ Other limits we want you to know:
 You can always take a computer back from an agent:
 
 - moving the mouse stops the agent's input at once, and its next input waits until the mouse is still
-- Take Control pauses every agent until you hand back, and Hand Back never restarts an agent by itself
+- Take Control pauses every agent until you hand back. Hand Back lets agents work again unless a person paused them, and never restarts an agent's task by itself
 - Pause Agents stops agents without taking control, until you choose Resume
 - removing a permission or a pairing takes effect on the next call, and ends any viewer that permission allowed
 

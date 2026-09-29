@@ -47,7 +47,7 @@ The first public release.
 - Agents can open the file manager (Files) as well as the text editor, terminal and browser.
 - Agents can name files, and the folder a command runs in, by their full path: in the task's folder, or anywhere in your home folder except ibara's own folders (its data, settings and keys, `~/.ssh`, and what its services and the page reader start with) and other people's home folders. A path outside those is refused with the folders an agent may use. File checks follow the same rule.
 - An agent that also assesses a check ibara verifies itself still finishes in one call: ibara's own result stands, and the reply says the assessment was ignored.
-- Every ibara command that names a computer takes the same names: the name you gave it, its host, or the id agents see (`cmp_…`) or the one `ibara-client --list-computers` shows (`computer_…`). An agent can collect a file with `ibara-client --computer Desk fetch …`. A name that fits no computer, or more than one, is refused with each computer's name and ids.
+- Every ibara command that names a computer takes the same names: the name you gave it, its host, or the id agents see (`cmp_…`) or the one `ibara client --list-computers` shows (`computer_…`). An agent can collect a file with `ibara client --computer Desk fetch …`. A name that fits no computer, or more than one, is refused with each computer's name and ids.
 
 ### Installing and updating
 

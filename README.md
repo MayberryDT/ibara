@@ -1,21 +1,20 @@
 # ibara
 
-ibara gives your agents computer use across the Omarchy machines you own.
+**Give your agents a computer you own.**
 
-[ibara.app](https://ibara.app)
+ibara gives your agents computer use across the Omarchy machines you own. Put a spare computer to work: your agent gets its own desktop, browser and apps, and you keep working on yours.
+
+[ibara.app](https://ibara.app) · [Docs](https://ibara.app/docs) · [Benchmarks](https://ibara.app/docs/benchmarks) · [Roadmap](https://ibara.app/docs/roadmap)
 
 [![CI](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml/badge.svg)](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)](LICENSE)
 
-[![An agent filling in a sign-up form on another computer, followed live in the ibara console](docs/media/hero-preview.webp)](https://ibara.app/media/hero.mp4)
+![Your agent works there, you keep working here: your computer and a spare joined over Tailscale, with Claude Code on yours and the agent using the spare's desktop](docs/media/what-it-is.webp)
 
-**[Watch an agent at work (33 s)](https://ibara.app/media/hero.mp4):** the console on one computer follows Claude Code on another as it fills in a sign-up form, waits for your approval before it sends it, then clicks through the next pages and finishes. Waiting is sped up.
+Every computer you add shows up as a live picture in a console on the others, where you can watch it, send it files and take control of it.
+Your agents work on those computers' real desktops, with their own cursor, while you approve what matters and step in whenever you like.
 
-You and your AI agents can use every computer you own from any other one.
-Each computer shows up as a live picture in a console on the others, where you can watch it, send it files and take control of it.
-Your agents work on those computers' real desktops, with their own named cursor, while you watch, approve what matters and step in whenever you like.
-
-ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland), and your computers reach each other only over your own [Tailscale](https://tailscale.com) network.
+ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland), and your computers reach each other only over your own [Tailscale](https://tailscale.com) network. It is free and open source.
 
 ## Install
 
@@ -31,9 +30,11 @@ Install ibara on each computer you want to use, then open the console from the b
 
 To check a release by hand before you install it, see [release verification](docs/release-verification.md).
 
+![Install on each computer, add the spare, connect your agent and give it a first task; you need two Omarchy 4 computers, Tailscale, your own account with sudo and an agent that uses MCP tools](docs/media/install.webp)
+
 ## What you can do
 
-![The fleet wall: one computer with an agent filling in a sign-up form, the other ready](docs/media/fleet.webp)
+![Claude Code checks a settings menu on a spare: three of three checks met, with a capture of what the spare saw](docs/media/one-real-task.webp)
 
 - See every computer at once on the fleet wall, with a live picture, who is using it and what it is doing.
 - Watch one computer's screen, follow its agent tasks step by step, and read its history in Activity.
@@ -56,8 +57,6 @@ The prompt has the agent do three things itself, so ibara never edits any agent'
 3. add a short marked block to its user-level instructions file (AGENTS.md, CLAUDE.md or similar), so every session knows ibara is there and when to reach for it.
 
 The agent gets 11 tools, described in [agent tools](docs/agent-tools.md).
-
-![Connect an Agent open over the fleet wall, with the prompt and Copy Prompt](docs/media/connect-agent.webp)
 
 ## How it works
 
@@ -91,7 +90,7 @@ flowchart LR
 
 Every computer runs the same ibara, so every computer is a peer. Each one runs `ibarad`, the service that owns its desktop for agents: it keeps a journal of every task, step, approval and access change, and it writes each step down before carrying it out, so a restart never loses track of what happened.
 
-Agents and consoles reach another computer through its agent entry, an SSH server that listens only on Tailscale addresses and accepts only the keys of computers you paired. `ibarad` checks every call against that computer's access rules, then acts through [Cua](https://github.com/trycua/cua)'s driver, which reads apps through accessibility and moves a named cursor that shows whose agent is working. Web pages are read through a small browser extension that never clicks or types by itself.
+Agents and consoles reach another computer through its agent entry, an SSH server that listens only on Tailscale addresses and accepts only the keys of computers you paired. `ibarad` checks every call against that computer's access rules, then acts through [Cua](https://github.com/trycua/cua)'s driver, which reads apps through accessibility and moves the agent's own cursor, so you can see where it is working. Web pages are read through a small browser extension that never clicks or types by itself.
 
 When you take control, the computer pauses its agents and starts `ibara-stream`. Your console's `ibara-view` connects with a ticket that works once, for your viewer only.
 
@@ -100,6 +99,8 @@ When you take control, the computer pauses its agents and starts `ibara-stream`.
 ## Security model
 
 ibara gives people and agents real power over real computers, so we designed it to be clear about who can do what.
+
+![You choose who's driving: watch a computer, take control, hand it back, and approve the steps that send, spend or delete](docs/media/control.webp)
 
 - Nothing listens on the internet. The agent entry, pairing and Take Control's stream listen only on this computer's Tailscale addresses. If the ufw firewall is on, setup opens those ports on the Tailscale interface only.
 - Adding a computer needs proof. Tailscale tells ibara which computer and which login is asking. Your own computers add each other when your console on the asking computer vouches for the request. Anyone else's computer waits until a person at your computer accepts a 6-digit code that both screens show, or brings a single-use invite code you made.
@@ -110,8 +111,6 @@ ibara gives people and agents real power over real computers, so we designed it 
 - Releases are signed. The installer and `ibara update` check the release's signature against a key built into ibara, and every package's digest, before anything is installed.
 
 Approvals guard the effects ibara knows about or an agent declares. An agent that can run commands or use the desktop is not in a sandbox: give agent access only to computers where you would let that agent work. [Security and access](docs/security-and-access.md) has the details, and [SECURITY.md](SECURITY.md) says how to report a vulnerability.
-
-<!-- Screenshot: the Access tab, one row per computer and agent, one column per permission, with an Ask First cell open. -->
 
 ## Requirements
 
@@ -124,18 +123,46 @@ Approvals guard the effects ibara knows about or an agent declares. An agent tha
 
 ibara needs no Node or Python at run time.
 
+![Your hardware, your connection: your logins stay on your own computer, no monthly bill, a home or office IP, and basic hardware is enough](docs/media/hardware.webp)
+
 ## Real numbers
 
-We measured the 0.1.0 release candidates on 2 test computers, from a console on one of them. These are the numbers as we recorded them, each next to the target we set, including the ones that missed.
+We measure ibara on 2 test computers: five-year-old ACEPC mini PCs with Intel Celeron J3455 processors, run from a console on one of them. Each result has its build and date, and the target we set where we set one. The misses stay in. The full tables are in the [benchmarks](https://ibara.app/docs/benchmarks) and the [test results](https://ibara.app/docs/tests).
 
-| What we measured | Target | Result | Met |
-|---|---|---|---|
-| A standard agent task on 0.1.0-9: open the editor, type a line, Save As, check the file on disk | Every run passes | 6 of 6 runs passed, in 11.6 to 14.1 seconds each | Yes |
-| Agents that connected themselves from the one prompt | Codex, Claude Code, opencode and omp, with models from at least 2 providers | All 4, with models from 3 providers; 5 of 5 follow-up tasks completed | Yes |
-| Take Control, from choosing it to the viewer on screen, on 0.1.0-9 (20 tries between 2 test computers on Wi-Fi) | No target set | 8.2 seconds median, 8.1 to 10.5 seconds | – |
-| Watching a still desktop in the Screen tab, on 0.1.0-10 (60 seconds) | No target set | 24.5 kbit/s, against 1.0 kbit/s without watching; a full picture crosses the network only when something on the screen changes | – |
-| Install, first use, update, rollback and uninstall in a clean container, on 0.1.0-7 | Every check passes, with no Node process at any point | 79 of 79 checks passed, with no Node process at any point | Yes |
-| One cursor on screen while an agent works, on 0.1.0-6 (6,349 recorded frames) | Exactly one cursor in every frame | 6,256 frames show exactly one cursor; 78 show both in the same place, for up to 0.67 seconds at handovers; 15 show both apart or neither | **No** |
+![132 of 157 real-agent runs passed on two Celeron mini PCs, with each agent setup's score and the failures counted](docs/media/proof.webp)
+
+**Real agents, 29 September 2026, on ibara 0.1.0-17.** Seven agent setups ran the same 12 tasks from a clean start. Each agent had only ibara's MCP server, its skill and its note in the agent's instructions, and the project's own source was hidden from it. Passed means the benchmark's own checks passed.
+
+| Agent and model | Passed |
+|---|---|
+| Claude Code, claude-opus-5-5 | 22 of 23 |
+| Codex, gpt-6-astra | 22 of 23 |
+| Codex, gpt-6-sol | 21 of 23 |
+| Claude Code, claude-sonnet-5 | 18 of 23 |
+| omp, grok-4.7 | 18 of 22 |
+| Codex, deepseek-v4.1-flash | 17 of 21 |
+| opencode, big-pickle (free) | 14 of 22 |
+| **All runs** | **132 of 157 (84%)** |
+
+Of the 25 failures, 13 were ibara's, 8 were the agents' and 4 were the benchmark's own setup. The weakest task was the file manager (3 of 13): its rename popup took the keyboard and refused every input, which caused 10 of ibara's 13 failures. 0.1.0-18 fixed it, and a focused rerun of 5 tasks on it passed 20 of 20 for Claude Code with claude-opus-5-5 and Codex with gpt-6-astra, with no failure of ibara's. The run stopped with 99 queued runs not started, so sample sizes are uneven. Google Gemini has not been tested.
+
+**Reliability and speed.** Recorded on the test computers, on the build named in each row.
+
+| What we measured | Result |
+|---|---|
+| 100 save-a-file tasks in a row, on 0.1.0-9 | 99 passed, at a median of 12.6 to 12.9 seconds with no drift. The one failure was a monitor reconnecting mid-typing, which ibara reported honestly |
+| Two agents on each of two computers, on 0.1.0-9 | 60 of 60 tasks that began passed, in 7 minutes. There is no queue, so a waiting agent waited up to 107 seconds |
+| 50 Take Control and Hand Back cycles, on 0.1.0-9 | No errors, no stuck keys, nothing left running |
+| Take Control, from choosing it to the viewer on screen, on 0.1.0-9 (20 tries between 2 test computers on Wi-Fi) | 8.2 seconds median, 8.1 to 10.5 seconds. The computer takes an agent again 0.7 seconds after Hand Back |
+| 20 restarts of ibara in the middle of a task, on 0.1.0-9 | Every outcome honest, every app and its text survived, and agents were back in 6.5 to 9.2 seconds |
+| 10 network drops of 10 to 90 seconds, on 0.1.0-9 | No lockout. Each call either waited and ran once, or said it may have run |
+| Clicks land where aimed, on 0.1.0-9 | 300 of 300 first-try hits, 0 pixels from center, in page buttons in Chrome and a GTK 4 app at scale 1 and 1.5. A mouse was plugged in during this test |
+| Agents that connected themselves from the one prompt, on 0.1.0-8 | Codex, Claude Code, opencode and omp, with models from 3 providers; 5 of 5 follow-up tasks completed |
+| Watching a still desktop in the Screen tab, on 0.1.0-10 (60 seconds) | 24.5 kbit/s, against 1.0 kbit/s without watching; a full picture crosses the network only when something on the screen changes |
+| Install, first use, update, rollback and uninstall in a clean container, on 0.1.0-7 | 79 of 79 checks passed, with no Node process at any point |
+| One cursor on screen while an agent works, on 0.1.0-6 (6,349 recorded frames) | **Missed the target of exactly one cursor in every frame:** 6,256 frames show exactly one cursor; 78 show both in the same place, for up to 0.67 seconds at handovers; 15 show both apart or neither. The fix shipped in 0.1.0, and we have not repeated this count on a release build |
+| Files of 1 to 5 GB, on 0.1.0-9 | **Failed.** Not supported: the limit is 250 MB. At 100 MiB, sends ran at 2.4 to 3.8 MiB/s and receives at about 5 MiB/s |
+| An hour-long idle soak | **Not run.** It was cut to about 5 minutes |
 
 Memory was measured on 0.1.0-7 with the computer held to 2 GiB. Each figure is the peak of proportional set size plus swap, in MiB. The console rows count the growth of Omarchy's shell while the console is loaded.
 
@@ -156,7 +183,7 @@ Memory was measured on 0.1.0-7 with the computer held to 2 GiB. Each figure is t
 | The standard agent task with this computer in both roles | Finishes, and takes no more than 1.5 times as long as without the limit | Did not finish, because the viewer took the keyboard focus; 0.1.0-8 fixed that | **No** |
 | Programs killed for lack of memory | None | None | Yes |
 
-<!-- Stress-test numbers go here once the stress tests on the release build finish: 100 tasks in a row, 3 computers with 2 agents each, 50 Take Control cycles, restarts mid-task, network drops, 1 to 5 GB files and a 1-hour idle soak. -->
+At full memory on 28 September, on one of the test computers: ibara idle 17.8 MiB, an agent working 117.0 MiB, and the console open on the fleet 58.2 MiB, over its 40 MiB target.
 
 ## Questions people ask
 
@@ -170,7 +197,7 @@ Any agent that can add an MCP server to its own settings. We have tested Codex, 
 
 ### What happens if I touch the mouse while an agent is working
 
-The agent's input stops. Your pointer comes back at once and the agent's named cursor disappears. The agent's next input waits until your mouse has been still for a second. If you keep using the computer, that input is refused and the agent is told that a person is using it. If you want the computer to yourself for longer, choose Take Control.
+The agent's input stops. Your pointer comes back at once and the agent's cursor disappears. The agent's next input waits until your mouse has been still for a second. If you keep using the computer, that input is refused and the agent is told that a person is using it. If you want the computer to yourself for longer, choose Take Control.
 
 ### Can an agent do something I have not approved
 
@@ -192,9 +219,11 @@ See [troubleshooting](docs/troubleshooting.md). If that does not help, [open an 
 
 These are the known gaps we want to close next:
 
-- bring the console's memory within its targets, including after a long session
+- bring the console's memory within its targets, including after a long session: with the console open on the fleet it uses 58.2 MiB against a target of 40
 - prove starting without the disk password (`ibara unattended-boot`) on real hardware, not only in a virtual machine
-- publish the stress-test and fresh-install measurements alongside the numbers above
+- test a power cut and an hour-long idle soak, and restart both test computers, not only one
+- read pages inside iframes and shadow DOM
+- run the full benchmark again on the newest release, since the last full run was on 0.1.0-17
 
 The [changelog](CHANGELOG.md) lists what each release changed.
 
@@ -216,7 +245,7 @@ ibara stands on the work of several open-source projects. We are grateful to all
 
 - [Sunshine](https://github.com/LizardByte/Sunshine) by LizardByte (GPL-3.0) is the streaming host behind Take Control. Our fork, `ibara-stream`, is a slim build without the web interface, tray, UPnP, mDNS or gamepads. It admits a viewer only with a one-time ticket bound to that viewer's certificate, confirms when access is revoked, and caps software encoding.
 - [Moonlight](https://github.com/moonlight-stream/moonlight-qt) by the Moonlight project (GPL-3.0), version 6.1.0, is the viewer. Our fork, `ibara-view`, streams one computer from a ticket, with its own identity. It adds Super+Alt+Escape to move the keyboard between the 2 computers, a tag that says where keys go, and file drop. It also closes when the stream ends, and downloads nothing from Moonlight's servers.
-- [Cua](https://github.com/trycua/cua) (MIT) provides the driver ibara uses to read apps through accessibility, type, click and draw each agent's named cursor. ibara includes Cua's Hyprland plugin from version 0.28.2 with changes that make clicks move like a person's pointer, accept Omarchy's keyboard settings and report exactly why an input was refused. The changes are in [vendor/cua-hyprland-plugin/IBARA.md](vendor/cua-hyprland-plugin/IBARA.md).
+- [Cua](https://github.com/trycua/cua) (MIT) provides the driver ibara uses to read apps through accessibility, type, click and draw each agent's cursor. ibara includes Cua's Hyprland plugin from version 0.28.2 with changes that make clicks move like a person's pointer, accept Omarchy's keyboard settings and report exactly why an input was refused. The changes are in [vendor/cua-hyprland-plugin/IBARA.md](vendor/cua-hyprland-plugin/IBARA.md).
 - [Omarchy](https://omarchy.org), [Hyprland](https://hyprland.org) and [Tailscale](https://tailscale.com) make the whole thing possible.
 
 The forks have no repositories of their own. Every release on the [releases page](https://github.com/MayberryDT/ibara/releases) includes `ibara-VERSION-source.tar.gz`, the exact source its packages were built from: this core, the console plugin, and both forks with their submodules and changes.

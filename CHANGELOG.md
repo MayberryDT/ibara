@@ -47,7 +47,7 @@ The first public release.
 - For a few seconds after ibara starts or restarts, an agent is told ibara is starting and to try again, never that a person has the computer. That includes the moment before ibara answers at all: nothing was sent, so the agent may send the same call again. A step cut off by a restart says ibara restarted.
 - An agent can check a web page's address even when the browser is not open yet at the start of a task. Status says "no browser open yet" when the browser is simply closed.
 - Agents can click, point and type into web pages on a computer with no mouse plugged in. Your own mouse, and a person in Take Control, still take over the moment they move.
-- When a way of acting is refused, the agent is told what it can use instead.
+- When a way of acting is refused, the agent is told what it can use instead. A web page element that doesn't take an action, such as a click on a text box, says which actions it takes, and for a text box how to type into it.
 - Agents can open the file manager (Files) as well as the text editor, terminal and browser.
 - Agents can name files, and the folder a command runs in, by their full path: in the task's folder, or anywhere in your home folder except ibara's own folders (its data, settings and keys, `~/.ssh`, and what its services and the page reader start with) and other people's home folders. A path outside those is refused with the folders an agent may use. File checks follow the same rule.
 - An agent that also assesses a check ibara verifies itself still finishes in one call: ibara's own result stands, and the reply says the assessment was ignored.

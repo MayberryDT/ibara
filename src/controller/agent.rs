@@ -1875,8 +1875,18 @@ impl Controller {
                 return Err(fail("AMBIGUOUS_TARGET", format!("{target} is not distinguishable from another element; observe with a query."), true));
             }
             if !node.actions.iter().any(|a| a == wanted) {
-                let why = if node.states.iter().any(|s| s == "disabled") { "is disabled".to_string() } else { format!("({}) does not take {wanted}", node.role) };
-                return Err(fail("AMBIGUOUS_TARGET", format!("{target} {why}."), true));
+                if node.states.iter().any(|s| s == "disabled") {
+                    return Err(fail("INVALID_ARGUMENT", format!("action.target: {target} is disabled."), true)
+                        .with("next", "Wait for it to be enabled (wait_for), or choose another element."));
+                }
+                let takes = if node.actions.is_empty() { "nothing".to_string() } else { node.actions.join(", ") };
+                let hint = if node.actions.iter().any(|a| a == "type") {
+                    format!(" To fill it in, send {{kind: \"type\", target: \"{target}\", text: …}}: that replaces its text, no click needed.")
+                } else {
+                    String::new()
+                };
+                return Err(fail("INVALID_ARGUMENT", format!("action.target: {target} ({}) does not take {wanted}; it takes {takes}.", node.role), true)
+                    .with("next", format!("Use one of the actions {target} takes: {takes}.{hint}")));
             }
             let args = json!({ "tabId": node.tab_id, "documentId": node.document_id, "capture": node.capture, "token": node.token });
             Ok((args, format!("{} \"{}\"", node.role, squash(&node.name, 40)), approval::element_words(&node.role, &node.name)))

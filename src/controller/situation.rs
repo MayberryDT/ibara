@@ -76,17 +76,6 @@ impl Sessions {
     }
 }
 
-/// `codex@vesper`: the client's name at the principal's computer.
-pub(crate) fn agent_label(client_name: &str, principal: &str) -> String {
-    let name: String = client_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .take(32)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    format!("{}@{principal}", if name.is_empty() { "agent" } else { &name })
-}
-
 // ---- events -------------------------------------------------------------------
 
 #[derive(Debug, Clone)]

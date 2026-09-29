@@ -23,6 +23,14 @@
 //!   that could show JSON, window addresses and process ids; they belong to an
 //!   earlier start of ibara, whose control they no longer match, so they
 //!   expire.
+//! - `operations.session`: the agent session (connection id) that made the
+//!   request, so a request_id can be reused for a new request in a later
+//!   session. Rows from before it have none and count as another session's.
+//!
+//! Well-known agents' short names (`codex@vesper`, formerly
+//! `codex-mcp-client@vesper`) need no version either: at every open, what an
+//! older build kept under a long name moves to the short name
+//! ([`crate::access::rename_agents`]).
 
 use crate::error::{IbaraError, Result};
 use crate::ids::id;
@@ -148,6 +156,10 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
              UPDATE attention_items SET state = 'expired' WHERE state = 'open' AND kind = 'approval';",
         )?;
     }
+    if !columns(&tx, "operations")?.iter().any(|c| c == "session") {
+        tx.execute_batch("ALTER TABLE operations ADD COLUMN session TEXT")?;
+    }
+    crate::access::rename_agents(&tx)?;
     if from < CORE_SCHEMA_VERSION {
         tx.execute(
             "INSERT INTO meta(key, value) VALUES('core_schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

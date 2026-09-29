@@ -89,7 +89,7 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 | `frame` | The first frame (see `observe`) |
 | `notes` | Any app notes that match what is on screen |
 
-It is idempotent by `request_id`. Replaying a `request_id` returns the original result, or the original error. Replaying with different arguments returns `REQUEST_CONFLICT`.
+It is idempotent by `request_id`. Replaying a `request_id` with the same arguments returns the original result, or the original error, in any session. A `request_id` names one request within an MCP session: different arguments under a `request_id` already used in this session return `REQUEST_CONFLICT`. In a later session, different arguments are a new request, once the earlier one under that `request_id` has finished; while it is still running, of unknown outcome or waiting for a person's approval, they return `REQUEST_CONFLICT`. This holds for every tool that takes a `request_id`.
 
 While ibara itself holds the computer back, `computer_begin` returns `BUSY` with `retry_safe: true` and says why: for a few seconds after ibara starts (after an update, a restart or a crash) it is starting, and when earlier work did not finish stopping it is settling that work first. Begin again after the wait it names, with a new `request_id`. When ibara cannot resume by itself (a repair needs a person, or this computer's settings leave resuming to a person), the refusal says so and is not retry-safe. `HUMAN_CONTROL` is only ever a person: they paused the computer or hold it through Take Control. A step cut off by a restart says ibara restarted: the task's control has ended, so check what the step did and begin again.
 
@@ -111,7 +111,7 @@ While ibara itself holds the computer back, `computer_begin` returns `BUSY` with
 
 | Action | Parameters |
 |---|---|
-| `launch` | `app`: `editor`, `terminal`, `browser` or `files` (the file manager, Nautilus). `text editor`, `mousepad`, `shell`, `chrome`, `file manager` and `nautilus` work too. The editor keeps its own settings, apart from the person's Mousepad (so it never offers to restore a session): `gsettings` and `dconf` don't show them; check a setting in the editor itself |
+| `launch` | `app`: `editor`, `terminal`, `browser` or `files` (the file manager, Nautilus). `text editor`, `mousepad`, `shell`, `chrome`, `file manager` and `nautilus` work too. The editor is Mousepad with the person's own settings, so `gsettings` and `dconf` show what it uses. ibara keeps one of them off: session restore (`org.xfce.mousepad.preferences.file session-restore` is set to `never` when the editor opens, which also turns off Mousepad's autosave), so the editor never offers to restore a session |
 | `focus` | `surface` |
 | `click` | `target`: an element, or a point `{x, y, frame?}` in a picture's pixels (see below) |
 | `double_click`, `right_click` | `target` |

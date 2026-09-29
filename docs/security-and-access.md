@@ -51,7 +51,7 @@ Change permissions in the console's Access tab. The change applies at once, and 
 
 ## Named agents
 
-An agent is known by its own name and the computer it came from, for example `codex@laptop`. The name comes from the agent's MCP client, and the paired computer vouches for it. Its named cursor on the screen shows the same name.
+An agent is known by its own name and the computer it came from, for example `codex@laptop`. The name comes from the agent's MCP client, and the paired computer vouches for it. Well-known agents go by their product's name: Codex (`codex-mcp-client`) is `codex`, Claude Code (`claude-code`) and Claude Desktop (`claude-ai`) are `claude`, and Gemini CLI (`gemini-cli-mcp-client`) is `gemini`. Permissions and tasks an agent had under its longer name before ibara 0.1.0-20 carry over to the short one. Its named cursor on the screen shows the same name.
 
 This naming is a guardrail, not isolation. Two agents on the same paired computer could claim each other's names. So an agent's own Allowed never overrides Ask First set for its computer.
 

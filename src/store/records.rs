@@ -66,7 +66,7 @@ pub struct ConnectionRecord {
 /// by the TypeScript controller read as the column default, `change`.
 pub const EFFECT_CLASSES: &[&str] = &["observe", "change", "send", "spend", "destructive", "access"];
 
-/// `OperationRecord` (journal.ts:77) plus the additive `effect_class`.
+/// `OperationRecord` (journal.ts:77) plus the additive `effect_class` and `session`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub operation_ref: String,
@@ -80,6 +80,10 @@ pub struct OperationRecord {
     pub receipt: Value,
     pub dispatched: bool,
     pub effect_class: String,
+    /// The agent session (connection id) that made the request; `None` on
+    /// rows written before sessions were recorded.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 impl OperationRecord {

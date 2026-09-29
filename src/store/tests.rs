@@ -1,7 +1,10 @@
 //! Journal behaviour tests. Failure cases, written first:
 //! - a retried request dispatches again instead of replaying its receipt
 //! - a reused request_id with changed arguments replays instead of conflicting
-//! - old mutation rows (request_id inside the fingerprint) stop replaying
+//!   in its session, or conflicts in a later session once it has finished
+//! - a later session's new request under an old id corrupts an unfinished
+//!   one, or stops a retry of the old request from replaying
+//! - old mutation rows (request_id inside the fingerprint, or no session) stop replaying
 //! - a failed begin's replay answers something other than its original error
 //! - a restart leaves dispatched non-job receipts `running`, or touches job-backed ones
 //! - retention deletes unresolved operations, failed begins, or retained tasks' events
@@ -59,6 +62,7 @@ fn intent<'a>(principal: &'a str, request_id: &'a str, task_ref: Option<&'a str>
         now_iso: "2026-09-25T00:00:00.000Z",
         recovery_operation_ref: None,
         effect_class: "change",
+        session: "connection_1",
     }
 }
 
@@ -117,7 +121,7 @@ fn replay_of_the_same_request_returns_the_original_receipt() {
 }
 
 #[test]
-fn reused_request_id_with_changed_arguments_is_a_request_conflict() {
+fn reused_request_id_with_changed_arguments_in_the_same_session_is_a_request_conflict() {
     let dir = tempdir();
     let (j, _) = open(&dir);
     let args = json!({ "task_ref": "task_a", "command": "ls" });
@@ -149,6 +153,144 @@ fn legacy_fingerprints_that_included_request_id_still_replay() {
         j.remember_intent(intent("vesper", "req-old", Some("task_a"), "computer_exec", &changed, &receipt("req-old", "task_a"))).unwrap_err().code,
         "REQUEST_CONFLICT"
     );
+}
+
+fn in_session<'a>(session: &'a str, intent: RememberIntent<'a>) -> RememberIntent<'a> {
+    RememberIntent { session, ..intent }
+}
+
+/// Store `receipt` on `op`, as a call does when it ends.
+fn settle(j: &Journal, op: &OperationRecord, receipt: Value, dispatched: bool) {
+    j.update_operation(&op.operation_ref, OperationPatch { receipt: Some(receipt), dispatched: Some(dispatched), ..OperationPatch::at("2026-09-25T00:00:01.000Z") }).unwrap();
+}
+
+/// A request whose whole answer was stored.
+fn finished() -> Value {
+    json!({ "kind": "receipt", "execution": "completed", "verification": "not_requested", "effect": "local_change", "call": { "status": "ok", "result": {} } })
+}
+
+#[test]
+fn a_finished_request_id_is_a_new_request_in_a_later_session_and_its_retry_still_replays() {
+    let dir = tempdir();
+    let (j, _) = open(&dir);
+    let args = json!({ "task_ref": "task_a", "action": { "kind": "key", "keys": "ctrl+s" } });
+    let act = |session: &str, args: &Value| j.remember_intent(in_session(session, intent("vesper", "act-1", Some("task_a"), "computer_act", args, &receipt("act-1", "task_a"))));
+    let step = json!({ "index": 1, "step": { "kind": "key", "keys": "Return" } });
+    let step_receipt = receipt("act-1#1", "task_a");
+    let step_intent = |session: &'static str| in_session(session, intent("vesper", "act-1#1", Some("task_a"), "computer_act", &step, &step_receipt));
+    let first = fresh(act("connection_1", &args).unwrap());
+    let first_step = fresh(j.remember_intent(step_intent("connection_1")).unwrap());
+    settle(&j, &first, finished(), true);
+    settle(&j, &first_step, finished(), true);
+
+    let changed = json!({ "task_ref": "task_a", "action": { "kind": "key", "keys": "ctrl+q" } });
+    let second = fresh(act("connection_2", &changed).unwrap());
+    assert_eq!(second.session.as_deref(), Some("connection_2"));
+    assert_eq!(j.get_mutation_operation("vesper", "task_a", "act-1").unwrap().unwrap().operation_ref, second.operation_ref);
+    // The first request moved aside with its later step, so the new act's steps start clean.
+    let retired = format!("act-1~{}", first.operation_ref);
+    assert_eq!(j.get_operation_by_ref(&first.operation_ref).unwrap().unwrap().request_id, retired);
+    assert_eq!(j.get_operation_by_ref(&first_step.operation_ref).unwrap().unwrap().request_id, format!("{retired}#1"));
+    assert_eq!(j.get_operation_by_ref(&first.operation_ref).unwrap().unwrap().receipt["execution"], "completed", "its receipt is kept");
+    fresh(j.remember_intent(step_intent("connection_2")).unwrap());
+
+    // A retry of either request replays it, from any session.
+    for session in ["connection_1", "connection_2", "connection_3"] {
+        for (sent, original) in [(&args, &first), (&changed, &second)] {
+            match act(session, sent).unwrap() {
+                Remembered::Replay(op) => assert_eq!(op.operation_ref, original.operation_ref, "{session}"),
+                other => panic!("{session}: expected a replay, got {other:?}"),
+            }
+        }
+    }
+    // Both sessions that used act-1 have used it up for other arguments.
+    let third = json!({ "task_ref": "task_a", "action": { "kind": "key", "keys": "ctrl+w" } });
+    for session in ["connection_1", "connection_2"] {
+        let err = act(session, &third).unwrap_err();
+        assert_eq!((err.code, err.message.as_str()), ("REQUEST_CONFLICT", "This request_id was already used in this session with different arguments."), "{session}");
+    }
+}
+
+#[test]
+fn a_begin_id_is_a_new_request_in_a_later_session_once_its_begin_finished() {
+    let dir = tempdir();
+    let (j, _) = open(&dir);
+    let args = json!({ "goal": "Write" });
+    let begin = |session: &str, args: &Value| j.remember_intent(in_session(session, intent("vesper", "begin-1", None, "computer_begin", args, &receipt("begin-1", "task_pending"))));
+    let first = fresh(begin("connection_1", &args).unwrap());
+    let changed = json!({ "goal": "Something else" });
+    // Still beginning: its task is not known yet.
+    let err = begin("connection_2", &changed).unwrap_err();
+    assert_eq!((err.code, err.message.as_str()), ("REQUEST_CONFLICT", "An earlier request with this request_id and different arguments has not finished yet."));
+    j.update_operation(&first.operation_ref, OperationPatch { task_ref: Some(Some("task_a".into())), receipt: Some(finished()), ..OperationPatch::at("2026-09-25T00:00:01.000Z") }).unwrap();
+
+    let second = fresh(begin("connection_2", &changed).unwrap());
+    assert_eq!(j.get_begin_operation("vesper", "begin-1").unwrap().unwrap().operation_ref, second.operation_ref);
+    match begin("connection_3", &args).unwrap() {
+        Remembered::Replay(op) => assert_eq!(op.operation_ref, first.operation_ref),
+        other => panic!("expected the first begin's replay, got {other:?}"),
+    }
+    assert_eq!(begin("connection_1", &json!({ "goal": "A third thing" })).unwrap_err().code, "REQUEST_CONFLICT");
+}
+
+#[test]
+fn a_request_from_before_sessions_counts_as_another_sessions() {
+    let dir = tempdir();
+    let (j, _) = open(&dir);
+    let args = json!({ "task_ref": "task_a", "command": "ls" });
+    let exec = |args: &Value| j.remember_intent(intent("vesper", "req-old", Some("task_a"), "computer_exec", args, &receipt("req-old", "task_a")));
+    let op = fresh(exec(&args).unwrap());
+    settle(&j, &op, finished(), true);
+    // As an older build stored it: no session, and request_id inside the fingerprint.
+    let legacy = j.fingerprint(&json!({ "tool": "computer_exec", "args": { "task_ref": "task_a", "command": "ls", "request_id": "req-old" } }));
+    j.db().execute("UPDATE operations SET session = NULL, fingerprint = ? WHERE operation_ref = ?", [&legacy, &op.operation_ref]).unwrap();
+    assert!(j.get_operation_by_ref(&op.operation_ref).unwrap().unwrap().session.is_none());
+
+    let changed = json!({ "task_ref": "task_a", "command": "pwd" });
+    let new = fresh(exec(&changed).unwrap());
+    assert_eq!(new.session.as_deref(), Some("connection_1"));
+    match exec(&args).unwrap() {
+        Remembered::Replay(replayed) => assert_eq!(replayed.operation_ref, op.operation_ref, "the old request still replays"),
+        other => panic!("expected the old request's replay, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unfinished_request_keeps_its_id_in_every_session() {
+    let dir = tempdir();
+    let (j, _) = open(&dir);
+    let call = json!({ "status": "ok", "result": {} });
+    let cases = [
+        ("intent-only", None, false, None),
+        ("running", Some(json!({ "execution": "running", "verification": "not_requested", "effect": "unknown", "call": call })), true, None),
+        ("unknown", Some(json!({ "execution": "unknown", "verification": "unknown", "effect": "unknown", "call": { "status": "error", "error": { "code": "OUTCOME_UNKNOWN" } } })), true, None),
+        (
+            "held",
+            Some(json!({ "execution": "not_started", "verification": "not_requested", "effect": "none", "held": { "attention": "att_1", "index": 0 },
+                         "call": { "status": "pending", "result": {}, "held": { "index": 0, "attention": "att_1" } } })),
+            false,
+            None,
+        ),
+        ("later-step-unknown", Some(finished()), true, Some(json!({ "execution": "unknown", "verification": "unknown", "effect": "unknown" }))),
+    ];
+    let args = json!({ "task_ref": "task_a", "command": "ls" });
+    let changed = json!({ "task_ref": "task_a", "command": "pwd" });
+    for (request_id, stored, dispatched, step) in cases {
+        let op = fresh(j.remember_intent(intent("vesper", request_id, Some("task_a"), "computer_exec", &args, &receipt(request_id, "task_a"))).unwrap());
+        if let Some(stored) = stored {
+            settle(&j, &op, stored, dispatched);
+        }
+        if let Some(step) = step {
+            let later = format!("{request_id}#1");
+            let step_op = fresh(j.remember_intent(intent("vesper", &later, Some("task_a"), "computer_exec", &json!({ "index": 1 }), &receipt(&later, "task_a"))).unwrap());
+            settle(&j, &step_op, step, true);
+        }
+        let before = j.get_operation_by_ref(&op.operation_ref).unwrap().unwrap();
+        let err = j.remember_intent(in_session("connection_2", intent("vesper", request_id, Some("task_a"), "computer_exec", &changed, &receipt(request_id, "task_a")))).unwrap_err();
+        assert_eq!(err.code, "REQUEST_CONFLICT", "{request_id}");
+        assert!(err.message.contains("not finished"), "{request_id}: {}", err.message);
+        assert_eq!(j.get_operation_by_ref(&op.operation_ref).unwrap().unwrap(), before, "{request_id}: the unfinished request is untouched");
+    }
 }
 
 #[test]

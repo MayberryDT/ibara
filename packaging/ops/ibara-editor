@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export XDG_CONFIG_HOME="${IBARA_DATA_DIR:-$HOME/.local/share/agent-computer}/editor-config"
-export GSETTINGS_BACKEND=keyfile
-mkdir -p "$XDG_CONFIG_HOME"
-chmod 0700 "$XDG_CONFIG_HOME"
-# Never ask to restore a previous session: an editor closed at a task's end
-# can look like a crash, and the prompt would take the agent's keystrokes.
-gsettings set org.xfce.mousepad.preferences.file session-restore never
+# The editor uses the person's own Mousepad settings, so what `gsettings`
+# shows is what the editor uses. One of them is kept off: session restore.
+# An editor closed at a task's end can look like a crash, and the "restore
+# the previous session?" prompt would take the agent's keystrokes. Mousepad
+# has no option to skip it for one launch, so the setting is turned off,
+# written only when it is not off already. Mousepad turns its autosave off
+# with it.
+key=(org.xfce.mousepad.preferences.file session-restore)
+if [[ "$(gsettings get "${key[@]}")" != "'never'" ]]; then
+  gsettings set "${key[@]}" never
+fi
 exec /usr/bin/mousepad --disable-server "$@"

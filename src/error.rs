@@ -18,7 +18,7 @@ pub const CODES: &[(&str, &str)] = &[
     ("AMBIGUOUS_TARGET", "More than one match. Choose one of the listed candidates."),
     ("BLOCKED_BY_DIALOG", "A dialog is in the way. Handle or close the dialog first."),
     ("CAPABILITY_UNAVAILABLE", "This route is not available here; the message says why. Reach the same result another way: by element, by keys, or with another tool."),
-    ("REQUEST_CONFLICT", "This request_id was already used with different arguments. Use a new request_id."),
+    ("REQUEST_CONFLICT", "This request_id was already used in this session with different arguments, or its earlier request has not finished. Use a new request_id; to retry a request, resend the same request_id with the same arguments."),
     ("OUTCOME_UNKNOWN", "ibara cannot tell whether the effect happened. Check its state with computer_status; never repeat it blindly."),
     ("POSTCONDITION_FAILED", "The action ran but its expectation was not seen. Observe, then decide."),
     ("BUDGET_EXCEEDED", "A task budget ran out. Finish, or ask a person to extend it."),

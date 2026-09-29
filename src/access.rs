@@ -524,3 +524,87 @@ pub fn valid_subject(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"@_.-".contains(&b))
 }
+
+/// `codex@vesper`: the agent's name at the principal's computer. The name is
+/// its MCP client's, kept to plain characters, and short for the agents
+/// people know by a product name ([`short_name`]).
+pub(crate) fn agent_label(client_name: &str, principal: &str) -> String {
+    let name: String = client_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("{}@{principal}", if name.is_empty() { "agent" } else { short_name(&name) })
+}
+
+/// The product name for a well-known MCP client's name: Codex sends
+/// `codex-mcp-client`, Claude Code `claude-code`, Claude Desktop `claude-ai`
+/// and Gemini CLI `gemini-cli-mcp-client`. Any other name stays as it is.
+fn short_name(name: &str) -> &str {
+    match name {
+        "codex-mcp-client" => "codex",
+        "claude-code" | "claude-ai" => "claude",
+        "gemini-cli-mcp-client" => "gemini",
+        other => other,
+    }
+}
+
+/// An agent's subject under its short name (`codex@vesper` for
+/// `codex-mcp-client@vesper`); none when it already has it.
+fn renamed(subject: &str) -> Option<String> {
+    let (name, computer) = subject.split_once('@')?;
+    let short = short_name(name);
+    (short != name).then(|| format!("{short}@{computer}"))
+}
+
+/// Move what is kept under an agent's long name (`codex-mcp-client@vesper`,
+/// from before agents had short names, or written by an older ibara after
+/// going back to it) to its short name: its identity, its own permissions and
+/// the tasks it owns. Runs whenever the journal opens; with nothing under a
+/// long name it changes nothing. Where the short name already has a
+/// permission of the same id, the moved one keeps its own id: an agent's
+/// permissions all apply, the strictest winning, so moving never widens what
+/// it may do. As after any access change, the revision moves on and
+/// approvals not yet used end.
+pub(crate) fn rename_agents(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    // Unreadable records stay as they are, refused where access is read.
+    if let Ok(Some(mut a)) = Access::read(tx) {
+        let old: Vec<String> = a.identities.keys().filter(|s| renamed(s).is_some()).cloned().collect();
+        let mut changed = !old.is_empty();
+        for subject in old {
+            if let (Some(identity), Some(short)) = (a.identities.remove(&subject), renamed(&subject)) {
+                a.identities.entry(short).or_insert(identity);
+            }
+        }
+        let ids: Vec<String> = a.grants.iter().filter(|(_, g)| renamed(&g.subject).is_some()).map(|(id, _)| id.clone()).collect();
+        changed |= !ids.is_empty();
+        for id in ids {
+            let Some(mut grant) = a.grants.remove(&id) else { continue };
+            let Some(short) = renamed(&grant.subject) else { continue };
+            let moved = id
+                .strip_prefix(grant.subject.as_str())
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(|capability| format!("{short}:{capability}"))
+                .filter(|moved| !a.grants.contains_key(moved))
+                .unwrap_or(id);
+            grant.subject = short;
+            a.grants.insert(moved, grant);
+        }
+        if changed {
+            a.revision += 1;
+            a.write_in(tx, "ibarad", "Well-known agents now go by short names, such as codex; their permissions carried over", true, None)?;
+        }
+    }
+    let owned: Vec<(String, String)> = tx
+        .prepare("SELECT task_ref, client_flags FROM tasks WHERE client_flags LIKE '%@%'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (task_ref, flags) in owned {
+        let Ok(mut flags) = serde_json::from_str::<Value>(&flags) else { continue };
+        let Some(short) = flags["agent"].as_str().and_then(renamed) else { continue };
+        flags["agent"] = json!(short);
+        tx.execute("UPDATE tasks SET client_flags = ?1 WHERE task_ref = ?2", rusqlite::params![flags.to_string(), task_ref])?;
+    }
+    Ok(())
+}

@@ -300,3 +300,64 @@ fn live_video_is_refused_without_bytes_whenever_watching_is() {
         assert_eq!(rig.desktop.video_reads.get(), 1, "only the allowed read reached the encoder");
     });
 }
+
+/// Codex's MCP client calls itself `codex-mcp-client`, and its agent is now
+/// `codex@vesper` rather than `codex-mcp-client@vesper`. What an older ibara
+/// kept under the long name counts for the short one once ibara restarts.
+/// Failure cases:
+/// 1. The task Codex began before the update now "belongs to another agent
+///    identity", or Codex still shows under its long name.
+/// 2. A rule a person set for the agent under its long name stops applying.
+/// 3. Claude Code (`claude-code`) and Claude Desktop (`claude-ai`) both
+///    become `claude@vesper`, and the more permissive of their rules wins.
+#[test]
+fn an_agent_keeps_its_task_and_rules_under_its_short_name() {
+    run(async {
+        let (mut rig, _helper) = access_rig(false, &[("watch", Rule::Allow), ("files", Rule::Allow), ("agents", Rule::Allow)]);
+        rig.controller.start().await.unwrap();
+        let c = rig.controller.clone();
+        c.watchdog_tick().await;
+        let args = json!({ "goal": "Save a note in the editor", "request_id": "req-1" });
+        let begun = c.call("vesper", "connection_a", "codex-mcp-client", "computer_begin", args, Cancel::new()).await.envelope;
+        assert_eq!(begun["status"], "ok", "{begun}");
+        assert_eq!(begun["result"]["you"]["agent"], "codex@vesper", "{begun}");
+        assert!(begun["situation"].as_str().unwrap().contains("you (codex@vesper) control"), "{begun}");
+        let task = begun["result"]["task_ref"].as_str().unwrap().to_string();
+
+        // As an older ibara kept them: the task, the agent and its rules under long names.
+        c.journal.db().execute("UPDATE tasks SET client_flags = ?1 WHERE task_ref = ?2", [json!({ "agent": "codex-mcp-client@vesper" }).to_string(), task.clone()]).unwrap();
+        let mut a = model(&c);
+        a.identities.remove("codex@vesper");
+        let own = |subject: &str, class: &str, rule: Rule| {
+            let effects = BTreeMap::from([(class.to_string(), rule)]);
+            (format!("{subject}:agents"), Grant { subject: subject.into(), capability: "agents".into(), rule: Rule::Allow, expires_at: None, effects })
+        };
+        for (subject, class, rule) in [("codex-mcp-client@vesper", "send", Rule::Deny), ("claude-code@vesper", "send", Rule::Allow), ("claude-ai@vesper", "send", Rule::Deny)] {
+            a.identities.insert(subject.into(), Identity { kind: "agent".into(), computer: "vesper".into(), key: "SHA256:vesper".into() });
+            let (id, grant) = own(subject, class, rule);
+            a.grants.insert(id, grant);
+        }
+        a.save(&c.journal, "owner", "Rules for vesper's agents").unwrap();
+
+        c.system_pause().await.unwrap();
+        c.shutdown().await;
+        drop(c);
+        rig.controller = open(&rig.dir, &rig.clock, &rig.desktop, false);
+        Rc::get_mut(&mut rig.controller).expect("unshared controller").access_socket = rig.dir.join("a.sock");
+        let c = rig.controller.clone();
+        c.start().await.unwrap();
+        c.watchdog_tick().await;
+
+        let finish = json!({ "task_ref": task, "request_id": "fin-1", "outcome": "complete", "summary": "Saved the note." });
+        let finished = c.call("vesper", "connection_b", "codex-mcp-client", "computer_finish", finish, Cancel::new()).await.envelope;
+        assert_eq!(finished["status"], "ok", "its own task: {finished}");
+        assert_eq!(c.journal.get_task(&task).unwrap().unwrap().client_flags["agent"], "codex@vesper");
+
+        let a = model(&c);
+        let names: Vec<&str> = a.identities.keys().map(String::as_str).filter(|s| s.contains('@')).collect();
+        assert_eq!(names, ["claude@vesper", "codex@vesper"]);
+        assert_eq!(a.effect("codex@vesper", "send", c.now_ms(), false), Rule::Deny, "its own rule still applies");
+        assert_eq!(a.effect("claude@vesper", "send", c.now_ms(), false), Rule::Deny, "the stricter of the two");
+        assert!(a.grants.values().all(|g| !g.subject.contains("-")), "{:?}", a.grants.keys());
+    });
+}

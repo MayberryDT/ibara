@@ -53,6 +53,9 @@ pub struct RememberIntent<'a> {
     pub recovery_operation_ref: Option<&'a str>,
     /// One of [`EFFECT_CLASSES`]; the TypeScript had no effect class (`change`).
     pub effect_class: &'a str,
+    /// The agent's MCP session (its connection id): a request_id is the
+    /// agent's to reuse for a new request only in a later session.
+    pub session: &'a str,
 }
 
 /// Result of `remember_intent`: `{ replay }` or `{ fresh }` in the TypeScript.
@@ -526,55 +529,50 @@ impl Journal {
         Ok(if rows.len() == 1 { rows.into_iter().next() } else { None })
     }
 
-    /// `rememberIntent` (journal.ts:449-520): replay an identical request, refuse a
-    /// changed one with `REQUEST_CONFLICT`, otherwise persist the intent before any effect.
+    /// `rememberIntent` (journal.ts:449-520): replay an identical request,
+    /// refuse a changed one with `REQUEST_CONFLICT`, otherwise persist the
+    /// intent before any effect.
+    ///
+    /// A request_id names one request within an agent's session. The same id
+    /// and arguments replay the original operation from any session, so a
+    /// retry after a lost reply or a restart never runs twice. Different
+    /// arguments conflict in the session that used the id, and while the
+    /// earlier request has not finished ([`Journal::request_finished`]): a
+    /// step still running, of unknown outcome or waiting for a person must
+    /// keep its operation. From another session, once the earlier request
+    /// finished, they are a new request: the earlier operation stays under a
+    /// retired id ([`Journal::retire_request`]) where a retry of it still
+    /// replays. Rows from before sessions were recorded count as another
+    /// session's.
     pub fn remember_intent(&self, input: RememberIntent<'_>) -> Result<Remembered> {
         if !EFFECT_CLASSES.contains(&input.effect_class) {
             return Err(invalid(format!("Unknown effect class {:?}.", input.effect_class)));
         }
         let fingerprint = self.fingerprint(&json!({ "tool": input.tool, "args": input.args_fingerprint_source }));
-        let existing = match input.recovery_operation_ref {
-            Some(op) => self.get_operation_by_ref(op)?,
-            None if input.tool == "computer_begin" => self.get_begin_operation(input.principal, input.request_id)?,
-            None => self.get_mutation_operation(input.principal, input.task_ref.unwrap_or(""), input.request_id)?,
-        };
-        if input.recovery_operation_ref.is_some() && existing.is_none() {
-            return Err(IbaraError::new("REQUEST_CONFLICT", "Canonical operation recovery identity is unknown.", false)
-                .requires_reconciliation()
-                .with("recovery", "Inspect the retained operation list and use the exact original operation_ref; do not dispatch a new effect."));
+        if let Some(op) = input.recovery_operation_ref {
+            return self.recover_intent(&input, op, &fingerprint);
         }
-        if let Some(existing) = existing {
-            if input.recovery_operation_ref.is_some() && (existing.task_ref.as_deref() != input.task_ref || existing.tool != input.tool) {
-                return Err(IbaraError::new("REQUEST_CONFLICT", "Canonical operation recovery does not match this task or tool.", false)
-                    .requires_reconciliation()
-                    .with("recovery", "Inspect the original operation_ref without dispatching a new effect."));
-            }
-            // Older mutation receipts fingerprinted request_id with the effect
-            // arguments (journal.ts:478-486). Recover that form with the retained ID.
-            let legacy = match (input.args_fingerprint_source, input.task_ref) {
-                (Value::Object(args), Some(task_ref)) if args.get("task_ref").and_then(Value::as_str) == Some(task_ref) => {
-                    let mut legacy = args.clone();
-                    legacy.insert("request_id".into(), json!(existing.request_id));
-                    Some(self.fingerprint(&json!({ "tool": input.tool, "args": Value::Object(legacy) })))
-                }
-                _ => None,
-            };
-            let matches = self.fingerprints_equal(&existing.fingerprint, &fingerprint)
-                || legacy.is_some_and(|l| self.fingerprints_equal(&existing.fingerprint, &l));
-            if !matches {
-                let recovery = if input.recovery_operation_ref.is_some() {
-                    "Inspect the original operation_ref and its exact arguments; do not dispatch a new effect to recover it."
-                } else {
-                    "Issue a new request_id for a new intention."
-                };
-                return Err(IbaraError::new("REQUEST_CONFLICT", "The same request ID was reused with different arguments.", false)
-                    .with("requires_reconciliation", input.recovery_operation_ref.is_some())
-                    .with("recovery", recovery));
-            }
-            if let Some(error) = existing.failed_begin_error() {
-                return Ok(Remembered::FailedBeginReplay { operation: existing, error });
-            }
-            return Ok(Remembered::Replay(existing));
+        let current = match input.tool {
+            "computer_begin" => self.get_begin_operation(input.principal, input.request_id)?,
+            _ => self.get_mutation_operation(input.principal, input.task_ref.unwrap_or(""), input.request_id)?,
+        };
+        let retired = self.retired_operations(&input)?;
+        let seen = || current.iter().chain(&retired);
+        if let Some(op) = seen().find(|op| self.same_request(op, &input, &fingerprint)) {
+            return Ok(replayed(op.clone()));
+        }
+        let conflict = |message: &str| {
+            IbaraError::new("REQUEST_CONFLICT", message, false)
+                .with("requires_reconciliation", false)
+                .with("recovery", "Issue a new request_id for a new intention.")
+        };
+        if seen().any(|op| op.session.as_deref() == Some(input.session)) {
+            return Err(conflict("This request_id was already used in this session with different arguments."));
+        }
+        if let Some(current) = &current
+            && !self.request_finished(current)?
+        {
+            return Err(conflict("An earlier request with this request_id and different arguments has not finished yet."));
         }
         self.enforce_retention(true)?;
         let operation = OperationRecord {
@@ -589,11 +587,16 @@ impl Journal {
             receipt: input.receipt.clone(),
             dispatched: false,
             effect_class: input.effect_class.to_string(),
+            session: Some(input.session.to_string()),
         };
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some(current) = &current {
+            self.retire_request(current)?;
+        }
         self.db
             .prepare_cached(
-                "INSERT INTO operations(operation_ref, request_id, principal, task_ref, tool, fingerprint, created_at, updated_at, receipt, dispatched, effect_class)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                "INSERT INTO operations(operation_ref, request_id, principal, task_ref, tool, fingerprint, created_at, updated_at, receipt, dispatched, effect_class, session)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
             )?
             .execute(params![
                 operation.operation_ref,
@@ -606,9 +609,105 @@ impl Journal {
                 operation.updated_at,
                 operation.receipt.to_string(),
                 operation.effect_class,
+                operation.session,
             ])
             .map_err(map_capacity_error)?;
+        tx.commit()?;
         Ok(Remembered::Fresh(operation))
+    }
+
+    /// `remember_intent` naming the exact operation to recover: it must exist
+    /// and match, and never becomes a new request.
+    fn recover_intent(&self, input: &RememberIntent<'_>, operation_ref: &str, fingerprint: &str) -> Result<Remembered> {
+        let Some(existing) = self.get_operation_by_ref(operation_ref)? else {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Canonical operation recovery identity is unknown.", false)
+                .requires_reconciliation()
+                .with("recovery", "Inspect the retained operation list and use the exact original operation_ref; do not dispatch a new effect."));
+        };
+        if existing.task_ref.as_deref() != input.task_ref || existing.tool != input.tool {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Canonical operation recovery does not match this task or tool.", false)
+                .requires_reconciliation()
+                .with("recovery", "Inspect the original operation_ref without dispatching a new effect."));
+        }
+        if !self.same_request(&existing, input, fingerprint) {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "The same request ID was reused with different arguments.", false)
+                .requires_reconciliation()
+                .with("recovery", "Inspect the original operation_ref and its exact arguments; do not dispatch a new effect to recover it."));
+        }
+        Ok(replayed(existing))
+    }
+
+    /// Whether `op` was written for this very request: the same tool and
+    /// arguments.
+    fn same_request(&self, op: &OperationRecord, input: &RememberIntent<'_>, fingerprint: &str) -> bool {
+        if self.fingerprints_equal(&op.fingerprint, fingerprint) {
+            return true;
+        }
+        // Older mutation receipts fingerprinted request_id with the effect
+        // arguments (journal.ts:478-486). Recover that form with the ID the
+        // agent sent (a retired row's own ID has changed).
+        match (input.args_fingerprint_source, input.task_ref) {
+            (Value::Object(args), Some(task_ref)) if args.get("task_ref").and_then(Value::as_str) == Some(task_ref) => {
+                let mut legacy = args.clone();
+                legacy.insert("request_id".into(), json!(input.request_id));
+                self.fingerprints_equal(&op.fingerprint, &self.fingerprint(&json!({ "tool": input.tool, "args": Value::Object(legacy) })))
+            }
+            _ => false,
+        }
+    }
+
+    /// Operations that once held this request_id and were retired by a new
+    /// request under it from a later session (`<request_id>~<operation_ref>`).
+    fn retired_operations(&self, input: &RememberIntent<'_>) -> Result<Vec<OperationRecord>> {
+        let rows = match input.tool {
+            "computer_begin" => self
+                .db
+                .prepare_cached(
+                    "SELECT * FROM operations WHERE principal = ?1 AND tool = 'computer_begin'
+                     AND substr(request_id, 1, length(?2) + 1) = ?2 || '~' AND instr(request_id, '#') = 0",
+                )?
+                .query_map(params![input.principal, input.request_id], operation_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            _ => self
+                .db
+                .prepare_cached(
+                    "SELECT * FROM operations WHERE principal = ?1 AND task_ref = ?2
+                     AND substr(request_id, 1, length(?3) + 1) = ?3 || '~' AND instr(request_id, '#') = 0",
+                )?
+                .query_map(params![input.principal, input.task_ref.unwrap_or(""), input.request_id], operation_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Whether the request `op` began has finished: its whole answer was
+    /// stored, and neither it nor any of its later steps (`<request_id>#<n>`)
+    /// is running, of unknown outcome or waiting for a person's approval.
+    fn request_finished(&self, op: &OperationRecord) -> Result<bool> {
+        let open = |o: &OperationRecord| receipt_needs_retention(&o.receipt, o.dispatched) || o.receipt.get("held").is_some();
+        if open(op) || op.receipt.get("call").is_none_or(|call| call.get("held").is_some()) {
+            return Ok(false);
+        }
+        let Some(task_ref) = &op.task_ref else { return Ok(true) };
+        let steps = self
+            .db
+            .prepare_cached("SELECT * FROM operations WHERE principal = ?1 AND task_ref = ?2 AND substr(request_id, 1, length(?3) + 1) = ?3 || '#'")?
+            .query_map(params![op.principal, task_ref, op.request_id], operation_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(!steps.iter().any(open))
+    }
+
+    /// Move a finished request's operation, and its later steps, to the
+    /// retired id `<request_id>~<operation_ref>` (steps keep their `#<n>`),
+    /// freeing the request_id. An agent's own ids cannot take that form.
+    fn retire_request(&self, op: &OperationRecord) -> Result<()> {
+        self.db
+            .prepare_cached(
+                "UPDATE operations SET request_id = ?1 || '~' || ?2 || substr(request_id, length(?1) + 1)
+                 WHERE principal = ?3 AND (operation_ref = ?2 OR (task_ref = ?4 AND substr(request_id, 1, length(?1) + 1) = ?1 || '#'))",
+            )?
+            .execute(params![op.request_id, op.operation_ref, op.principal, op.task_ref])?;
+        Ok(())
     }
 
     /// `getBeginOperation` (journal.ts:522).
@@ -1343,6 +1442,14 @@ fn task_from_row(r: &Row<'_>) -> rusqlite::Result<TaskRecord> {
     })
 }
 
+/// The replay of an earlier operation of the same request.
+fn replayed(operation: OperationRecord) -> Remembered {
+    match operation.failed_begin_error() {
+        Some(error) => Remembered::FailedBeginReplay { operation, error },
+        None => Remembered::Replay(operation),
+    }
+}
+
 /// `operationFromRow` (journal.ts:986).
 fn operation_from_row(r: &Row<'_>) -> rusqlite::Result<OperationRecord> {
     Ok(OperationRecord {
@@ -1357,6 +1464,7 @@ fn operation_from_row(r: &Row<'_>) -> rusqlite::Result<OperationRecord> {
         receipt: json_col(r, "receipt", json!({}))?,
         dispatched: get_i64(r, "dispatched")? != 0,
         effect_class: r.get::<_, Option<String>>("effect_class")?.unwrap_or_else(|| "change".into()),
+        session: r.get("session")?,
     })
 }
 

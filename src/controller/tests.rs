@@ -665,16 +665,95 @@ fn a_failed_begin_replays_its_original_error() {
     });
 }
 
+/// A call from another MCP session (connection) of the same agent.
+async fn call_in(c: &Controller, connection_id: &str, tool: &str, args: Value) -> Value {
+    c.call("vesper", connection_id, "codex", tool, args, Cancel::new()).await.envelope
+}
+
 #[test]
-fn begin_with_changed_arguments_under_the_same_request_id_conflicts() {
+fn begin_with_changed_arguments_conflicts_in_its_session_and_is_new_in_a_later_one() {
     run(async {
         let rig = rig(false);
-        let first = call(&rig.controller, "computer_begin", json!({ "goal": "Write", "request_id": "req-1" })).await;
+        let c = &rig.controller;
+        let first = call(c, "computer_begin", json!({ "goal": "Write", "request_id": "req-1" })).await;
         assert_eq!(first["status"], "ok");
-        let changed = call(&rig.controller, "computer_begin", json!({ "goal": "Something else", "request_id": "req-1" })).await;
+        let changed = call(c, "computer_begin", json!({ "goal": "Something else", "request_id": "req-1" })).await;
         assert_eq!(code(&changed), "REQUEST_CONFLICT");
-        let same = call(&rig.controller, "computer_begin", json!({ "goal": "Write", "request_id": "req-1" })).await;
+        assert!(changed["error"]["message"].as_str().unwrap().contains("in this session"), "{changed}");
+        let same = call(c, "computer_begin", json!({ "goal": "Write", "request_id": "req-1" })).await;
         assert_eq!(same["result"]["task_ref"], first["result"]["task_ref"], "replay returns the original result");
+        let task = first["result"]["task_ref"].as_str().unwrap();
+        let done = call(c, "computer_finish", json!({ "task_ref": task, "request_id": "fin-1", "outcome": "complete", "summary": "Wrote it." })).await;
+        assert_eq!(done["status"], "ok", "{done}");
+
+        // The agent restarts: a new session reuses its generic id for a new task.
+        let fresh = call_in(c, "connection_b", "computer_begin", json!({ "goal": "Something else", "request_id": "req-1" })).await;
+        assert_eq!(fresh["status"], "ok", "{fresh}");
+        assert_ne!(fresh["result"]["task_ref"], first["result"]["task_ref"], "a new task, not the old one's replay");
+        // A retry of either request still replays it, from any session.
+        let retried = call_in(c, "connection_c", "computer_begin", json!({ "goal": "Write", "request_id": "req-1" })).await;
+        assert_eq!(retried["result"]["task_ref"], first["result"]["task_ref"], "{retried}");
+        let retried = call(c, "computer_begin", json!({ "goal": "Something else", "request_id": "req-1" })).await;
+        assert_eq!(retried["result"]["task_ref"], fresh["result"]["task_ref"], "{retried}");
+        // The new session used req-1 for its own request.
+        let again = call_in(c, "connection_b", "computer_begin", json!({ "goal": "A third thing", "request_id": "req-1" })).await;
+        assert_eq!(code(&again), "REQUEST_CONFLICT", "{again}");
+    });
+}
+
+#[test]
+fn an_agent_back_in_a_new_session_replays_its_act_and_may_reuse_the_id_for_a_new_one() {
+    run(async {
+        let rig = rig(false);
+        let c = &rig.controller;
+        let task = begin(c).await;
+        let args = json!({ "task_ref": task, "request_id": "act-1", "action": { "kind": "key", "keys": "ctrl+s" } });
+        let first = call(c, "computer_act", args.clone()).await;
+        assert_eq!(first["result"]["steps"][0]["outcome"], "done", "{first}");
+        c.disconnect("vesper", "connection_a").await.unwrap();
+
+        // Its reply was lost: the retry from the new session sends nothing.
+        let replay = call_in(c, "connection_b", "computer_act", args.clone()).await;
+        assert_eq!(replay["result"]["steps"], first["result"]["steps"], "{replay}");
+        assert_eq!(rig.desktop.acts(), 1, "a retry never dispatches again");
+
+        let mut changed = args.clone();
+        changed["action"]["keys"] = json!("ctrl+q");
+        let new = call_in(c, "connection_b", "computer_act", changed).await;
+        assert_eq!(new["result"]["steps"][0]["outcome"], "done", "{new}");
+        assert_eq!(rig.desktop.acts(), 2, "a new request under the old id runs");
+        let old = call_in(c, "connection_b", "computer_act", args.clone()).await;
+        assert_eq!(old["result"]["steps"], first["result"]["steps"], "the first request still replays: {old}");
+        let mut third = args;
+        third["action"]["keys"] = json!("ctrl+w");
+        let conflict = call_in(c, "connection_b", "computer_act", third).await;
+        assert_eq!(code(&conflict), "REQUEST_CONFLICT", "this session already used act-1: {conflict}");
+        assert_eq!(rig.desktop.acts(), 2);
+    });
+}
+
+#[test]
+fn a_request_waiting_for_a_person_keeps_its_id_in_a_new_session() {
+    run(async {
+        let rig = rig(false);
+        let c = &rig.controller;
+        let task = begin(c).await;
+        let args = json!({ "task_ref": task, "request_id": "act-1", "action": { "kind": "key", "keys": "Return" }, "effect": "send" });
+        let held = call(c, "computer_act", args.clone()).await;
+        let att = held_as(c, &held, "send");
+        c.disconnect("vesper", "connection_a").await.unwrap();
+
+        let mut changed = args.clone();
+        changed["action"]["keys"] = json!("ctrl+Return");
+        let conflict = call_in(c, "connection_b", "computer_act", changed).await;
+        assert_eq!(code(&conflict), "REQUEST_CONFLICT", "{conflict}");
+        assert!(conflict["error"]["message"].as_str().unwrap().contains("not finished"), "{conflict}");
+        assert_eq!(rig.desktop.acts(), 0);
+
+        answer(c, &att, "approve").await;
+        let ran = call_in(c, "connection_b", "computer_act", args).await;
+        assert_eq!(ran["result"]["steps"][0]["outcome"], "done", "the held request runs once approved: {ran}");
+        assert_eq!(rig.desktop.acts(), 1);
     });
 }
 

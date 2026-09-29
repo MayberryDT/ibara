@@ -106,7 +106,7 @@ sequenceDiagram
   D-->>A: envelope: situation, status, result
 ```
 
-`ibara mcp` answers the tool list itself, so an agent loads ibara without touching any computer. The first call to a computer opens one SSH route to it, kept for the session. Each agent is named by its MCP client name and the paired computer it came from, for example `codex@laptop`, and the computer vouches for that name.
+`ibara mcp` answers the tool list itself, so an agent loads ibara without touching any computer. The first call to a computer opens one SSH route to it, kept for the session. Each agent is named by its MCP client name, shortened for well-known agents (`codex-mcp-client` is `codex`), and the paired computer it came from, for example `codex@laptop`, and the computer vouches for that name.
 
 `ibarad` writes every effect to the journal as running before it happens. After a restart, anything still running becomes unknown, and the agent is told so instead of being told it worked. A step whose effect class asks first (by default sending, spending, deleting or changing access) stops as pending with an attention item, and runs only when a person approves that exact step.
 

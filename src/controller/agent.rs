@@ -11,7 +11,8 @@ use super::control::{Charge, Release};
 use super::checks::{TaskPath, pause};
 use super::ports::{Button, Cancel, Done, Effect, Image, PutBack, TypingCursor, Win, WinKey};
 use super::approval::{self, Ask, Place};
-use super::situation::{FrameSpec, FrameState, agent_label, app_class, app_id_for, dirty_title, surface_signature};
+use super::situation::{FrameSpec, FrameState, app_class, app_id_for, dirty_title, surface_signature};
+use crate::access::agent_label;
 use super::{Controller, Rule, clip, squash};
 use crate::contract::{
     self, ActInput, ActResult, Action, BeginInput, BeginResult, BrowserAction, BrowserActInput, Check, CheckBasis, CheckState,
@@ -262,6 +263,8 @@ struct CallCtx<'a> {
     principal: &'a str,
     task_ref: &'a str,
     request_id: &'a str,
+    /// The caller's connection: its MCP session, which scopes `request_id`.
+    session: &'a str,
     tool: &'a str,
     lease: &'a LeaseRecord,
     /// Fires when the caller goes away; the call stops at its next safe point.
@@ -382,13 +385,14 @@ impl Controller {
     /// Run a journalled call in the effect queue, once at a time per request.
     /// A repeat while the same call is still queued or running answers
     /// `pending` with its operation at once instead of waiting behind it;
-    /// different arguments are `REQUEST_CONFLICT`.
+    /// different arguments are `REQUEST_CONFLICT`, from any session, since
+    /// the running request keeps its id until it has finished.
     async fn once(&self, principal: &str, task_ref: &str, request_id: &str, args: &Value, work: impl Future<Output = Result<Reply>>) -> Result<Reply> {
         let key = (principal.to_string(), task_ref.to_string(), request_id.to_string());
         let source = fingerprint_source(args);
         let running = self.in_flight.borrow().get(&key).map(|existing| *existing == source);
         match running {
-            Some(false) => return Err(fail("REQUEST_CONFLICT", "The same request ID was reused with different arguments.", false)),
+            Some(false) => return Err(fail("REQUEST_CONFLICT", "An earlier request with this request_id and different arguments has not finished yet.", false)),
             Some(true) => {
                 let op_ref = self.journal.get_mutation_operation(principal, task_ref, request_id)?.map(|o| o.operation_ref);
                 let next = match &op_ref {
@@ -430,10 +434,11 @@ impl Controller {
     }
 
     fn remember(&self, ctx: &CallCtx<'_>, request_id: &str, source: &Value, class: &str) -> Result<Remembered> {
-        self.remember_for(ctx.principal, ctx.task_ref, ctx.tool, request_id, source, class)
+        self.remember_for(ctx.principal, ctx.session, ctx.task_ref, ctx.tool, request_id, source, class)
     }
 
-    fn remember_for(&self, principal: &str, task_ref: &str, tool: &str, request_id: &str, source: &Value, class: &str) -> Result<Remembered> {
+    #[allow(clippy::too_many_arguments)]
+    fn remember_for(&self, principal: &str, session: &str, task_ref: &str, tool: &str, request_id: &str, source: &Value, class: &str) -> Result<Remembered> {
         let provisional = Value::Object(self.receipt(request_id, "pending", task_ref, &format!("{tool} intent recorded.")));
         let now = self.now_iso();
         self.journal.remember_intent(RememberIntent {
@@ -446,6 +451,7 @@ impl Controller {
             now_iso: &now,
             recovery_operation_ref: None,
             effect_class: class,
+            session,
         })
     }
 
@@ -1051,6 +1057,7 @@ impl Controller {
             now_iso: &now,
             recovery_operation_ref: None,
             effect_class: "observe",
+            session: connection_id,
         })?;
         let op = match remembered {
             Remembered::FailedBeginReplay { error, .. } => return Err(error),
@@ -1256,7 +1263,7 @@ impl Controller {
         let lease = self.require_live_lease(principal, connection_id, task_ref)?;
         let mut task = self.task(task_ref)?;
         self.charge(&mut task, Charge::Action)?;
-        let ctx = CallCtx { principal, task_ref, request_id, tool, lease: &lease, gone };
+        let ctx = CallCtx { principal, task_ref, request_id, session: connection_id, tool, lease: &lease, gone };
         let declared = steps
             .iter()
             .filter_map(|s| match s {
@@ -2353,7 +2360,7 @@ impl Controller {
         let mut task = self.task(&task_ref)?;
         self.charge(&mut task, Charge::Action)?;
         let mut class = class_name(input.effect);
-        let ctx = CallCtx { principal, task_ref: &task_ref, request_id: &request_id, tool: "computer_exec", lease: &lease, gone: &Cancel::new() };
+        let ctx = CallCtx { principal, task_ref: &task_ref, request_id: &request_id, session: connection_id, tool: "computer_exec", lease: &lease, gone: &Cancel::new() };
         let describe = format!("run {}", serde_json::to_value(&input.command).unwrap_or_default());
         let mut ask = Ask { doing: format!("run the command “{}”", approval::command_words(&input.command)), place: None, class, says_why: false, changed: false, again: false };
         let asked = json!({ "command": input.command, "cwd": input.cwd });
@@ -2628,7 +2635,7 @@ impl Controller {
             super::checks::destination_path("to.path", &s.to.path)?;
             s.to.host = self.delivery_host(principal, "to.host", &s.to.host)?;
         }
-        let ctx = CallCtx { principal, task_ref: &task_ref, request_id: &request_id, tool: "computer_files", lease: &lease, gone: &Cancel::new() };
+        let ctx = CallCtx { principal, task_ref: &task_ref, request_id: &request_id, session: connection_id, tool: "computer_files", lease: &lease, gone: &Cancel::new() };
         // The effect class, the words for the agent, and the words for a person
         // (and whether those already say why it asks first).
         let (class, describe, doing, says_why): (&'static str, String, String, bool) = match &input.op {
@@ -3019,7 +3026,7 @@ impl Controller {
             }
             assessments.push((a.check.to_string(), a.met, a.reason.clone()));
         }
-        let op = match self.remember_for(principal, &task_ref, "computer_finish", &request_id, &fingerprint_source(args), "change")? {
+        let op = match self.remember_for(principal, connection_id, &task_ref, "computer_finish", &request_id, &fingerprint_source(args), "change")? {
             Remembered::Fresh(op) => op,
             Remembered::Replay(op) | Remembered::FailedBeginReplay { operation: op, .. } => {
                 return self.stored_call(&op, &task_ref).unwrap_or_else(|| Err(fail("OUTCOME_UNKNOWN", "An earlier finish with this request_id was interrupted; check the task with computer_status.", false)));

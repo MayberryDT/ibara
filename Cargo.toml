@@ -1,0 +1,40 @@
+[package]
+name = "ibara"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "ibara: use your computers from any other, by you and your agents"
+publish = false
+
+[[bin]]
+name = "ibarad"
+path = "src/bin/ibarad.rs"
+
+[[bin]]
+name = "ibara"
+path = "src/bin/ibara.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+schemars = "1"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "process", "signal", "macros", "sync", "fs"] }
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde_path_to_error = "0.1.20"
+libc = "0.2"
+png = "0.18"
+parking_lot = "0.12"
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

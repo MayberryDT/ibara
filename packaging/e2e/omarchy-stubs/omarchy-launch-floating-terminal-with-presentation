@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for Omarchy's floating terminal in the E2E container: runs the
+# command the console's Install ibara button gives it, in this terminal.
+printf 'omarchy-launch-floating-terminal-with-presentation %s\n' "$*" >>"$HOME/omarchy-stub.log"
+exec bash -c "$*"

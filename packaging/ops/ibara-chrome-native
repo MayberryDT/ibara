@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Chrome native messaging host (chrome-extension/native-host.json).
+set -euo pipefail
+release=$(dirname "$(dirname "$(realpath "$0")")")
+exec "$release/bin/ibara" chrome-host "$@"

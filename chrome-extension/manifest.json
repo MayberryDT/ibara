@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "ibara",
+  "version": "1.0.0.0",
+  "minimum_chrome_version": "110",
+  "description": "Lets agents on this computer read pages through ibara. Installed by ibara; it never clicks or types.",
+  "permissions": ["nativeMessaging", "scripting", "tabs", "alarms"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "incognito": "not_allowed"
+}

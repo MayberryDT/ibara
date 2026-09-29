@@ -1,0 +1,22 @@
+[Unit]
+Description=Apply ibara access grants to reviewed SSH bindings
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/ibara access-system
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=15
+MemoryMax=32M
+TasksMax=16
+UMask=0077

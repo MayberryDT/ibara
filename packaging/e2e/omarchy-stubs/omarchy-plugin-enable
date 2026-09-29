@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for `omarchy plugin enable` in the E2E container.
+printf 'omarchy-plugin-enable %s\n' "$*" >>"$HOME/omarchy-stub.log"
+touch "$HOME/.omarchy-stub-enabled"
+echo "Enabled $1"

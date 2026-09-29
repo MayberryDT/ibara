@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+# E2E helper (test tooling only): one request to this account's console
+# (ibarad --role operator) and its one reply line, e.g. console-ask whats-new.
+import json, os, socket, sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(20)
+sock.connect(os.path.join(os.environ["XDG_RUNTIME_DIR"], "ibara", "ibarad.sock"))
+sock.sendall((json.dumps({"id": "e2e", "command": sys.argv[1], "args": sys.argv[2:]}) + "\n").encode())
+reply = b""
+while not reply.endswith(b"\n"):
+    chunk = sock.recv(65536)
+    if not chunk:
+        break
+    reply += chunk
+print(reply.decode().strip())

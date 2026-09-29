@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test (Arch Linux)
+    runs-on: ubuntu-latest
+    # ibara is built for Arch Linux, so it is tested there too.
+    container: archlinux:base-devel
+    steps:
+      - name: Install the build tools
+        run: pacman -Syu --noconfirm --needed git rust openssh openssl acl
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build and test as an ordinary user
+        # Several tests check that files belong to the user running them, which
+        # root would pass by accident.
+        run: |
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          su builder -c 'cd "$GITHUB_WORKSPACE" && cargo test --locked'

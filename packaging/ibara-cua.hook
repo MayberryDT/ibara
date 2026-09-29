@@ -1,0 +1,14 @@
+# After Hyprland or GCC is installed or upgraded: build Cua's Hyprland plugin
+# again for them. Nothing else is touched, so agents at work keep working.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = hyprland
+Target = gcc
+
+[Action]
+Description = Building ibara's Hyprland plugin for the new Hyprland...
+When = PostTransaction
+Exec = /usr/bin/ibara system rebuild-cua
+Depends = ibara

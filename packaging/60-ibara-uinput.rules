@@ -1,0 +1,3 @@
+# Take Control (ibara-stream) moves the pointer and types through /dev/uinput.
+# The person signed in at this computer gets access to it, as with any seat device.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"

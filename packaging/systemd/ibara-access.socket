@@ -1,0 +1,13 @@
+[Unit]
+Description=ibara access: SSH accounts for paired computers
+
+[Socket]
+ListenStream=/run/ibara-access.sock
+SocketMode=0600
+# ibara setup names the desktop account in ibara-access.socket.d/desktop.conf;
+# until then only root can connect.
+SocketUser=root
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

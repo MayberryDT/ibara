@@ -1,0 +1,35 @@
+[Unit]
+Description=ibara restart, shut down or sleep request
+Requires=ibara-power.socket
+After=ibara-power.socket
+CollectMode=inactive-or-failed
+
+[Service]
+Type=exec
+User=root
+Group=root
+# One JSON request per connection: disk, restart, shutdown or sleep. The reply
+# is sent before systemctl runs.
+ExecStart=/usr/bin/ibara power-system
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+# systemd-cryptenroll reads the LUKS header from the disk device, so the real
+# /dev stays visible.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# D-Bus to systemd and logind, nl80211 for Wi-Fi wake, and a datagram socket
+# for the wired wake-on-LAN ioctl, which sends nothing.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+IPAddressDeny=any
+UMask=0077
+RuntimeMaxSec=30s
+MemoryMax=64M
+TasksMax=16

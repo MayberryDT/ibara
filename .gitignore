@@ -1,0 +1,7 @@
+/target
+# Copies of real target databases used for migration tests hold user data.
+/fixtures/private/
+# What makepkg leaves when the package is built in packaging/.
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.zst

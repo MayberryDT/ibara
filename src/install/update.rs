@@ -200,21 +200,11 @@ pub fn update(args: &[String]) -> Result<(), String> {
         }
         println!("Downloading ibara {} (this computer has {installed})…", release.version);
         let mut to_root = vec!["update".to_string(), me.name.clone()];
-        for package in &release.packages {
-            let path = dir.join(&package.file);
-            channel.fetch(&package.file, &path)?;
-            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if bytes.len() as u64 != package.size || sha256_hex(&bytes) != package.sha256 {
-                return Err(format!("The downloaded {} package does not match the signed release; nothing was installed.", package.name));
-            }
-            to_root.extend([path.to_string_lossy().into_owned(), package.sha256.clone()]);
-        }
+        to_root.extend(download(&channel, &release, &dir)?);
         let plugin_before = super::user::plugin_digest();
         println!("Installing it needs your password once (sudo).");
         as_root(&to_root.iter().map(String::as_str).collect::<Vec<_>>())?;
-        restart_services()?;
-        super::user::reload_plugin(plugin_before)?;
-        record_whats_new(&release.version, &release.notes, Some(&installed))?;
+        after_install(&release, &installed, plugin_before)?;
         println!("\nibara {} is installed. What's new:", release.version);
         for note in &release.notes {
             println!("  - {note}");
@@ -224,6 +214,133 @@ pub fn update(args: &[String]) -> Result<(), String> {
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
+}
+
+/// Download the packages of a verified release into `dir`, each checked
+/// against the manifest: `PATH SHA256` pairs for [`system_update`].
+fn download(channel: &Channel, release: &Release, dir: &Path) -> Result<Vec<String>, String> {
+    let mut pairs = Vec::new();
+    for package in &release.packages {
+        let path = dir.join(&package.file);
+        channel.fetch(&package.file, &path)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if bytes.len() as u64 != package.size || sha256_hex(&bytes) != package.sha256 {
+            return Err(format!("The downloaded {} package does not match the signed release; nothing was installed.", package.name));
+        }
+        pairs.extend([path.to_string_lossy().into_owned(), package.sha256.clone()]);
+    }
+    Ok(pairs)
+}
+
+/// The desktop account's part once a release is installed: its services
+/// restart, Omarchy's shell loads a changed plugin, the console shows What's New.
+fn after_install(release: &Release, installed: &str, plugin_before: String) -> Result<(), String> {
+    restart_services()?;
+    super::user::reload_plugin(plugin_before)?;
+    record_whats_new(&release.version, &release.notes, Some(installed))
+}
+
+/// The unit a remote update runs in (`ibara power-system` starts it).
+pub const UPDATE_UNIT: &str = "ibara-update.service";
+
+/// Root, with nobody at the computer (`ibara system update-latest`): all of
+/// `ibara update` for the desktop account named in the station file. The root
+/// power helper starts it as its own unit, [`UPDATE_UNIT`], because updating
+/// restarts that helper's socket and the account's `ibarad`; what it prints
+/// goes to the journal. The release is checked exactly as `ibara update`
+/// checks it, and the account's own part runs as that account, in its session.
+pub fn system_update_latest() -> Result<(), String> {
+    let owner = super::system::station_owner().ok_or("ibara is not set up on this computer, so there is nobody to update it for.")?;
+    let desktop = Account::desktop(&owner)?;
+    let channel = Channel::built_in().ok_or("This build of ibara has no update channel. Install a published release to get updates.")?;
+    let installed = installed_version().ok_or("The ibara package is not installed.")?;
+    let dir = Path::new(PACKAGE_CACHE).with_file_name(format!("update-{}", crate::ids::now_millis()));
+    root_dir(&dir, 0o700)?;
+    let result = (|| {
+        let release = latest(&channel, &dir)?;
+        if vercmp(&release.version, &installed)? <= 0 {
+            println!("ibara is up to date ({installed}).");
+            return Ok(());
+        }
+        println!("Updating ibara from {installed} to {} for {}, asked for from another computer.", release.version, desktop.name);
+        let pairs = download(&channel, &release, &dir)?;
+        let plugin_before = super::user::plugin_digest();
+        system_update(&desktop, &pairs.iter().map(String::as_str).collect::<Vec<_>>())?;
+        as_desktop(&desktop, || after_install(&release, &installed, plugin_before))?;
+        println!("ibara {} is installed. To go back to {installed}: ibara rollback", release.version);
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Run `work` as `desktop` in its desktop session: a child of this process
+/// that becomes the account and takes the environment of its systemd user
+/// manager, which Omarchy's session exports to (so `ibara update` run over SSH
+/// and this reach the same shell). A child rather than the installed `ibara`,
+/// which is already the new release's and may not know this step.
+fn as_desktop(desktop: &Account, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    use std::io::Write;
+    let name = std::ffi::CString::new(desktop.name.as_str()).map_err(|_| "The account name is not valid.".to_string())?;
+    let _ = std::io::stdout().flush();
+    // SAFETY: the root update starts no threads, so the child may run any code.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("Could not start the part that runs as {}.", desktop.name));
+    }
+    if pid == 0 {
+        let code = match become_account(desktop, &name).and_then(|()| work()) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        };
+        let _ = std::io::stdout().flush();
+        // SAFETY: ends the child without running the parent's exit handlers.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child.
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        Ok(())
+    } else {
+        Err(format!("ibara is installed, but restarting its services as {} did not finish (see above).", desktop.name))
+    }
+}
+
+/// In the forked child: become `desktop` and take its session's environment.
+fn become_account(desktop: &Account, name: &std::ffi::CStr) -> Result<(), String> {
+    // SAFETY: plain system calls on values this process owns; each result is checked.
+    let dropped = unsafe {
+        libc::initgroups(name.as_ptr(), desktop.gid) == 0 && libc::setgid(desktop.gid) == 0 && libc::setuid(desktop.uid) == 0
+    };
+    if !dropped || unsafe { libc::geteuid() } == 0 {
+        return Err(format!("Could not become {}.", desktop.name));
+    }
+    let runtime = format!("/run/user/{}", desktop.uid);
+    let own = [
+        ("HOME", desktop.home.to_string_lossy().into_owned()),
+        ("USER", desktop.name.clone()),
+        ("LOGNAME", desktop.name.clone()),
+        ("XDG_RUNTIME_DIR", runtime.clone()),
+        ("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={runtime}/bus")),
+    ];
+    // SAFETY (all set_var calls): this child is single-threaded.
+    for (key, value) in &own {
+        unsafe { std::env::set_var(key, value) };
+    }
+    let session = output(Command::new("systemctl").args(["--user", "show-environment"]))
+        .map_err(|e| format!("{}'s desktop session is not running, so ibara's services were not restarted: {e}", desktop.name))?;
+    for (key, value) in session.lines().filter_map(|line| line.split_once('=')) {
+        // Values systemd had to quote (`$'…'`) are not ones ibara needs.
+        if !value.starts_with("$'") && !own.iter().any(|(k, _)| *k == key) {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+    let _ = std::env::set_current_dir(&desktop.home);
+    Ok(())
 }
 
 fn restart_services() -> Result<(), String> {

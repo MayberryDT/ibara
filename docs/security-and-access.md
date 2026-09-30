@@ -41,7 +41,7 @@ Every paired computer and every agent has 5 permissions on each computer:
 | Files | Send and collect files |
 | Take Control | Use the keyboard and mouse through the viewer |
 | Agent Tasks | Let their agents work on this computer |
-| Administer | Change access, answer approvals, restart, shut down, sleep and update |
+| Administer | Change access, answer approvals, restart, shut down, sleep, and update Omarchy or ibara |
 
 Each permission is Allowed, Ask First or Denied, and can end at a set time. Where several rules match, Denied wins over Ask First, which wins over Allowed. No matching rule means Denied. For an agent's send, spend and delete steps that no rule covers, see [Turning approvals off](#turning-approvals-off). An agent also inherits the permissions of the computer it came from, and never has more: its own rules count only while its computer has that permission, so they end when the computer's permission ends or is removed.
 
@@ -132,6 +132,8 @@ You can always take a computer back from an agent:
 ## Signed releases
 
 The installer and `ibara update` check the release manifest's SSH signature against the public key built into ibara, then each package's SHA-256 and size, before anything is installed. The key's public half is in [packaging/release.env](../packaging/release.env). [Release verification](release-verification.md) shows how to check a release by hand.
+
+A computer with Administer can also update ibara on another computer from its console (Update ibara, or Update All), with nobody at that computer and no password. ibara's root helper then does what `ibara update` does, with the same checks: it installs only the newest signed release, and only when it is newer than the one installed. It cannot install anything else, go back to an older release or run a command of the asker's choosing. The update restarts ibara's services and bar on that computer, and does not install while an agent task holds it. Updating Omarchy itself still needs a person there to type the password.
 
 ## Reference
 

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
+const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | update-latest | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
 
 /// System units the package ships; setup enables them for the desktop user.
 const SYSTEM_UNITS: [&str; 3] = ["ibara-agent-sshd.service", "ibara-access.socket", "ibara-power.socket"];
@@ -57,6 +57,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
             uninstall(&Account::desktop(user)?, delete_data)
         }
         ["update", user, pairs @ ..] if !pairs.is_empty() => super::update::system_update(&Account::desktop(user)?, pairs),
+        ["update-latest"] => super::update::system_update_latest(),
         ["rollback", user] => super::update::system_rollback(&Account::desktop(user)?),
         ["unattended-boot", rest @ ..] => super::unattended_boot::system(&rest.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
         _ => Err(USAGE.into()),

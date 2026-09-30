@@ -35,7 +35,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {
-            println!("ibara {}", version());
+            println!("ibara {}", ibara::version());
             ExitCode::SUCCESS
         }
         _ => {
@@ -63,14 +63,6 @@ Commands:
 To connect an agent, copy the prompt from Connect an Agent in the ibara console and paste it to your agent;
 it connects itself. ibara prompt prints the same prompt.
 ";
-
-/// `pkgver-pkgrel` for a packaged build (the PKGBUILD sets IBARA_PKGREL), `pkgver` otherwise.
-fn version() -> String {
-    match option_env!("IBARA_PKGREL") {
-        Some(rel) if !rel.is_empty() => format!("{}-{rel}", env!("CARGO_PKG_VERSION")),
-        _ => env!("CARGO_PKG_VERSION").to_string(),
-    }
-}
 
 fn code(status: i32) -> ExitCode {
     ExitCode::from(u8::try_from(status).unwrap_or(1))

@@ -1,5 +1,5 @@
 [Unit]
-Description=ibara restart, shut down or sleep request
+Description=ibara restart, shut down, sleep or update request
 Requires=ibara-power.socket
 After=ibara-power.socket
 CollectMode=inactive-or-failed
@@ -8,8 +8,9 @@ CollectMode=inactive-or-failed
 Type=exec
 User=root
 Group=root
-# One JSON request per connection: disk, restart, shutdown or sleep. The reply
-# is sent before systemctl runs.
+# One JSON request per connection: disk, restart, shutdown, sleep or
+# update_ibara. The reply is sent before systemctl runs; an ibara update runs
+# as its own unit (ibara-update.service), started before the reply.
 ExecStart=/usr/bin/ibara power-system
 StandardInput=socket
 StandardOutput=socket

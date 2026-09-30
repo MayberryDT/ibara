@@ -337,7 +337,14 @@ impl Controller {
                     "message": "The update runs in a window on this computer and asks for its password there.",
                 }))
             }
-            _ => Err(invalid("Choose restart, shutdown, sleep, lock or update.")),
+            "update_ibara" => {
+                let reply = power_helper(json!({"op": "update_ibara"})).await?;
+                if reply["state"] == "started" {
+                    log_event("power", "ibara update at a person's request");
+                }
+                Ok(json!({"action": "update_ibara", "state": reply["state"], "message": reply["message"]}))
+            }
+            _ => Err(invalid("Choose restart, shutdown, sleep, lock, update or update_ibara.")),
         }
     }
 

@@ -417,6 +417,7 @@ impl Controller {
         out.insert("name".into(), json!(crate::settings::current().text("name")));
         out.insert("wake".into(), self.wake_info().await);
         out.insert("disk_password".into(), self.disk_password().await);
+        out.insert("version".into(), json!(crate::version()));
         if let Some(a)=crate::access::Access::load(&self.journal)? {
             out.insert("access".into(),a.own_row(operator_id,self.now_ms(),(self.ask_first)()));
             if a.rule(operator_id,"administer",self.now_ms())==super::Rule::Allow { out.insert("attention".into(),json!(self.journal.list_attention(Some("open"),None,20)?)); }
@@ -661,7 +662,8 @@ impl Controller {
                 "shutdown" => "shut down this computer".into(),
                 "sleep" => "put this computer to sleep".into(),
                 "lock" => "lock this computer's screen".into(),
-                "update" => "update this computer".into(),
+                "update" => "update Omarchy on this computer".into(),
+                "update_ibara" => "update ibara on this computer".into(),
                 _ => return None,
             },
             "settings" => {

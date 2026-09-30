@@ -26,3 +26,11 @@ pub mod tailnet;
 pub mod settings;
 pub mod wake;
 pub mod theme;
+
+/// `pkgver-pkgrel` for a packaged build (the PKGBUILD sets IBARA_PKGREL), `pkgver` otherwise.
+pub fn version() -> String {
+    match option_env!("IBARA_PKGREL") {
+        Some(rel) if !rel.is_empty() => format!("{}-{rel}", env!("CARGO_PKG_VERSION")),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}

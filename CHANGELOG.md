@@ -23,6 +23,7 @@ The first public release.
 - Starting without the disk password is available on encrypted Omarchy computers, off unless you turn it on.
 - A computer agents use never locks them out by itself: ibara turns on Omarchy's Stay Awake when it starts, after setup and after each update, so the screensaver and idle lock no longer start. It stays on after an agent finishes. If you turn it off in Omarchy, ibara turns it on again the next time it starts.
 - A locked computer says Locked in the console instead of looking offline, and Take Control works on it: type your password in the viewer to unlock it. Agents still wait until it is unlocked.
+- Update ibara on a computer, or on all of them with Update All, from your console with nobody at it and no password. The computer installs the newest signed release, checked the same way `ibara update` checks it, and restarts its bar when it finishes. Updating Omarchy itself, which asks for the password on that computer, is now called Update Omarchy.
 
 ### Agents
 

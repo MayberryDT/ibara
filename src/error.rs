@@ -14,6 +14,7 @@ pub const CODES: &[(&str, &str)] = &[
     ("LEASE_EXPIRED", "Your control ended. Start again with computer_begin; old references are not revived."),
     ("HUMAN_CONTROL", "A person holds the computer. Wait for them to hand back; do not retry input."),
     ("STALE_TARGET", "The thing you pointed at changed. Observe again and choose a fresh target."),
+    ("NOT_FOUND", "What you named is gone. List again and choose what is there now."),
     ("DISPLAY_CHANGED", "The display changed. Observe again before acting."),
     ("AMBIGUOUS_TARGET", "More than one match. Choose one of the listed candidates."),
     ("BLOCKED_BY_DIALOG", "A dialog is in the way. Handle or close the dialog first."),

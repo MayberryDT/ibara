@@ -455,7 +455,7 @@ impl Controller {
         })
     }
 
-    fn timeline(&self, kind: &str, task_ref: Option<&str>, actor: &str, summary: &str, data: Value) {
+    pub(super) fn timeline(&self, kind: &str, task_ref: Option<&str>, actor: &str, summary: &str, data: Value) {
         let at = self.now_iso();
         if let Err(e) = self.journal.append_event(NewEvent { at: &at, kind, task_ref, actor, summary, data: &data }) {
             super::log_event("timeline_write_failed", &e.to_string());

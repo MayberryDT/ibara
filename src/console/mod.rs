@@ -283,7 +283,9 @@ async fn dispatch(ctx: &Ctx) -> Handled {
         "operator-logs" | "operator-health" | "operator-power" | "operator-settings" | "operator-answer-attention" | "operator-repair"
         | "operator-tasks" | "operator-task" | "operator-artifacts" | "operator-procedures" | "operator-procedure"
         | "operator-task-extend" | "operator-task-revoke" | "operator-procedure-review" | "operator-access" | "operator-access-set"
-        | "operator-access-remove" | "operator-access-unpair" => everyday::per_computer(ctx).await,
+        | "operator-access-remove" | "operator-access-unpair" | "operator-windows" | "operator-window-close" | "operator-window-move" => {
+            everyday::per_computer(ctx).await
+        }
         "operator-artifact-save" => everyday::artifact_save(ctx).await,
         "operator-theme" => fleet::operator_theme(ctx).await,
         "open-terminal" => everyday::open_terminal(ctx).await,

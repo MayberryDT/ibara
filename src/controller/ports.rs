@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::pin::Pin;
 use tokio::sync::broadcast;
 
+pub use crate::desktop::hyprland::WorkspaceRef;
 pub use crate::desktop::{OutputChange, TypingCursor};
 pub use crate::desktop::run::Cancel;
 
@@ -44,7 +45,10 @@ pub struct Win {
     pub focused: bool,
     /// Floating windows are how dialogs usually appear on Hyprland.
     pub floating: bool,
+    /// The workspace's name as Hyprland gives it (`special:NAME` for a special one).
     pub workspace: String,
+    pub workspace_id: i64,
+    pub fullscreen: bool,
     pub rect: Rect,
 }
 
@@ -159,6 +163,14 @@ pub trait DesktopPort {
         Box::pin(async { false })
     }
     fn windows(&self) -> LocalFuture<'_, Result<Vec<Win>>>;
+    /// The workspace the focused monitor shows; `None` with no monitor.
+    fn active_workspace(&self) -> LocalFuture<'_, Result<Option<WorkspaceRef>>>;
+    /// Ask a window to close for a person managing windows, like its close
+    /// button: no agent input goes. Address **and** pid must still match.
+    fn close_window<'a>(&'a self, key: &'a WinKey) -> LocalFuture<'a, Result<()>>;
+    /// Move a window to workspace `workspace` for a person, without showing
+    /// that workspace. Address **and** pid must still match.
+    fn move_window<'a>(&'a self, key: &'a WinKey, workspace: i64) -> LocalFuture<'a, Result<()>>;
     fn elements<'a>(&'a self, surface: &'a WinKey, query: Option<&'a str>, limit: u32, cursor: Option<u32>) -> LocalFuture<'a, Result<ElementPage>>;
     fn act<'a>(&'a self, effect: &'a Effect, cancel: &'a Cancel) -> LocalFuture<'a, Result<Done>>;
     fn capture<'a>(&'a self, target: &'a Capture, max_bytes: usize) -> LocalFuture<'a, Result<Image>>;

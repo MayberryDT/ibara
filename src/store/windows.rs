@@ -83,6 +83,11 @@ impl Journal {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Every window a task opened, oldest first.
+    pub fn owned_windows(&self) -> Result<Vec<TaskWindow>> {
+        Ok(self.db().prepare_cached("SELECT * FROM task_windows ORDER BY id")?.query_map([], window_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// The task finished: its windows are no longer anyone's.
     pub fn forget_task_windows(&self, task_ref: &str) -> Result<()> {
         self.db().prepare_cached("DELETE FROM task_windows WHERE task_ref = ?")?.execute([task_ref])?;

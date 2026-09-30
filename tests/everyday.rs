@@ -757,3 +757,150 @@ fn watching_that_asks_first_asks_once_per_sitting() {
     assert_eq!(status["observation"], "denied", "{status}");
     assert_eq!(open_asks(&tulip1), Vec::<String>::new());
 }
+
+/// Hyprland for window management, from `clients` beside it: one window per
+/// line, `ADDRESS PID CLASS WORKSPACE_ID WORKSPACE_NAME X Y TITLE…`. The
+/// monitor shows workspace 2. `eval` of the close script removes the window
+/// it names; of the move script, puts it on the workspace it names.
+const WINDOWS_HYPRCTL: &str = r#"#!/bin/sh
+here="$(dirname "$0")"
+address=$(printf '%s' "$*" | sed -n "s/.*w.address == '\(0x[0-9a-f]*\)'.*/\1/p")
+case "$*" in
+  *hl.dsp.window.close*)
+    grep -v "^$address " "$here/clients" > "$here/clients.new"; mv "$here/clients.new" "$here/clients" ;;
+  *hl.dsp.window.move*)
+    workspace=$(printf '%s' "$*" | sed -n 's/.*workspace = \([0-9]*\).*/\1/p')
+    awk -v a="$address" -v w="$workspace" '$1 == a { $4 = w; $5 = w } { print }' "$here/clients" > "$here/clients.new"
+    mv "$here/clients.new" "$here/clients" ;;
+  *monitors*) echo '[{"id":0,"name":"IbaraVirtual","width":1280,"height":720,"x":0,"y":0,"scale":1.0,"focused":true,"activeWorkspace":{"id":2,"name":"2"}}]' ;;
+  *clients*)
+    awk 'BEGIN { printf "[" } {
+      title = $8; for (i = 9; i <= NF; i++) title = title " " $i
+      printf "%s{\"address\":\"%s\",\"pid\":%s,\"class\":\"%s\",\"workspace\":{\"id\":%s,\"name\":\"%s\"},\"at\":[%s,%s],\"size\":[600,400],\"mapped\":true,\"hidden\":false,\"floating\":false,\"fullscreen\":0,\"title\":\"%s\"}", (NR > 1 ? "," : ""), $1, $2, $3, $4, $5, $6, $7, title
+    } END { print "]" }' "$here/clients" ;;
+  *) echo '[]' ;;
+esac
+"#;
+
+/// Each workspace as `[id, name, special, active, [titles]]`.
+fn layout(windows: &Value) -> Value {
+    let spaces = windows["workspaces"].as_array().unwrap().iter();
+    let titles = |w: &Value| w["windows"].as_array().unwrap().iter().map(|x| x["title"].clone()).collect::<Vec<_>>();
+    json!(spaces.map(|w| json!([w["id"], w["name"], w["special"], w["active"], titles(w)])).collect::<Vec<_>>())
+}
+
+/// A person clears windows an agent left behind, from another computer.
+/// Failure cases this must catch:
+/// 1. The list does not group windows by workspace, misses the shown (empty)
+///    workspace or does not mark it, takes a named workspace (negative id)
+///    for a special one, puts the scratchpad among the others, or orders a
+///    workspace's windows other than top to bottom.
+/// 2. A terminal started with its own app id is not known as a terminal, or
+///    another program is.
+/// 3. Closing leaves the window, or says it closed when it did not; the
+///    history does not say what was closed or moved.
+/// 4. A window that is gone, or an address now another process's, is acted
+///    on, or not refused as `NOT_FOUND`.
+/// 5. Moving leaves the window where it was.
+/// 6. A malformed address or workspace reaches the other computer.
+/// (The agent's own window is refused in `controller::tests`: a running
+/// agent task needs a desktop this world does not have.)
+#[test]
+fn windows_left_behind_are_closed_and_moved_from_another_computer() {
+    let world = World::new("windows");
+    let desk = world.root.join("desk-tulip1");
+    fs::create_dir_all(&desk).unwrap();
+    write_executable(&desk.join("hyprctl"), WINDOWS_HYPRCTL);
+    // The processes behind two windows: a terminal (its program is named
+    // `foot`) showing btop under Omarchy's own app id, and an editor.
+    std::os::unix::fs::symlink("/usr/bin/sleep", desk.join("foot")).unwrap();
+    let mut terminal = Command::new(desk.join("foot")).arg("120").spawn().unwrap();
+    let mut editor = Command::new("/usr/bin/sleep").arg("120").spawn().unwrap();
+    let (term_pid, editor_pid) = (terminal.id().to_string(), editor.id().to_string());
+    let clients = format!(
+        "0x5578a2 4102 foot 1 1 0 400 htop\n\
+         0x5578a1 {term_pid} org.omarchy.btop 1 1 0 0 btop\n\
+         0x5578b1 {editor_pid} mousepad 3 3 0 0 Untitled 1 - Mousepad\n\
+         0x5578c1 4301 foot -98 special:scratchpad 0 0 scratch\n\
+         0x5578d1 4401 foot -1337 hdmi 0 0 notes\n"
+    );
+    fs::write(desk.join("clients"), clients).unwrap();
+    let hyprctl = desk.join("hyprctl");
+    let tulip1 = Target::start_with(&world, node("tulip1"), Some("Tulip1"), 300_000, &[("IBARA_TEST_HYPRCTL", hyprctl.as_os_str())]);
+    let vesper_target = Target::start(&world, node("vesper"), None, 300_000);
+    let mut vesper = Console::start(&world, "vesper", node("vesper"), Some(&vesper_target));
+    let id = add_own(&mut vesper, "tulip1");
+    let e = epoch(&mut vesper, &id);
+    let on_desk = || fs::read_to_string(desk.join("clients")).unwrap();
+
+    // 1. Workspaces with windows, and the one shown; the named one after the
+    // numbered ones, the scratchpad last.
+    let listed = ok_on(&mut vesper, &id, &e, "operator-windows", &[]);
+    assert_eq!(
+        layout(&listed),
+        json!([
+            [1, "1", false, false, ["btop", "htop"]],
+            [2, "2", false, true, []],
+            [3, "3", false, false, ["Untitled 1 - Mousepad"]],
+            [-1337, "hdmi", false, false, ["notes"]],
+            [-98, "special:scratchpad", true, false, ["scratch"]],
+        ]),
+        "{listed}"
+    );
+    // 2. Known as a terminal by its program, not its app id.
+    let btop = json!({"address": "0x5578a1", "pid": terminal.id(), "class": "org.omarchy.btop", "title": "btop", "floating": false, "fullscreen": false, "focused": false, "terminal": true, "task": null});
+    assert_eq!(listed["workspaces"][0]["windows"][0], btop);
+    assert_eq!(listed["workspaces"][2]["windows"][0]["terminal"], false, "{listed}");
+    assert_eq!(listed["agent"], Value::Null);
+
+    // 3. Close: the window goes.
+    let closed = ok_on(&mut vesper, &id, &e, "operator-window-close", &["--address", "0x5578a1", "--pid", &term_pid]);
+    assert_eq!(closed["closed"], true, "{closed}");
+    assert!(!on_desk().contains("0x5578a1"), "{}", on_desk());
+
+    // 4. Gone, or the address now another process's: refused, nothing sent.
+    let before = on_desk();
+    for (command, extra) in [
+        ("operator-window-close", vec!["--address", "0x5578a1", "--pid", term_pid.as_str()]),
+        ("operator-window-move", vec!["--address", "0x5578a1", "--pid", term_pid.as_str(), "--workspace", "4"]),
+        ("operator-window-close", vec!["--address", "0x5578a2", "--pid", "9999"]),
+    ] {
+        let refused = on(&mut vesper, &id, &e, command, &extra);
+        assert_eq!(refused["error"]["code"], "NOT_FOUND", "{command} {extra:?}: {refused}");
+        assert_eq!(refused["error"]["message"], "That window is gone.");
+    }
+    assert_eq!(on_desk(), before);
+
+    // 5. Move: the editor goes to the shown workspace, and its own empties.
+    let moved = ok_on(&mut vesper, &id, &e, "operator-window-move", &["--address", "0x5578b1", "--pid", &editor_pid, "--workspace", "2"]);
+    assert_eq!((moved["moved"].as_bool(), moved["workspace"].as_i64()), (Some(true), Some(2)), "{moved}");
+    let listed = ok_on(&mut vesper, &id, &e, "operator-windows", &[]);
+    assert_eq!(
+        layout(&listed),
+        json!([
+            [1, "1", false, false, ["htop"]],
+            [2, "2", false, true, ["Untitled 1 - Mousepad"]],
+            [-1337, "hdmi", false, false, ["notes"]],
+            [-98, "special:scratchpad", true, false, ["scratch"]],
+        ]),
+        "{listed}"
+    );
+    let history = vesper.ok("away", &[]);
+    let events: Vec<(&str, &str)> = history["computers"][0]["events"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap(), e["summary"].as_str().unwrap())).collect();
+    assert!(events.contains(&("window_closed", "Closed org.omarchy.btop “btop”")), "{history}");
+    assert!(events.contains(&("window_moved", "Moved mousepad “Untitled 1 - Mousepad” to workspace 2")), "{history}");
+    let _ = (terminal.kill(), editor.kill(), terminal.wait(), editor.wait());
+
+    // 6. Refused here, with Tulip1 off: the other computer is never asked.
+    drop(tulip1);
+    for (extra, message) in [
+        (vec!["--address", "5578a2", "--pid", "4102"], "Expected a window address such as 0x1a2b."),
+        (vec!["--address", "0x5578A2", "--pid", "4102"], "Expected a window address such as 0x1a2b."),
+        (vec!["--address", "0x5578a2", "--pid", "0"], "Expected the window's process id."),
+    ] {
+        let refused = on(&mut vesper, &id, &e, "operator-window-close", &extra);
+        assert_eq!((refused["error"]["code"].as_str(), refused["error"]["message"].as_str()), (Some("INVALID_ARGUMENT"), Some(message)), "{extra:?}: {refused}");
+    }
+    let refused = on(&mut vesper, &id, &e, "operator-window-move", &["--address", "0x5578a2", "--pid", "4102", "--workspace", "11"]);
+    assert_eq!(refused["error"]["message"], "Choose a workspace from 1 to 10.", "{refused}");
+}

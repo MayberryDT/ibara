@@ -361,3 +361,31 @@ fn an_agent_keeps_its_task_and_rules_under_its_short_name() {
         assert!(a.grants.values().all(|g| !g.subject.contains("-")), "{:?}", a.grants.keys());
     });
 }
+
+/// Failure cases: closing a window that asks first goes before a person
+/// approves; the approval does not name the window by its live title, or
+/// fails to be raised for a window whose title cannot be read.
+#[test]
+fn closing_a_window_that_asks_first_names_it_and_waits_for_approval() {
+    run(async {
+        let (rig, _helper) = access_rig(false, &[("control", Rule::Ask)]);
+        let c = &rig.controller;
+        let mut close = operator_action(c, "window_close");
+        close["address"] = json!("0x1");
+        close["pid"] = json!(100);
+        let held = c.operator_call("vesper", close.clone()).await.unwrap();
+        assert_eq!(held["state"], "pending_approval", "{held}");
+        assert_eq!(held["held"], "vesper asks to close the window “Untitled 1 - Mousepad”.");
+        assert_eq!(rig.desktop.acts(), 0, "nothing is sent before approval");
+        c.journal.answer_attention(held["attention"].as_str().unwrap(), "approve", "owner", &c.now_iso()).unwrap();
+        let closed = c.operator_call("vesper", close).await.unwrap();
+        assert_eq!(closed["closed"], true, "{closed}");
+
+        let mut moving = operator_action(c, "window_move");
+        moving["address"] = json!("0x9");
+        moving["pid"] = json!(900);
+        moving["workspace"] = json!("3");
+        let held = c.operator_call("vesper", moving).await.unwrap();
+        assert_eq!(held["held"], "vesper asks to move a window to workspace 3.");
+    });
+}

@@ -1,9 +1,10 @@
 //! Everyday commands for one computer over its operator route: logs, health,
 //! power, its settings and theme, repairs, approvals, tasks, results,
-//! procedures, access, and a terminal. Every one names the computer and the
-//! controller epoch the plugin knows (`--computer ID --epoch E`, like
-//! `operator-control`), and the target decides with its access model: reads
-//! need watch, changes need administer. A refusal is said plainly.
+//! procedures, access, its windows, and a terminal. Every one names the
+//! computer and the controller epoch the plugin knows (`--computer ID --epoch
+//! E`, like `operator-control`), and the target decides with its access model:
+//! reads need watch, closing or moving a window needs control, other changes
+//! need administer. A refusal is said plainly.
 
 use super::envelope::{Fault, Handled};
 use super::process::{launch, which};
@@ -53,6 +54,8 @@ fn asks(command: &str) -> &'static str {
             "see what happened on it"
         }
         "operator-task-extend" | "operator-task-revoke" => "change its tasks",
+        "operator-windows" => "see its windows",
+        "operator-window-close" | "operator-window-move" => "close or move its windows",
         "operator-procedure-review" => "review its procedures",
         "operator-access-set" | "operator-access-remove" | "operator-access-unpair" => "change who can use it",
         "operator-artifact-save" => "collect its results",
@@ -102,6 +105,18 @@ pub(super) fn target(ctx: &Ctx) -> Result<(String, String), Fault> {
 
 fn reference(ctx: &Ctx, name: &str, label: &str) -> Result<String, Fault> {
     validated_id(option(&ctx.args, name), label)
+}
+
+/// `--address` (`0x` and 1 to 16 lowercase hex digits) and `--pid` of a window.
+fn window(ctx: &Ctx) -> Result<Value, Fault> {
+    let address = option(&ctx.args, "--address").unwrap_or("");
+    let hex = address.strip_prefix("0x").unwrap_or("");
+    if !(1..=16).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(Fault::plain("Expected a window address such as 0x1a2b."));
+    }
+    let pid = option(&ctx.args, "--pid").and_then(|p| p.parse::<i64>().ok()).filter(|p| *p > 0);
+    let pid = pid.ok_or_else(|| Fault::plain("Expected the window's process id."))?;
+    Ok(json!({"address": address, "pid": pid}))
 }
 
 /// The access change body: one JSON object.
@@ -163,6 +178,14 @@ pub async fn per_computer(ctx: &Ctx) -> Handled {
         "operator-access-set" => ("access_set", access_body(ctx)?, CALL_DEADLINE),
         "operator-access-remove" => ("access_remove", access_body(ctx)?, CALL_DEADLINE),
         "operator-access-unpair" => ("access_unpair", access_body(ctx)?, CALL_DEADLINE),
+        "operator-windows" => ("windows", json!({}), CALL_DEADLINE),
+        "operator-window-close" => ("window_close", window(ctx)?, CALL_DEADLINE),
+        "operator-window-move" => {
+            let workspace = option(&ctx.args, "--workspace").and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=10).contains(n));
+            let mut fields = window(ctx)?;
+            fields["workspace"] = json!(workspace.ok_or_else(|| Fault::plain("Choose a workspace from 1 to 10."))?);
+            ("window_move", fields, CALL_DEADLINE)
+        }
         _ => return Err(Fault::Plain(format!("Unknown command {command}."))),
     };
     let data = match call(ctx, &computer, &epoch, op, fields, deadline).await {

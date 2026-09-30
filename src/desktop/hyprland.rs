@@ -428,6 +428,22 @@ impl Hyprland {
         self.window_dispatch(lua, address, "close").await
     }
 
+    /// Move a window to workspace `workspace` without following it (the
+    /// `movetoworkspacesilent` of Hyprland's string dispatchers, in 0.56's Lua
+    /// as `hl.dsp.window.move({ workspace, follow = false })`). The window
+    /// must still be the same process: address **and** PID must match.
+    pub async fn move_window(&self, address: &str, pid: i64, workspace: i64) -> Result<()> {
+        if !valid_address(address) || pid <= 0 {
+            return Err(IbaraError::new("STALE_TARGET", "Window is no longer present for move.", true).with("address", address));
+        }
+        let lua = format!(
+            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {pid} then target = w break end end; \
+             if not target then error('window not found') end; hl.dispatch(hl.dsp.window.move({{ window = target, workspace = {workspace}, follow = false }}))",
+            lua_string(address)
+        );
+        self.window_dispatch(lua, address, "move").await
+    }
+
     /// `count` presses of `key` (an xkb name such as `Down` or `Escape`)
     /// into whatever holds the keyboard now, through Hyprland: an open
     /// menu, which Cua's plugin sends no keys past (see `Desktop::key`).

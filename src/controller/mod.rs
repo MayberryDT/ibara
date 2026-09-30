@@ -8,6 +8,8 @@
 //! - `operator`, `admin`: the operator and administrator operations.
 //! - `stream`: `ibara-stream`, the stream Take Control opens, as a child.
 //! - `clipboard`: the shared clipboard while a person holds control.
+//! - `everyday`, `windows`: a person's everyday operations on the operator
+//!   route; `windows` lists, closes and moves this computer's windows.
 //! - `watchdog`: repairs known stuck states and resumes a computer only the
 //!   system paused.
 //! - `budget`: keeps a response inside the client's byte limit.
@@ -35,6 +37,7 @@ mod replay;
 mod situation;
 pub mod stream;
 mod watchdog;
+mod windows;
 
 #[cfg(test)]
 mod tests;
@@ -331,6 +334,9 @@ pub struct Controller {
     virtual_size_applied: RefCell<Option<String>>,
     /// The last preview per display and quality, for the picture interval setting.
     previews: RefCell<HashMap<(String, String), (i64, Value)>>,
+    /// The live title of the window a `window_close` or `window_move` names,
+    /// read just before its access gate (see `windows::note_window_title`).
+    window_title: RefCell<Option<(String, String)>>,
 }
 
 impl Controller {
@@ -415,6 +421,7 @@ impl Controller {
             disk_cache: RefCell::new(None),
             virtual_size_applied: RefCell::new(None),
             previews: RefCell::new(HashMap::new()),
+            window_title: RefCell::new(None),
         })
     }
 

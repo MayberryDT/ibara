@@ -2,7 +2,7 @@
 //! `DesktopPort`, and `ControllerOptions::live` building everything from the
 //! configured paths and the startup policy snapshot.
 
-use super::ports::{Button, Capture, Cancel, DesktopPort, Done, Effect, Image, LocalFuture, OutputChange, Preview, PutBack, Rect, Tab, Win, WinKey};
+use super::ports::{Button, Capture, Cancel, DesktopPort, Done, Effect, Image, LocalFuture, OutputChange, Preview, PutBack, Rect, Tab, Win, WinKey, WorkspaceRef};
 use super::stream::LiveStream;
 use super::{ComputerIdentity, ControllerOptions, EffectRules, GrantSource};
 use crate::desktop::atspi::ElementPage;
@@ -153,11 +153,25 @@ impl DesktopPort for LiveDesktop {
                         title: w.title,
                         floating: w.floating,
                         workspace: w.workspace.name,
+                        workspace_id: w.workspace.id,
+                        fullscreen: w.fullscreen != 0,
                         rect: rect(g),
                     }
                 })
                 .collect())
         })
+    }
+
+    fn active_workspace(&self) -> LocalFuture<'_, Result<Option<WorkspaceRef>>> {
+        Box::pin(self.desktop.active_workspace())
+    }
+
+    fn close_window<'a>(&'a self, key: &'a WinKey) -> LocalFuture<'a, Result<()>> {
+        Box::pin(async move { self.desktop.close_for_person(&surface(key)).await })
+    }
+
+    fn move_window<'a>(&'a self, key: &'a WinKey, workspace: i64) -> LocalFuture<'a, Result<()>> {
+        Box::pin(async move { self.desktop.move_for_person(&surface(key), workspace).await })
     }
 
     fn elements<'a>(&'a self, key: &'a WinKey, query: Option<&'a str>, limit: u32, cursor: Option<u32>) -> LocalFuture<'a, Result<ElementPage>> {

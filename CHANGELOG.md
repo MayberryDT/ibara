@@ -2,6 +2,16 @@
 
 Each release's notes are also in its signed manifest, and the console shows them once after an update, under What's New. Versions are `PKGVER-PKGREL`: all 3 packages (`ibara`, `ibara-stream` and `ibara-view`) always share one version.
 
+## Unreleased
+
+### Your computers
+
+- A computer's page has a Windows tab that lists its workspaces and the windows on each, and says which agent task opened a window.
+- Close a window, or move it to another workspace without changing what the screen shows, from the Windows tab, so windows an agent left behind no longer crowd its next windows into a corner.
+- A window the agent at work opened cannot be closed or moved there until its task stops.
+- Closing a terminal window asks first, since anything running in it stops. ibara recognizes a terminal by its program, so a program started in a terminal under its own name still counts.
+- Closing or moving a window needs the Take Control permission, and each close or move is written in the computer's history.
+
 ## 0.1.0
 
 The first public release.

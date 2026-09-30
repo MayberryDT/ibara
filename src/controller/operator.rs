@@ -145,6 +145,9 @@ impl Controller {
             op if super::EVERYDAY_OPS.contains(&op)=>Some(super::everyday::capability(op)),
             _=>None,
         };
+        if matches!(op.as_str(), "window_close" | "window_move") {
+            self.note_window_title(&action).await;
+        }
         if let Some(cap)=capability {
             let gate = if cap == "watch" { self.watch_gate(operator_id)? } else { self.access_gate(operator_id,cap,&action)? };
             if let Some(mut pending)=gate {
@@ -706,6 +709,19 @@ impl Controller {
                 _ => return None,
             },
             "artifact_transfer" => "collect an agent result".into(),
+            op @ ("window_close" | "window_move") => {
+                let window = action
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .and_then(|a| self.noted_window_title(a))
+                    .map_or("a window".to_string(), |t| format!("the window {}", quoted(&t)));
+                if op == "window_close" {
+                    format!("close {window}")
+                } else {
+                    let n = action.get("workspace").and_then(|s| s.as_i64().or_else(|| s.as_str()?.trim().parse().ok()))?;
+                    format!("move {window} to workspace {n}")
+                }
+            }
             _ => return None,
         })
     }

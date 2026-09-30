@@ -403,6 +403,12 @@ impl Desktop {
         self.hypr.active_window().await
     }
 
+    /// The workspace the focused monitor shows (else the first monitor's).
+    pub async fn active_workspace(&self) -> Result<Option<hyprland::WorkspaceRef>> {
+        let monitors = self.hypr.monitors().await?;
+        Ok(monitors.iter().find(|m| m.focused).or(monitors.first()).map(|m| m.active_workspace.clone()))
+    }
+
     /// Monitors, windows and focus, read concurrently.
     pub async fn snapshot(&self) -> Result<Snapshot> {
         let (monitors, windows, active) =
@@ -606,6 +612,25 @@ impl Desktop {
             self.hypr.close_window(&surface.address, surface.pid).await
         })
         .await
+    }
+
+    /// Close a window for a person managing windows: as [`Self::close`], but
+    /// no agent input goes, so nothing waits for the screen or takes it from
+    /// the person.
+    pub async fn close_for_person(&self, surface: &SurfaceId) -> Result<()> {
+        // Hyprland may move the pointer onto the window focused next.
+        let motion = self.cua.motion();
+        let _moving = motion.begin();
+        self.hypr.close_window(&surface.address, surface.pid).await
+    }
+
+    /// Move a window to `workspace` for a person, leaving the workspace shown
+    /// as it is; the address **and** PID must still match.
+    pub async fn move_for_person(&self, surface: &SurfaceId, workspace: i64) -> Result<()> {
+        // Hyprland may move the pointer onto the window focused next.
+        let motion = self.cua.motion();
+        let _moving = motion.begin();
+        self.hypr.move_window(&surface.address, surface.pid, workspace).await
     }
 
     /// Click, double-click or right-click. A point is clicked through Cua's

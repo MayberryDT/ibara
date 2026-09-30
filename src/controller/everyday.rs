@@ -2,10 +2,12 @@
 //! another one over the pairing route. Logs, health, power, this computer's
 //! settings and theme, repairs, the timeline, sending a wake packet for a
 //! sleeping neighbour, and the task, result and procedure reads and actions
-//! that used to need the administrator route.
+//! that used to need the administrator route; and this computer's windows
+//! (`windows.rs`).
 //!
-//! Reads (`health`, `timeline`, tasks, results, procedures) need watch;
-//! everything that changes this computer needs administer. Anything needing
+//! Reads (`health`, `timeline`, tasks, results, procedures, windows) need
+//! watch; closing or moving a window needs control; everything else that
+//! changes this computer needs administer. Anything needing
 //! root (restart, shut down, sleep, turning on wake-up, the disk check) goes
 //! through the root power helper (`ibara power-system`, socket
 //! `/run/ibara-power/power.sock`, or `IBARA_POWER_SOCKET`).
@@ -25,7 +27,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 /// Everyday operations on the operator route.
 pub const EVERYDAY_OPS: &[&str] = &[
     "logs", "health", "power", "settings", "theme_apply", "theme_upload", "repair", "timeline", "send_wake", "tasks", "task",
-    "artifacts", "procedures", "procedure", "task_extend", "task_revoke", "procedure_review", "artifact_transfer",
+    "artifacts", "procedures", "procedure", "task_extend", "task_revoke", "procedure_review", "artifact_transfer", "windows",
+    "window_close", "window_move",
 ];
 
 /// Everyday operations that may take long: their own transport and the long relay deadline.
@@ -34,7 +37,8 @@ pub const SLOW_OPS: &[&str] = &["theme_apply", "repair"];
 /// The access capability an everyday operation needs.
 pub(crate) fn capability(op: &str) -> &'static str {
     match op {
-        "health" | "timeline" | "tasks" | "task" | "artifacts" | "procedures" | "procedure" => "watch",
+        "health" | "timeline" | "tasks" | "task" | "artifacts" | "procedures" | "procedure" | "windows" => "watch",
+        "window_close" | "window_move" => "control",
         _ => "administer",
     }
 }
@@ -53,7 +57,7 @@ fn text<'a>(action: &'a Value, key: &str) -> &'a str {
 }
 
 /// A number given as a JSON number or as decimal text.
-fn number(action: &Value, key: &str) -> Option<i64> {
+pub(super) fn number(action: &Value, key: &str) -> Option<i64> {
     match action.get(key)? {
         Value::Number(n) => n.as_i64(),
         Value::String(s) => s.trim().parse().ok(),
@@ -170,6 +174,9 @@ impl Controller {
                 }
                 self.storage.transfer("operator", &request, Some(&format!("op_{operator_id}")))
             }
+            "windows" => self.op_windows().await,
+            "window_close" => self.op_window_close(operator_id, action).await,
+            "window_move" => self.op_window_move(operator_id, action).await,
             _ => Err(invalid("Unknown operator operation.")),
         }
     }

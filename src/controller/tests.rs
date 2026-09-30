@@ -175,6 +175,30 @@ impl DesktopPort for FakeDesktop {
             Ok(self.windows.borrow().clone())
         })
     }
+    /// Workspace 1 is shown.
+    fn active_workspace(&self) -> LocalFuture<'_, crate::error::Result<Option<WorkspaceRef>>> {
+        Box::pin(async move { Ok(Some(WorkspaceRef { id: 1, name: "1".into() })) })
+    }
+    /// Recorded with the effects; the window goes unless it ignores closing.
+    fn close_window<'a>(&'a self, key: &'a WinKey) -> LocalFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            self.acts.borrow_mut().push(format!("close_window {}", key.address));
+            if !self.ignores_close.borrow().contains(&key.address) {
+                self.windows.borrow_mut().retain(|w| w.address != key.address);
+            }
+            Ok(())
+        })
+    }
+    /// Recorded with the effects.
+    fn move_window<'a>(&'a self, key: &'a WinKey, workspace: i64) -> LocalFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            self.acts.borrow_mut().push(format!("move_window {} {workspace}", key.address));
+            for w in self.windows.borrow_mut().iter_mut().filter(|w| w.address == key.address) {
+                (w.workspace_id, w.workspace) = (workspace, workspace.to_string());
+            }
+            Ok(())
+        })
+    }
     fn elements<'a>(&'a self, _: &'a WinKey, _: Option<&'a str>, _: u32, _: Option<u32>) -> LocalFuture<'a, crate::error::Result<ElementPage>> {
         Box::pin(async move { Ok(self.page.borrow().clone()) })
     }
@@ -1417,6 +1441,48 @@ fn operator_calls_bound_to_another_epoch_generation_or_endpoint_are_denied() {
         let ok = c.operator_call("vesper", operator_action(c, "status")).await.unwrap();
         assert_eq!(ok["controller_epoch"], json!(c.epoch()));
         assert_eq!(ok["owner"], "none");
+    });
+}
+
+/// Failure cases: a person closes or moves the window the agent at work
+/// opened, from under it, or is not told whose it is; a refusal for the
+/// agent's window also stops a person closing their own while it works.
+#[test]
+fn a_person_cannot_close_or_move_the_window_of_the_agent_at_work() {
+    run(async {
+        let rig = rig(false);
+        let c = &rig.controller;
+        let task = begin(c).await;
+        c.journal.own_window(&task, "0x1", 100, "mousepad", "Untitled 1 - Mousepad").unwrap();
+        rig.desktop.windows.borrow_mut().push(win("0x3", 300, "foot", "a person's shell", false, false));
+        let listed = c.operator_call("vesper", operator_action(c, "windows")).await.unwrap();
+        let windows: Vec<&Value> = listed["workspaces"].as_array().unwrap().iter().flat_map(|w| w["windows"].as_array().unwrap()).collect();
+        let task_of = |address: &str| windows.iter().find(|w| w["address"] == address).map(|w| w["task"].clone());
+        assert_eq!(task_of("0x1"), Some(json!({ "task_ref": task, "goal": "Save a note in the editor", "running": true })), "{listed}");
+        assert_eq!(task_of("0x3"), Some(Value::Null), "{listed}");
+        assert_eq!(listed["agent"], json!({ "task_ref": task, "goal": "Save a note in the editor" }), "{listed}");
+
+        let before = rig.desktop.acts();
+        let mut close = operator_action(c, "window_close");
+        close["address"] = json!("0x1");
+        close["pid"] = json!(100);
+        let mut moving = close.clone();
+        moving["op"] = json!("window_move");
+        moving["workspace"] = json!(2);
+        for action in [close.clone(), moving] {
+            let err = c.operator_call("vesper", action.clone()).await.unwrap_err();
+            assert_eq!(err.code, "BUSY", "{action}: {err:?}");
+            assert_eq!(err.details.get("reason"), Some(&json!("agent_window")), "{err:?}");
+            assert_eq!(err.details.get("task_ref"), Some(&json!(task)), "{err:?}");
+        }
+        assert_eq!(rig.desktop.acts(), before, "nothing reaches the desktop");
+        assert!(rig.desktop.windows.borrow().iter().any(|w| w.address == "0x1"));
+
+        close["address"] = json!("0x3");
+        close["pid"] = json!(300);
+        let closed = c.operator_call("vesper", close).await.unwrap();
+        assert_eq!(closed["closed"], true, "{closed}");
+        assert!(rig.desktop.windows.borrow().iter().all(|w| w.address != "0x3"));
     });
 }
 

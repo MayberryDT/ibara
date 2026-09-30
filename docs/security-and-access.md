@@ -37,9 +37,9 @@ Every paired computer and every agent has 5 permissions on each computer:
 
 | Permission | Lets them |
 |---|---|
-| Watch | See the screen, the agent tasks and the history |
+| Watch | See the screen, the agent tasks, the history and the open windows |
 | Files | Send and collect files |
-| Take Control | Use the keyboard and mouse through the viewer |
+| Take Control | Use the keyboard and mouse through the viewer; close windows or move them to another workspace from the console, except a window the agent at work opened |
 | Agent Tasks | Let their agents work on this computer |
 | Administer | Change access, answer approvals, restart, shut down, sleep, and update Omarchy or ibara |
 

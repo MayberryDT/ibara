@@ -21,6 +21,8 @@ The first public release.
 - Wake, restart, shut down, sleep and lock computers, and apply your Omarchy theme to every computer at once.
 - While you were away shows one line of news per computer when you open the console.
 - Starting without the disk password is available on encrypted Omarchy computers, off unless you turn it on.
+- A computer agents use never locks them out by itself: ibara turns on Omarchy's Stay Awake when it starts, after setup and after each update, so the screensaver and idle lock no longer start. It stays on after an agent finishes. If you turn it off in Omarchy, ibara turns it on again the next time it starts.
+- A locked computer says Locked in the console instead of looking offline, and Take Control works on it: type your password in the viewer to unlock it. Agents still wait until it is unlocked.
 
 ### Agents
 

@@ -1,8 +1,10 @@
 //! Idle inhibition and session-lock detection.
 //!
-//! ibara keeps the screen awake while an agent works, through Omarchy's
-//! `omarchy-toggle-idle`, but only ever undoes what it did itself: ownership
-//! is recorded in `idle-owned.json`, so a person's own stay-awake survives.
+//! ibara keeps a computer that takes agent work awake for good, through
+//! Omarchy's `omarchy-toggle-idle` ([`Idle::keep_awake`] at start), so the
+//! screensaver and idle lock never shut agents out. Stay-awake it turns on
+//! for a single agent lease is recorded in `idle-owned.json` and undone at the
+//! lease's end; stay-awake it did not turn on for a lease is never undone.
 
 use super::hyprland::Monitor;
 use super::run::{Cmd, run};
@@ -67,6 +69,15 @@ pub fn require_unlocked(monitors: Result<Vec<Monitor>>) -> Result<()> {
     }
 }
 
+/// A person's Take Control: unlocked, or locked (they unlock it through the
+/// viewer); only an unreadable lock state refuses.
+pub fn require_known(monitors: Result<Vec<Monitor>>) -> Result<()> {
+    match require_unlocked(monitors) {
+        Err(e) if e.code == "HUMAN_CONTROL" => Ok(()),
+        other => other,
+    }
+}
+
 /// `omarchy-toggle-idle status`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -106,6 +117,17 @@ impl Idle {
         let raw = self.call("status").await?;
         serde_json::from_slice(&raw)
             .map_err(|_| IbaraError::new("CAPABILITY_UNAVAILABLE", "Idle inhibitor status was not JSON.", true))
+    }
+
+    /// Turn stay-awake on for good unless it already is, owned by nobody, so
+    /// no lease's end turns it off. Whether it turned it on now.
+    pub async fn keep_awake(&self) -> Result<bool> {
+        let turn_on = !self.status().await?.enabled;
+        if turn_on {
+            self.call("stay-awake").await?;
+        }
+        self.write_owned(false).await?;
+        Ok(turn_on)
     }
 
     /// Begin (`true`): turn stay-awake on unless it already is, and record

@@ -843,7 +843,8 @@ impl Controller {
                 if !self.desktop.session_available() {
                     return Err(fail("CAPABILITY_UNAVAILABLE", "Desktop session unavailable.", true));
                 }
-                self.desktop.session_ready().await?;
+                // A locked screen is fine: the person unlocks it through the viewer.
+                self.desktop.control_ready().await?;
                 authorize()?;
                 transition_started = true;
                 // Agents settle while the stream is fenced; both must finish.

@@ -59,7 +59,7 @@ The agent is told why. The common reasons are:
 - a person is using the mouse or keyboard: the agent's input waits until the mouse is still, then is refused if the person carries on
 - the window lost the keyboard focus, or a different window came to the front
 - a menu or dialog holds the keyboard: the agent should act on its items, or close the menu with Escape
-- the computer is locked: a person has to unlock it
+- the computer is locked: a person has to unlock it, at the computer or through Take Control, which works on a locked screen. ibara turns on Omarchy's Stay Awake on every computer it runs on, so the screensaver and idle lock do not start by themselves; a computer locks only when someone locks it
 
 A computer with no mouse plugged in is not a reason: agents click and type there too, in apps and in web pages.
 

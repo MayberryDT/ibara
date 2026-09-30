@@ -433,6 +433,13 @@ impl Controller {
         if let Err(e) = self.desktop.reset_input().await {
             log_event("reset_input_failed", &e.to_string());
         }
+        // This computer takes agent work: its screensaver and idle lock must
+        // never shut agents (or a person taking control) out.
+        match self.desktop.keep_awake().await {
+            Ok(true) => log_event("stay_awake_on", "Turned on Omarchy's Stay Awake so this computer never locks agents out."),
+            Ok(false) => {}
+            Err(e) => log_event("stay_awake_failed", &e.to_string()),
+        }
         self.system_pause().await?;
         if self.stream.is_some() {
             if let Err(e) = self.initialize_viewer().await {

@@ -128,6 +128,14 @@ impl DesktopPort for LiveDesktop {
         Box::pin(self.desktop.session_ready())
     }
 
+    fn control_ready(&self) -> LocalFuture<'_, Result<()>> {
+        Box::pin(self.desktop.control_ready())
+    }
+
+    fn locked(&self) -> LocalFuture<'_, bool> {
+        Box::pin(self.desktop.locked())
+    }
+
     fn windows(&self) -> LocalFuture<'_, Result<Vec<Win>>> {
         Box::pin(async move {
             let (windows, active) = tokio::join!(self.desktop.windows(), self.desktop.focused());
@@ -311,6 +319,15 @@ impl DesktopPort for LiveDesktop {
                 return Ok(());
             }
             self.desktop.set_idle_inhibited(on).await
+        })
+    }
+
+    fn keep_awake(&self) -> LocalFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            if !session_env() {
+                return Ok(false);
+            }
+            self.desktop.keep_awake().await
         })
     }
 

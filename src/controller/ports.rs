@@ -149,6 +149,15 @@ pub trait DesktopPort {
     fn session_available(&self) -> bool;
     /// The session is unlocked and Hyprland answers.
     fn session_ready(&self) -> LocalFuture<'_, Result<()>>;
+    /// A person may take control: as [`Self::session_ready`], but a locked
+    /// screen is fine (they unlock it through the viewer).
+    fn control_ready(&self) -> LocalFuture<'_, Result<()>> {
+        self.session_ready()
+    }
+    /// The screen is locked; false when unlocked or unreadable.
+    fn locked(&self) -> LocalFuture<'_, bool> {
+        Box::pin(async { false })
+    }
     fn windows(&self) -> LocalFuture<'_, Result<Vec<Win>>>;
     fn elements<'a>(&'a self, surface: &'a WinKey, query: Option<&'a str>, limit: u32, cursor: Option<u32>) -> LocalFuture<'a, Result<ElementPage>>;
     fn act<'a>(&'a self, effect: &'a Effect, cancel: &'a Cancel) -> LocalFuture<'a, Result<Done>>;
@@ -191,6 +200,11 @@ pub trait DesktopPort {
     fn release_input(&self) -> LocalFuture<'_, Result<()>>;
     fn reset_input(&self) -> LocalFuture<'_, Result<()>>;
     fn set_idle_inhibited(&self, on: bool) -> LocalFuture<'_, Result<()>>;
+    /// Keep this computer awake for good (it takes agent work); whether
+    /// stay-awake was turned on now.
+    fn keep_awake(&self) -> LocalFuture<'_, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
     /// Whether a window shows a password field (replay keeps no picture of it).
     fn has_password_field<'a>(&'a self, _key: &'a WinKey) -> LocalFuture<'a, Result<bool>> {
         Box::pin(async { Ok(false) })

@@ -121,5 +121,9 @@ package() {
       [[ $file == */* ]] && continue
       install -Dm644 "$_plugin/$file" "$plugin/$file"
     done
+  [[ -f $plugin/manifest.json && -f $plugin/Console.qml ]] || {
+    echo "No console plugin was packaged: IBARA_PLUGIN_DIR must be a git checkout of omarchy-ibara." >&2
+    return 1
+  }
   install -Dm644 "$_plugin/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/omarchy-plugin-LICENSE"
 }

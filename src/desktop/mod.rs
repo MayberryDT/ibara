@@ -444,6 +444,21 @@ impl Desktop {
         idle::require_unlocked(self.hypr.monitors().await)
     }
 
+    /// A person's Take Control: like [`Self::session_ready`], but a locked
+    /// screen is fine, since they unlock it through the viewer.
+    pub async fn control_ready(&self) -> Result<()> {
+        if !graphical_env() {
+            return Err(IbaraError::new("SESSION_UNAVAILABLE", "No graphical session is available.", true));
+        }
+        idle::require_known(self.hypr.monitors().await)
+    }
+
+    /// The screen is locked (Hyprland's session lock); false when unlocked
+    /// or unreadable.
+    pub async fn locked(&self) -> bool {
+        graphical_env() && self.hypr.monitors_quick().await.is_ok_and(|m| idle::lock_state(&m) == idle::LockState::Locked)
+    }
+
     /// `Some("memory tight · close tabs")` when this computer is short of memory.
     pub fn memory_pressure(&self) -> Option<String> {
         let pressure = std::fs::read_to_string("/proc/pressure/memory").ok();
@@ -907,6 +922,11 @@ impl Desktop {
     /// Keep the screen awake while an agent works (§12.1).
     pub async fn set_idle_inhibited(&self, active: bool) -> Result<()> {
         self.idle.set_inhibited(active).await
+    }
+
+    /// Keep this computer awake for good; whether stay-awake was turned on now.
+    pub async fn keep_awake(&self) -> Result<bool> {
+        self.idle.keep_awake().await
     }
 
     /// The headless fallback change (§12.3) the outputs need: remove

@@ -313,7 +313,7 @@ impl Controller {
         });
         if (grant.observe || asks) && self.desktop.session_available() {
             let listed = async {
-                self.desktop.session_ready().await?;
+                self.desktop.control_ready().await?;
                 self.desktop.outputs().await
             }
             .await;
@@ -406,6 +406,8 @@ impl Controller {
         out.insert("holds_control".into(), json!(holds));
         out.insert("video".into(), json!(self.desktop.video_capability()));
         out.insert("repair".into(), self.repair_status());
+        // A locked screen: a person unlocks it through Take Control; agents wait.
+        out.insert("locked".into(), json!(self.desktop.locked().await));
         let control = self.journal.get_control()?;
         out.insert("paused".into(), json!(control.paused));
         out.insert("pause_origin".into(), json!(control.pause_origin.map(|o| o.as_str())));

@@ -2,3 +2,6 @@
 # which name the desktop account.
 d /var/lib/ibara-agent 0750 ibara-agent ibara-agent -
 d /var/lib/ibara-operator 0755 root root -
+# The desktop account's sudo without a password exists only while a remote
+# Omarchy update runs (ibara-omarchy-update.service), never after a boot.
+r /etc/sudoers.d/zz-ibara-omarchy-update

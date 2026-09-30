@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | update-latest | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
+const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | update-latest | omarchy-update | omarchy-update-end | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
 
 /// System units the package ships; setup enables them for the desktop user.
 const SYSTEM_UNITS: [&str; 3] = ["ibara-agent-sshd.service", "ibara-access.socket", "ibara-power.socket"];
@@ -58,6 +58,8 @@ pub fn main(args: &[String]) -> Result<(), String> {
         }
         ["update", user, pairs @ ..] if !pairs.is_empty() => super::update::system_update(&Account::desktop(user)?, pairs),
         ["update-latest"] => super::update::system_update_latest(),
+        ["omarchy-update"] => super::omarchy_update::system_omarchy_update(),
+        ["omarchy-update-end"] => super::omarchy_update::system_omarchy_update_end(),
         ["rollback", user] => super::update::system_rollback(&Account::desktop(user)?),
         ["unattended-boot", rest @ ..] => super::unattended_boot::system(&rest.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
         _ => Err(USAGE.into()),
@@ -84,6 +86,7 @@ pub fn setup(desktop: &Account) -> Result<(), String> {
 /// daemon is turned on; the pacman hook leaves it as the person left it.
 fn set_up(desktop: &Account, by_person: bool) -> Result<(), String> {
     println!("Setting up this computer for {} (as root):", desktop.name);
+    super::omarchy_update::clear_leftover_sudoers();
     step("Checking this computer", || preconditions(desktop))?;
     step("Accounts", accounts)?;
     step("Folders", || folders(desktop))?;
@@ -565,6 +568,7 @@ fn uninstall(desktop: &Account, delete_data: bool) -> Result<(), String> {
         for file in ["/etc/tmpfiles.d/agent-computer.conf", "/etc/tmpfiles.d/ibara-operator-peer.conf"] {
             let _ = std::fs::remove_file(file);
         }
+        super::omarchy_update::clear_leftover_sudoers();
         run("systemctl", &["daemon-reload"]).map(|_| ())
     })?;
     step("Accounts of paired computers", || {
@@ -608,7 +612,7 @@ fn uninstall(desktop: &Account, delete_data: bool) -> Result<(), String> {
     })?;
     if delete_data {
         step("Keys, identity and history kept by root", || {
-            for path in [CONFIG_DIR, OPERATOR_PUBLIC, "/var/lib/ibara-operator", "/var/lib/ibara-agent", INSTALL_ROOT, "/var/cache/ibara", BACKUPS] {
+            for path in [CONFIG_DIR, OPERATOR_PUBLIC, "/var/lib/ibara-operator", "/var/lib/ibara-agent", "/var/lib/ibara", INSTALL_ROOT, "/var/cache/ibara", BACKUPS] {
                 if std::fs::symlink_metadata(path).is_ok() {
                     std::fs::remove_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
                 }

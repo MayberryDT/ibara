@@ -22,6 +22,7 @@
 //! shell, browser native hosts) keeps working and a computer that ran a
 //! release tree keeps its `previous` release for going back.
 
+pub mod omarchy_update;
 pub mod system;
 pub mod unattended_boot;
 pub mod update;
@@ -140,7 +141,7 @@ pub fn unattended_boot_main(args: Vec<OsString>) -> ExitCode {
     finish(unattended_boot::main(&strings(args)))
 }
 
-/// `ibara system setup|refresh|uninstall|update|update-latest|rollback|unattended-boot …` (root).
+/// `ibara system setup|refresh|uninstall|update|update-latest|omarchy-update|omarchy-update-end|rollback|unattended-boot …` (root).
 pub fn system_main(args: Vec<OsString>) -> ExitCode {
     finish(system::main(&strings(args)))
 }

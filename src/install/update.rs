@@ -266,7 +266,9 @@ pub fn system_update_latest() -> Result<(), String> {
         let pairs = download(&channel, &release, &dir)?;
         let plugin_before = super::user::plugin_digest();
         system_update(&desktop, &pairs.iter().map(String::as_str).collect::<Vec<_>>())?;
-        as_desktop(&desktop, || after_install(&release, &installed, plugin_before))?;
+        if !as_desktop(&desktop, || after_install(&release, &installed, plugin_before)) {
+            return Err(format!("ibara is installed, but restarting its services as {} did not finish (see above).", desktop.name));
+        }
         println!("ibara {} is installed. To go back to {installed}: ibara rollback", release.version);
         Ok(())
     })();
@@ -278,15 +280,20 @@ pub fn system_update_latest() -> Result<(), String> {
 /// that becomes the account and takes the environment of its systemd user
 /// manager, which Omarchy's session exports to (so `ibara update` run over SSH
 /// and this reach the same shell). A child rather than the installed `ibara`,
-/// which is already the new release's and may not know this step.
-fn as_desktop(desktop: &Account, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+/// which is already the new release's and may not know this step. False when
+/// the child could not start or `work` failed; what went wrong is printed.
+pub(super) fn as_desktop(desktop: &Account, work: impl FnOnce() -> Result<(), String>) -> bool {
     use std::io::Write;
-    let name = std::ffi::CString::new(desktop.name.as_str()).map_err(|_| "The account name is not valid.".to_string())?;
+    let Ok(name) = std::ffi::CString::new(desktop.name.as_str()) else {
+        eprintln!("The account name is not valid.");
+        return false;
+    };
     let _ = std::io::stdout().flush();
     // SAFETY: the root update starts no threads, so the child may run any code.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(format!("Could not start the part that runs as {}.", desktop.name));
+        eprintln!("Could not start the part that runs as {}.", desktop.name);
+        return false;
     }
     if pid == 0 {
         let code = match become_account(desktop, &name).and_then(|()| work()) {
@@ -303,11 +310,7 @@ fn as_desktop(desktop: &Account, work: impl FnOnce() -> Result<(), String>) -> R
     let mut status = 0;
     // SAFETY: `pid` is this process's own child.
     let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-        Ok(())
-    } else {
-        Err(format!("ibara is installed, but restarting its services as {} did not finish (see above).", desktop.name))
-    }
+    waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 /// In the forked child: become `desktop` and take its session's environment.
@@ -332,7 +335,7 @@ fn become_account(desktop: &Account, name: &std::ffi::CStr) -> Result<(), String
         unsafe { std::env::set_var(key, value) };
     }
     let session = output(Command::new("systemctl").args(["--user", "show-environment"]))
-        .map_err(|e| format!("{}'s desktop session is not running, so ibara's services were not restarted: {e}", desktop.name))?;
+        .map_err(|e| format!("{}'s desktop session is not running: {e}", desktop.name))?;
     for (key, value) in session.lines().filter_map(|line| line.split_once('=')) {
         // Values systemd had to quote (`$'…'`) are not ones ibara needs.
         if !value.starts_with("$'") && !own.iter().any(|(k, _)| *k == key) {
@@ -357,7 +360,7 @@ fn busy() -> Option<String> {
     Some(lease["client_name"].as_str().or(lease["principal"].as_str()).unwrap_or("An agent").to_string())
 }
 
-fn refuse_while_busy() -> Result<(), String> {
+pub(super) fn refuse_while_busy() -> Result<(), String> {
     match busy() {
         Some(who) => Err(format!("{who} is working on this computer right now. Try again once it has finished.")),
         None => Ok(()),

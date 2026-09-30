@@ -19,7 +19,7 @@
 //!    hand edit is not picked up without a restart, or a console edit loses
 //!    the person's comments; a setting has no effect (name, wake on network).
 //! 5. Sleep does not turn on wake-up (on the adapter's own phy) first, or
-//!    turns it on when the setting is off; restart, shut down, lock or update
+//!    turns it on when the setting is off; restart, shut down or lock
 //!    do not reach their program; restart does not warn about the disk password.
 //! 6. A theme the other computer lacks is not sent, arrives changed, or Omarchy
 //!    is not asked to apply it; applying the theme it already has runs again.
@@ -120,7 +120,7 @@ fn machine(world: &World, name: &str) {
     let theme_set = "mkdir -p \"$HOME/.local/state/omarchy/current\" && printf '%s\\n' \"$1\" > \"$HOME/.local/state/omarchy/current/theme.name\"\n\
          echo \"OMARCHY_PATH=$OMARCHY_PATH\" >> \"$(dirname \"$0\")/../log\"";
     write_executable(&bin.join("omarchy-theme-set"), &logging("omarchy-theme-set", theme_set));
-    for program in ["omarchy-system-lock", "omarchy-launch-floating-terminal-with-presentation", "omarchy-update", "systemctl", "loginctl"] {
+    for program in ["omarchy-system-lock", "systemctl", "loginctl"] {
         write_executable(&bin.join(program), &logging(program, ""));
     }
 }
@@ -309,13 +309,8 @@ fn a_computer_is_looked_after_from_another_over_the_pairing_route() {
     ok_on(&mut vesper, &id, &e, "operator-power", &["--action", "shutdown"]);
     assert_eq!(power_log_at(&power, 5)[3..], ["systemctl reboot", "systemctl poweroff"]);
     ok_on(&mut vesper, &id, &e, "operator-power", &["--action", "lock"]);
-    let updated = ok_on(&mut vesper, &id, &e, "operator-power", &["--action", "update"]);
-    assert!(updated["message"].as_str().unwrap().contains("password"), "{updated}");
-    std::thread::sleep(Duration::from_millis(300));
     let log = machine_log(&world, "tulip1");
     assert!(log.iter().any(|l| l == "omarchy-system-lock "), "{log:?}");
-    let update = world.machine_bin("tulip1").join("omarchy-update");
-    assert!(log.contains(&format!("omarchy-launch-floating-terminal-with-presentation {}", update.display())), "{log:?}");
     let reset = ok_on(&mut vesper, &id, &e, "operator-settings", &["reset", "--section", "display"]);
     assert_eq!(setting(&reset, "virtual_display_size")["value"], "1920x1080");
     assert!(!fs::read_to_string(&file).unwrap().contains("[display]"));

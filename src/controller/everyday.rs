@@ -11,7 +11,7 @@
 //! `/run/ibara-power/power.sock`, or `IBARA_POWER_SOCKET`).
 
 use super::{Controller, log_event};
-use crate::desktop::run::{Cmd, run, spawn_detached};
+use crate::desktop::run::{Cmd, run};
 use crate::error::{IbaraError, Result, invalid, unavailable};
 use crate::settings::{self, Scope};
 use crate::{theme, wake};
@@ -325,26 +325,15 @@ impl Controller {
                 self.lock_screen().await?;
                 Ok(json!({"action": "lock", "state": "started"}))
             }
-            "update" => {
-                let (Some(launcher), Some(update)) =
-                    (omarchy_program("omarchy-launch-floating-terminal-with-presentation"), omarchy_program("omarchy-update"))
-                else {
-                    return Err(unavailable("Omarchy's updater is not on this computer."));
-                };
-                spawn_detached(omarchy_cmd(&launcher).arg(update)).await?;
-                Ok(json!({
-                    "action": "update", "state": "started",
-                    "message": "The update runs in a window on this computer and asks for its password there.",
-                }))
-            }
-            "update_ibara" => {
-                let reply = power_helper(json!({"op": "update_ibara"})).await?;
+            "update_ibara" | "update_omarchy" => {
+                let reply = power_helper(json!({"op": action})).await?;
                 if reply["state"] == "started" {
-                    log_event("power", "ibara update at a person's request");
+                    let what = if action == "update_ibara" { "ibara" } else { "Omarchy" };
+                    log_event("power", &format!("{what} update at a person's request"));
                 }
-                Ok(json!({"action": "update_ibara", "state": reply["state"], "message": reply["message"]}))
+                Ok(json!({"action": action, "state": reply["state"], "message": reply["message"]}))
             }
-            _ => Err(invalid("Choose restart, shutdown, sleep, lock, update or update_ibara.")),
+            _ => Err(invalid("Choose restart, shutdown, sleep, lock, update_ibara or update_omarchy.")),
         }
     }
 

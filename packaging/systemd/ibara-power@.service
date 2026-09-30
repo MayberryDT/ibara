@@ -8,9 +8,10 @@ CollectMode=inactive-or-failed
 Type=exec
 User=root
 Group=root
-# One JSON request per connection: disk, restart, shutdown, sleep or
-# update_ibara. The reply is sent before systemctl runs; an ibara update runs
-# as its own unit (ibara-update.service), started before the reply.
+# One JSON request per connection: disk, restart, shutdown, sleep,
+# update_ibara or update_omarchy. The reply is sent before systemctl runs; an
+# update runs as its own unit (ibara-update.service or
+# ibara-omarchy-update.service), started before the reply.
 ExecStart=/usr/bin/ibara power-system
 StandardInput=socket
 StandardOutput=socket

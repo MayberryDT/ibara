@@ -1,16 +1,19 @@
 //! `ibara power-system`: the root helper that lets the desktop user's `ibarad`
-//! restart, shut down or sleep this computer, update ibara on it, and report
-//! whether it will come back without a person typing a disk passphrase.
+//! restart, shut down or sleep this computer, update ibara or Omarchy on it,
+//! and report whether it will come back without a person typing a disk
+//! passphrase.
 //!
 //! systemd runs it per connection (`ibara-power.socket`, `Accept=yes`, a socket
 //! only the desktop user can open): stdin and stdout are that connection. It
 //! reads one JSON line, writes one JSON line and exits. Power commands run only
 //! after the reply is flushed, because the computer may be gone before they
-//! return. An ibara update starts first, as a unit of its own
-//! (`ibara-update.service`, `ibara system update-latest`), because the update
-//! restarts this socket; the reply says whether it started. Requests name an
-//! operation and at most a network adapter; programs and paths come from the
-//! unit's environment, never from the request, and nothing runs through a shell.
+//! return. An update starts first, as a unit of its own (`ibara-update.service`
+//! running `ibara system update-latest`, or `ibara-omarchy-update.service`
+//! running `ibara system omarchy-update`), because it outlives this helper and
+//! an ibara update restarts its socket; the reply says whether it started. One
+//! update of either kind at a time. Requests name an operation and at most a
+//! network adapter; programs and paths come from the unit's environment, never
+//! from the request, and nothing runs through a shell.
 use crate::wake::{ETHTOOL_GWOL, ETHTOOL_SWOL, WAKE_MAGIC, WolInfo, ethtool_wol};
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
@@ -54,8 +57,43 @@ enum Op {
     Restart,
     Shutdown,
     Sleep(Option<String>),
-    UpdateIbara,
+    Update(&'static Job),
 }
+
+/// An update that runs as its own unit.
+struct Job {
+    action: &'static str,
+    /// How the reply names what is updating.
+    name: &'static str,
+    unit: &'static str,
+    command: &'static str,
+    description: &'static str,
+    /// Units that run after the command ends or is stopped (`ExecStopPost=`).
+    stop_post: Option<&'static str>,
+    started: &'static str,
+}
+
+const IBARA_UPDATE: Job = Job {
+    action: "update_ibara",
+    name: "ibara",
+    unit: crate::install::update::UPDATE_UNIT,
+    command: "update-latest",
+    description: "ibara update, asked for from another computer",
+    stop_post: None,
+    started: "ibara is updating to the latest release. It may restart its bar when it finishes.",
+};
+
+const OMARCHY_UPDATE: Job = Job {
+    action: "update_omarchy",
+    name: "Omarchy",
+    unit: crate::install::omarchy_update::UNIT,
+    command: "omarchy-update",
+    description: "Omarchy update, asked for from another computer",
+    stop_post: Some("omarchy-update-end"),
+    started: "Omarchy is updating. The computer stays usable; it says when a restart is needed.",
+};
+
+const JOBS: [&Job; 2] = [&IBARA_UPDATE, &OMARCHY_UPDATE];
 
 enum Wake {
     Enabled,
@@ -92,12 +130,13 @@ fn parse(line: &str) -> Result<Op, String> {
     let object = value.as_object().ok_or("The request must be a JSON object.")?;
     let op = object.get("op").and_then(Value::as_str).ok_or("The request needs an \"op\".")?;
     match op {
-        "disk" | "restart" | "shutdown" | "update_ibara" => {
+        "disk" | "restart" | "shutdown" | "update_ibara" | "update_omarchy" => {
             only_keys(object, &["op"])?;
             Ok(match op {
                 "disk" => Op::Disk,
                 "restart" => Op::Restart,
-                "update_ibara" => Op::UpdateIbara,
+                "update_ibara" => Op::Update(&IBARA_UPDATE),
+                "update_omarchy" => Op::Update(&OMARCHY_UPDATE),
                 _ => Op::Shutdown,
             })
         }
@@ -113,7 +152,9 @@ fn parse(line: &str) -> Result<Op, String> {
                 Some(_) => Err("\"wake\" must be null or an object with an \"ifname\".".into()),
             }
         }
-        other => Err(format!("\"{other}\" is not something this computer can do. Use disk, restart, shutdown, sleep or update_ibara.")),
+        other => Err(format!(
+            "\"{other}\" is not something this computer can do. Use disk, restart, shutdown, sleep, update_ibara or update_omarchy."
+        )),
     }
 }
 
@@ -147,48 +188,55 @@ fn handle(roots: &Roots, op: Op) -> (Value, Option<&'static str>) {
             };
             (reply, Some("suspend"))
         }
-        Op::UpdateIbara => (update_ibara(roots), None),
+        Op::Update(job) => (update(roots, job), None),
     }
 }
 
-/// Whether an ibara update's unit is running.
-fn updating(roots: &Roots) -> bool {
-    let unit = crate::install::update::UPDATE_UNIT;
+/// Whether a unit is running.
+fn active(roots: &Roots, unit: &str) -> bool {
     let Ok(out) = roots.program("systemctl").args(["show", "--property=ActiveState", "--value", unit]).output() else { return false };
     out.status.success() && matches!(String::from_utf8_lossy(&out.stdout).trim(), "active" | "activating" | "deactivating" | "reloading")
 }
 
-/// Start the newest signed release installing, apart from this helper, whose
-/// socket the update restarts; one update at a time.
-fn update_ibara(roots: &Roots) -> Value {
-    let running = || {
-        json!({"ok": true, "action": "update_ibara", "state": "running", "message": "ibara is already updating on this computer."})
+/// The reply when an update of either kind is already running, else `None`.
+fn running(roots: &Roots, job: &Job) -> Option<Value> {
+    let busy = JOBS.into_iter().find(|other| active(roots, other.unit))?;
+    let message = if busy.unit == job.unit {
+        format!("{} is already updating on this computer.", job.name)
+    } else {
+        format!("{} is updating on this computer. Update {} once it has finished.", busy.name, job.name)
     };
-    if updating(roots) {
-        return running();
+    Some(json!({"ok": true, "action": job.action, "state": "running", "message": message}))
+}
+
+/// Start an update apart from this helper, which it outlives; one update at a time.
+fn update(roots: &Roots, job: &Job) -> Value {
+    if let Some(reply) = running(roots, job) {
+        return reply;
     }
-    let started = roots
-        .program("systemd-run")
-        .args(["--quiet", "--collect", "--property=Type=exec", "--unit", crate::install::update::UPDATE_UNIT])
-        .args(["--description", "ibara update, asked for from another computer", "--"])
-        .arg(Path::new(crate::install::LIB).join("bin/ibara"))
-        .args(["system", "update-latest"])
-        .stdout(Stdio::null())
-        .output();
-    match started {
-        Ok(out) if out.status.success() => json!({
-            "ok": true, "action": "update_ibara", "state": "started",
-            "message": "ibara is updating to the latest release. It may restart its bar when it finishes.",
-        }),
-        // Another request started one a moment ago.
-        _ if updating(roots) => running(),
+    let ibara = Path::new(crate::install::LIB).join("bin/ibara");
+    let mut command = roots.program("systemd-run");
+    command.args(["--quiet", "--collect", "--property=Type=exec", "--unit", job.unit]);
+    if let Some(end) = job.stop_post {
+        command.arg(format!("--property=ExecStopPost=+{} system {end}", ibara.display()));
+    }
+    command.args(["--description", job.description, "--"]).arg(&ibara).args(["system", job.command]).stdout(Stdio::null());
+    let started = command.output();
+    if matches!(&started, Ok(out) if out.status.success()) {
+        return json!({"ok": true, "action": job.action, "state": "started", "message": job.started});
+    }
+    // Another request started one a moment ago.
+    if let Some(reply) = running(roots, job) {
+        return reply;
+    }
+    let detail = match started {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let detail = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given");
-            json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": format!("The update did not start: {detail}")}})
+            stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given").to_string()
         }
-        Err(_) => json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": "The update did not start: systemd-run could not run."}}),
-    }
+        Err(_) => "systemd-run could not run.".into(),
+    };
+    json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": format!("The update did not start: {detail}")}})
 }
 
 pub fn main(args: Vec<OsString>) -> i32 {
@@ -197,6 +245,8 @@ pub fn main(args: Vec<OsString>) -> i32 {
         return 64;
     }
     let roots = Roots::from_env();
+    // A run that crashed must not leave the desktop account's sudo open.
+    crate::install::omarchy_update::clear_leftover_sudoers();
     let (reply, verb) = match read_request().and_then(|line| parse(&line)) {
         Ok(op) => handle(&roots, op),
         Err(message) => (refusal(message), None),

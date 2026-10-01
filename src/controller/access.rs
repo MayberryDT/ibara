@@ -506,6 +506,9 @@ impl Controller {
     /// stays open, where the agent's computer's own rule asks first.
     pub(crate) async fn answer_approval(&self, att_ref: &str, answer: &str, actor: &str) -> Result<(AttentionItem, Option<Value>)> {
         let item = self.journal.get_attention(att_ref)?.ok_or_else(|| invalid("Unknown attention item."))?;
+        if item.kind == "login" {
+            return Err(invalid("Answer this on the computer your logins come from."));
+        }
         let approval = item.kind == "approval";
         let stop_asking = approval && item.details.pointer("/request/op").and_then(Value::as_str) == Some("stop_asking");
         let step = item.details["effect"].as_str().and_then(|c| ASKED.into_iter().find(|k| *k == c)).filter(|_| approval && !stop_asking);

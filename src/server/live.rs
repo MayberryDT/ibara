@@ -76,7 +76,7 @@ async fn serve_target(paths: &Paths, lock: &Lock, stop: impl Future<Output = ()>
 
     let policy = Policy::load(&paths.policy)?;
     let keys = Keys::load(&paths.gateway_key, &paths.admin_hash)?;
-    let chrome = ChromeBridge::listen(&paths.chrome_socket()).await.context("listen on chrome.sock")?;
+    let chrome = ChromeBridge::listen(&paths.chrome_socket(), &["pages", "receive"]).await.context("listen on chrome.sock")?;
     let started = async {
         let config = LiveConfig {
             state_dir: paths.state_dir.clone(),

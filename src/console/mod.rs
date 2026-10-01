@@ -35,6 +35,7 @@ mod process;
 mod selected;
 pub mod video;
 mod viewer;
+mod logins;
 
 use crate::operator::directory::{OperatorDirectory, directory_path};
 use crate::operator::sessions::OperatorSessions;
@@ -65,6 +66,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// with a preview in flight, the gate later previews of it wait on. No reply or
 /// envelope is kept.
 pub struct Console {
+    /// The chosen local browser. Only internal login delivery reads values;
+    /// the console surface reports metadata and counts.
+    chrome: Mutex<Option<Arc<crate::desktop::chrome::ChromeBridge>>>,
+    login_gate: tokio::sync::Mutex<()>,
     database: PathBuf,
     sessions: OperatorSessions,
     previews: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -74,6 +79,8 @@ pub struct Console {
     pairs: pairing::Pairs,
     /// Epochs, approvals and timeline marks across computers (`fleet.rs`).
     fleet: fleet::Fleet,
+    /// What login sharing knows about each computer, and its background loop (`logins.rs`).
+    logins: logins::Logins,
     /// The viewer this console started for each computer, ended on hand back.
     viewers: Mutex<HashMap<String, u32>>,
     /// The clipboard shared with each computer this console controls, and the
@@ -86,6 +93,8 @@ pub struct Console {
 impl Console {
     pub fn new(database: PathBuf, frames: PathBuf) -> Self {
         Console {
+            chrome: Mutex::new(None),
+            login_gate: tokio::sync::Mutex::new(()),
             sessions: OperatorSessions::new(database.clone()),
             videos: video::Videos::new(frames.clone(), database.clone()),
             database,
@@ -93,6 +102,7 @@ impl Console {
             frames: frames::Frames::new(frames),
             pairs: pairing::Pairs::default(),
             fleet: fleet::Fleet::default(),
+            logins: logins::Logins::default(),
             viewers: Mutex::new(HashMap::new()),
             clipboards: Mutex::new(HashMap::new()),
         }
@@ -104,6 +114,7 @@ impl Console {
     fn forget_computer(&self, computer: &str) {
         self.sessions.forget(computer);
         self.fleet.forget(computer);
+        self.logins.forget(computer);
         self.videos.close(computer);
         clipboard::stop(self, computer);
         selected::close_viewer(self, computer);
@@ -229,7 +240,8 @@ async fn answer(console: Arc<Console>, request: Request) -> (Option<String>, Val
 /// The computer a request names (`--computer NAME`, or `wake NAME`), named any
 /// way a person or agent names one (`pick_computer`), becomes its `computer_`
 /// id here. The plugin already names computers by that id, which is taken as
-/// it is without reading the directory.
+/// it is without reading the directory. Login commands name All Computers
+/// as `all`, which is not a computer.
 fn name_computer(console: &Console, command: &str, args: &mut [String]) -> crate::error::Result<()> {
     let slot = if command == "wake" {
         let mut at = 0;
@@ -243,7 +255,8 @@ fn name_computer(console: &Console, command: &str, args: &mut [String]) -> crate
             None => return Ok(()),
         }
     };
-    let Some(name) = args.get_mut(slot).filter(|name| !name.starts_with("computer_")) else { return Ok(()) };
+    let all = command.starts_with("login-") && args.get(slot).is_some_and(|a| a == "all");
+    let Some(name) = args.get_mut(slot).filter(|name| !all && !name.starts_with("computer_")) else { return Ok(()) };
     let directory = OperatorDirectory::open(&console.database)?;
     let row = directory.resolve_computer(name);
     directory.close();
@@ -255,6 +268,10 @@ fn name_computer(console: &Console, command: &str, args: &mut [String]) -> crate
 async fn dispatch(ctx: &Ctx) -> Handled {
     let command = ctx.head.command.as_str();
     match command {
+        "login-settings" | "login-browser-status" | "login-on" | "login-not-now" | "login-off" | "login-rule" | "login-rows"
+        | "login-answer" | "login-share-with" | "login-sync" | "login-remove" | "login-probe" | "login-share" | "login-test-seed" => {
+            logins::command(ctx).await
+        }
         "directory" => selected::directory(ctx),
         "rename-computer" => selected::rename_computer(ctx),
         "remove-computer" => pairing::remove_computer(ctx),
@@ -453,6 +470,7 @@ pub async fn serve(listener: UnixListener, console: Arc<Console>) {
             },
         }
     }
+    console.logins.stop();
     console.videos.close_all().await;
     console.sessions.close_all().await;
 }
@@ -501,8 +519,18 @@ pub fn main() -> i32 {
             eprintln!("ibarad: {message}");
             return 1;
         }
+        // The sharing computer reads cookies; gated disposable test seeding also writes them.
+        let jobs: &'static [&'static str] = if std::env::var("IBARA_LOGIN_TESTS").as_deref() == Ok("1") { &["share", "receive"] } else { &["share"] };
+        let chrome = match crate::desktop::chrome::ChromeBridge::listen(&path.with_file_name("chrome.sock"), jobs).await {
+            Ok(chrome) => chrome,
+            Err(_) => { eprintln!("ibarad: could not start the local browser bridge"); return 1; }
+        };
+        let console = Arc::new(Console::new(database, frames.clone()));
+        *console.chrome.lock().unwrap_or_else(|e| e.into_inner()) = Some(chrome.clone());
+        logins::start(&console);
         eprintln!("ibarad: operator console serving {}", path.display());
-        serve(listener, Arc::new(Console::new(database, frames.clone()))).await;
+        serve(listener, console).await;
+        chrome.close().await;
         let _ = frames::reset(&frames);
         // Only the service that bound the socket removes it.
         let _ = std::fs::remove_file(&path);

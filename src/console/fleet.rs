@@ -201,7 +201,7 @@ pub(super) async fn fleet_call(console: &Console, computer: &str, op: &str, fiel
 }
 
 /// Every computer this console has added.
-fn verified(console: &Console) -> Result<Vec<ListedComputer>> {
+pub(super) fn verified(console: &Console) -> Result<Vec<ListedComputer>> {
     Ok(OperatorDirectory::open(&console.database)?.list_computers()?.into_iter().filter(|r| r.trust_state == "verified").collect())
 }
 

@@ -30,6 +30,12 @@ ibara was first written in TypeScript for Node, then ported to Rust before its f
 
 [Security and access](security-and-access.md) describes the authoritative records, exact approval boundary, generated transport and migration/recovery. `access.rs`, `controller/access.rs` and `access_system.rs` own those parts; legacy files become transport projections.
 
+## Take Control and Hand Back
+
+Take Control settles agent input, browser work and command jobs, stops charging active-control time, and keeps the task reserved for its agent. The lease gets a fresh generation to fence in-flight work and any previously answered step approval. Open approvals bound to a held step expire because the person's input can change what that step would affect. Questions, login requests and access decisions stay open and answerable. Attention waits check task access and the retained lease without requiring input authority; input replies with `HUMAN_CONTROL` and tells the agent to wait for Hand Back.
+
+Hand Back ends the viewer and resumes the same task when settled, unless the person had already paused agents. It restores charging, the agent cursor and idle inhibition. Finish during a takeover records the outcome and ends the task without taking the screen back. Revoke, finish, restart, disconnect grace, idle expiry and budget expiry still end control and expire the task's open attention.
+
 ## Contract and MCP
 
 `src/contract/` holds contract 4 ([agent tools](agent-tools.md)); `src/mcp.rs` serves it over stdio.
@@ -147,7 +153,8 @@ ibara was first written in TypeScript for Node, then ported to Rust before its f
 
 **Hazards kept for parity:**
 
-- A Chrome effect that is never acknowledged leaves the bridge unsettled until `ibarad` restarts (hazard 3).
+- A Chrome effect that is never acknowledged leaves the bridge unsettled until `ibarad` restarts (hazard 3). Cookie writes and removals are the exception: they can be repeated by name, domain, path and partition, so a failed or unanswered one is `OUTCOME_UNKNOWN` for that site and page reading goes on. They get a 12 s deadline, and the target writes a login 25 cookies at a time.
+- Right after the extension's hello the bridge names its jobs (`jobs`): `pages` and `receive` from the target daemon, `share` from the operator daemon (with `receive` too when `IBARA_LOGIN_TESTS=1`, for disposable test seeding). The worker refuses any operation outside its jobs and, without a `jobs` call, allows only `pages`; an older extension refuses `jobs`, which the bridge ignores.
 - The host reads `allowed_origins` from `<install root>/browser/native-host.json`, written by `ibara browser-setup` with this computer's extension id.
 
 ### Browser pages
@@ -400,6 +407,8 @@ Version 0 is the TypeScript schema, unchanged. Version 1 adds `file_writers(task
 
 `src/controller/` is the engine behind `ibarad`: the port of `core.ts`, `agent-native.ts`, `response-budget.ts` and `viewer-adapter.ts`. The agent path speaks contract 4 ([agent tools](agent-tools.md)); the admin and operator paths keep the TypeScript reply shapes that lifecycle and the console parse.
 
+Command receipts keep their dispatch `summary` (at most 2,000 characters) when a job ends and record its state separately in `job_state`. Operator task, receipt and operation views include `job_state` and still clip the summary to 400 characters. When a stored job state is running, these views read the current job state without an agent lookup. For older receipts that say “Job … is …”, these views recover the state from that text or the job without rewriting storage. Job records do not retain commands, so those older command summaries cannot be restored. Agent operation lookup includes the job state beside the command; execution, verification and effect semantics are unchanged.
+
 | Module | Holds |
 |---|---|
 | `mod.rs` | `Controller`, `ControllerOptions`, the effect queue, the rate limit and shared helpers |
@@ -412,7 +421,8 @@ Version 0 is the TypeScript schema, unchanged. Version 1 adds `file_writers(task
 | `situation.rs` | frames (compact lines and at most 20 ranked choices), the situation line, `since` events, windows a task opened |
 | `checks.rs` | typed checks, and expectations awaited until met or their deadline |
 | `control.rs` | leases, settlement, heartbeat and disconnect grace, pause and resume (and who paused), the viewer ownership machine |
-| `operator.rs` | `operator_call`: `session`, `status`, `task_status`, `observe`, `observe_video`, `files_*`, `take_control`, `handback`, `viewer_ticket`, `viewer_register` (authorized here, saved by the server), `clipboard_get`, `clipboard_set`, `pause`, `resume` |
+| `operator.rs` | `operator_call`: `session`, `status`, `task_status`, `observe`, `observe_video`, `files_*`, `take_control`, `handback`, `viewer_ticket`, `viewer_register` (authorized here, saved by the server), `clipboard_get`, `clipboard_set`, `pause`, `resume`, and the `login_*` operations (below) |
+| `logins.rs` | login sharing on the agent computer: the pinned sharing computer and its rules (`login_receiver` in meta), login requests and site results (`login_requests` in meta), `logins` at begin, `sign_in`, and `login_configure`, `login_pending`, `login_deliver`, `login_report`, `login_answer`, `login_remove`, `login_probe` |
 | `everyday.rs` | the everyday operator operations: logs, health, power, settings, theme, repairs, the timeline, wake packets, the task, result and procedure reads and actions, and the capability each needs |
 | `windows.rs` | a person's window management: `windows`, `window_close`, `window_move` (see Everyday commands) |
 | `access.rs` | access enforcement, its migration and its attention items on the controller |
@@ -450,6 +460,7 @@ The person taking control (the operator route's `take_control`) gets the desktop
 - `call` takes a `Cancel` that the server fires when the caller goes away. The call stops at its next safe point: before a step (later steps are `not_run`), in an expectation wait (the step is `unmet`, "the caller went away") and in `computer_wait` (`pending`). A dispatched effect always runs to completion, and the outcome is stored for replay. The server keeps polling the future rather than dropping it.
 - Repeating a `request_id` while that call is still queued or running answers `pending` at once, with `{op_ref, state: "running"}`, instead of waiting behind it. A step left `running` without a live call is reported as "the call ended during this step" within the same epoch, and "the controller restarted" after a restart.
 - `admin` gains `attention {state?, task_ref?}` and `answer_attention {att_ref, answer, answered_by?}` so the console and tests can answer (`approve`, `approved`, `yes`, `allow` or `ok` approve).
+- **Login sharing** (`logins.rs`). The `login_*` operator operations need the pinned sharing computer's operator identity and unconditional Allowed Administer, checked before the generic approval gate, so a cookie-bearing action is never persisted for review; they are never written to the journal. `login_configure` pins the source (another one only with `replace`; `check` probes without changing anything). `login_pending` is the sharing computer's heartbeat (kept in memory; older than 15 s reads as `waiting_for_sharing_computer`), runs removals that waited for the browser, and lists each open request's sites with `need` (`deliver`: Allowed here for this agent; `answer`: waiting on the person) and the site results (`worked`, `site_rejected`) once. `login_deliver` records `login_shared` or `login_refreshed` on the timeline before writing, then writes in batches of 25 through the page reader; per-cookie failures make the site `unknown`. A request's sites that need the person are one attention item of kind `login` (the attention table's kind check allows it; older journals rebuild the table once); `login_answer` settles them, and the item closes once none waits. Generic `answer_attention`, from a console or `computerctl`, refuses a `login` item. `sign_in` plans once per request (the tab's site and the site it came from, or the sites named), stores the plan on its operation, and answers from the requests each time the same request is sent until it settles: it waits up to 10 s for Allowed sites, then reloads the tab and reads whether a password field remains. Declined and rejected sites stay so for the task. `own` agents come from a computer with Allowed Administer here; others are always asked. `computer_status` adds `logins from <label> · N sites allowed` or `logins off`.
 
 ### What agents see
 
@@ -491,6 +502,7 @@ The person taking control (the operator route's `take_control`) gets the desktop
 | `video.rs` | Live Video (Preview): `video open\|close` and `ibara video`, each open stream's polling of `observe_video` over a second session per computer, and its FIFO in the previews directory |
 | `files.rs` | `operator-file-send`, `-receive` and `-resume`. `files_roots` names the target's largest file (`max_file_bytes`, its `max_artifact_bytes`); a file over it, or over this console's own 500 MB, is refused before anything is sent (`BUDGET_EXCEEDED`, "This file is 1.3 GB; ibara sends files up to 250 MB.": sizes in decimal units from the bytes, and the default limit is 250 MB, 250,000,000 bytes), and the target refuses the same way. When a sent file's final check goes unanswered, the console asks the target for the job's state every 2 seconds, for a minute and a second per MiB, and reports it verified once it is published |
 | `everyday.rs` | one computer's everyday commands over its operator route: logs, health, power, settings, approvals, repairs, tasks, results, procedures, access, windows, `operator-artifact-save`, `open-terminal` |
+| `logins.rs` | login sharing on the sharing computer: settings in `~/.local/state/ibara/login-sharing.json` (0600: rules per computer and for all, site memory, history, recent rejections, pending removals and turn-offs; never a login), the 2 s background loop in the daemon that pushes rules, asks each administered computer for requests, delivers Allowed sites fresh from the chosen browser and stores results, and the `login-*` commands the plugin calls. One login operation runs at a time. It refuses to share on a computer that also runs agents (`controller.sock` answers). The browser is read only through the operator's Chrome bridge (`$XDG_RUNTIME_DIR/ibara/chrome.sock`), after checking the selection and the sole Default profile; turning sharing on or off installs or removes the extension through the power helper when there is one |
 | `fleet.rs` | commands over every computer: `fleet-attention`, `away`, `away-seen`, `theme-fleet`, `operator-theme`, `wake`, the console's own `settings`, and `ibara away` |
 | `pairing.rs` | `tailnet`, `pair-start`, `pair-status`, `pair-cancel`, `pair-requests`, `pair-answer`, `invite-create`, `invites`, `invite-revoke`, `remove-computer` (see [Adding computers](#adding-computers)) |
 | `picker.rs` | `pick-file` and `pick-folder` |
@@ -678,3 +690,5 @@ Updates: `stable.json` (schema 2: `packages` names `ibara`, `ibara-stream` and `
 Choices come from the returned frames; no element id is written in. A floating Save As already listed when the task begins, usually left by an earlier run, stops `dogfood` before the launch. A launch that leaves a dialog in front stops the run instead of typing into it. Every run writes a JSON report (`--report FILE`, else stdout): each request's tool, milliseconds, request, response and image bytes, status and error code; totals; the outcome; and the full transcript without image data. It exits 1 when the run did not pass.
 
 The target returns freed capture/PNG allocator pages to the OS when no task holds control (glibc builds). This preserves live records and keeps memory after real use within the idle gate; measure after console/capture work as well as after startup.
+
+Login-sharing repair details (1 October 2026): answer lookups use `login_pending {att_ref}` to retain already delivered sites in an active multi-site request. `login_page` receives `after_ms` and requires a returned document timestamp and treats an older document or older worker as unknown; only visible password fields count. Browser awaits never hold a Receiver snapshot for a later whole-record write. Partial writes have a `login_delivery_incomplete` timeline result, no shared timestamp and `unknown` spread results. Failed deliveries settle as unknown; unsuccessful passes back off for 30 seconds. Partial removals remain queued. Self-pinning is refused using the paired Tailscale node identity.

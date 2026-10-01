@@ -590,7 +590,26 @@ impl Controller {
 
     /// `receiptSummary` (`core.ts:2574-2596`).
     fn receipt_summary(&self, op: &OperationRecord, detail: bool) -> Result<Value> {
-        let receipt = if op.receipt.is_object() { op.receipt.clone() } else { json!({}) };
+        let mut receipt = if op.receipt.is_object() { op.receipt.clone() } else { json!({}) };
+        if matches!(receipt.get("job_state").and_then(Value::as_str), None | Some("running"))
+            && let Some(job_ref) = receipt.get("job_ref").and_then(Value::as_str)
+        {
+            // Older receipts replaced the command with this sentence. Jobs
+            // retain state and output, but not commands, so keep that summary.
+            let old_state = receipt.get("summary").and_then(Value::as_str)
+                .and_then(|s| s.strip_prefix(&format!("Job {job_ref} is ")))
+                .and_then(|s| s.strip_suffix('.'))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let state = match old_state {
+                Some(state) => Some(state),
+                None => self.storage.get_job(job_ref, op.task_ref.as_deref(), Some(&op.principal))?
+                    .and_then(|j| j.get("state").and_then(Value::as_str).map(str::to_string)),
+            };
+            if let Some(state) = state {
+                receipt["job_state"] = json!(state);
+            }
+        }
         let audits = self.journal.read_audit(&format!("operation:{}", op.operation_ref))?;
         let last = audits.last().and_then(|a| a.get("resolution")).and_then(Value::as_str);
         let dependency = if last == Some("abandoned") {
@@ -620,6 +639,7 @@ impl Controller {
             "summary": receipt.get("summary").and_then(Value::as_str).map(|s| clip(s, 400)),
             "error": error,
             "effect_class": op.effect_class,
+            "job_state": receipt.get("job_state"),
             "reconciliations": audits,
             "dependency_state": dependency,
         });

@@ -146,6 +146,50 @@ pub struct BeginResult {
     pub frame: Frame,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Each site of the begin's `logins`, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<LoginStanding>,
+}
+
+/// A site's login standing on this computer at begin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoginStanding {
+    pub site: String,
+    /// `allowed`, `asking`, `denied`, `sharing_off`, `rejected_before` or `not_available`.
+    pub state: String,
+    /// The one request a person answers for every site asked at begin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    /// `site_rejected` when the site turned a shared login away before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+}
+
+/// One site of a `sign_in`: `shared`, or a reason code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SiteState {
+    pub site: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignIn {
+    pub sites: Vec<SiteState>,
+    /// `left_sign_in`, `still_sign_in` or `unknown`; `unknown` is never success.
+    pub page: String,
+}
+
+/// `browser_act` with `{kind: "sign_in"}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignInResult {
+    pub sign_in: SignIn,
+    /// The reloaded tab's situation, once the logins were written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Frame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

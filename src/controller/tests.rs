@@ -1357,7 +1357,7 @@ fn a_url_check_waits_for_the_browser_when_the_page_reader_is_installed() {
         assert_eq!(check["state"], "met", "{finish}");
         assert_eq!(finish["result"]["complete"], true, "{finish}");
         let status = call(&rig.controller, "computer_status", json!({})).await;
-        assert_eq!(status["result"]["computers"][0]["capabilities"], "all available", "{status}");
+        assert_eq!(status["result"]["computers"][0]["capabilities"], "all available; logins off", "{status}");
     });
 }
 
@@ -2496,24 +2496,42 @@ fn an_agent_that_lost_its_context_finds_its_last_note() {
 
 #[test]
 fn a_job_whose_reply_was_lost_reads_as_finished() {
+    // Failure cases: settlement loses the command or end state; a failed job
+    // reads as successful to an agent; looking it up dispatches it again.
     run(async {
         let rig = rig(false);
         let c = &rig.controller;
         let task = begin(c).await;
-        let ran = call(c, "computer_exec", json!({ "task_ref": task, "request_id": "exec-1", "command": ["sleep", "1"] })).await;
-        assert_eq!(ran["status"], "pending", "{ran}");
-        let op = ran["result"]["op_ref"].as_str().unwrap().to_string();
-        // The agent never hears of the job again; all it has later is the op.
-        let mut state = String::new();
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let read = call(c, "computer_status", json!({ "ref": op })).await;
-            state = read["result"]["state"].as_str().unwrap_or("").to_string();
-            if state != "running" {
-                break;
+        for (request, command, job_state, exit_code) in [
+            ("exec-1", vec!["sh", "-c", "sleep 1; echo once >> runs"], "completed", 0),
+            ("exec-2", vec!["sh", "-c", "sleep 1; echo once >> runs; exit 7"], "failed", 7),
+        ] {
+            let args = json!({ "task_ref": task, "request_id": request, "command": command, "background": true });
+            let ran = call(c, "computer_exec", args.clone()).await;
+            assert_eq!(ran["status"], "pending", "{ran}");
+            let op = ran["result"]["op_ref"].as_str().unwrap().to_string();
+            // The agent never hears of the job again; all it has later is the op.
+            let mut state = String::new();
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let read = call(c, "computer_status", json!({ "ref": op })).await;
+                state = read["result"]["state"].as_str().unwrap_or("").to_string();
+                if state != "running" {
+                    break;
+                }
             }
+            assert_eq!(state, "done");
+            let receipt = c.journal.get_operation_by_ref(&op).unwrap().unwrap().receipt;
+            assert_eq!(receipt["summary"], format!("run {}", json!(command)));
+            assert_eq!(receipt["job_state"], job_state);
+            let read = call(c, "computer_status", json!({ "ref": op })).await;
+            assert!(read["result"]["summary"].as_str().unwrap().contains(&format!("job {job_state}")), "{read}");
+            let replayed = call(c, "computer_exec", args).await;
+            assert_eq!(replayed["result"]["job"]["state"], job_state, "{replayed}");
+            assert_eq!(replayed["result"]["job"]["exit_code"], exit_code, "{replayed}");
         }
-        assert_eq!(state, "done");
+        let workspace = c.storage.workspace(&task, false).unwrap();
+        assert_eq!(std::fs::read_to_string(workspace.join("runs")).unwrap(), "once\nonce\n");
     });
 }
 

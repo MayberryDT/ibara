@@ -4,6 +4,10 @@ Each release's notes are also in its signed manifest, and the console shows them
 
 ## Unreleased
 
+- Take Control pauses the agent's task and keeps its questions answerable. Hand Back lets the same agent continue. Approvals tied to a held step expire when the person takes control.
+
+- Finished command steps keep the command in task details and record the job's state separately, including failed jobs. Task details read the current state of a running job even before the agent asks for its result.
+
 ### Your computers
 
 - A computer's page has a Windows tab that lists its workspaces and the windows on each, and says which agent task opened a window.
@@ -11,6 +15,15 @@ Each release's notes are also in its signed manifest, and the console shows them
 - A window the agent at work opened cannot be closed or moved there until its task stops.
 - Closing a terminal window asks first, since anything running in it stops. ibara recognizes a terminal by its program, so a program started in a terminal under its own name still counts.
 - Closing or moving a window needs the Take Control permission, and each close or move is written in the computer's history.
+
+### Logins
+
+- Let your agents use your logins. Turn on login sharing on the computer you use (in Chromium, Google Chrome, Brave or Brave Origin, with one profile), and an agent at a sign-in page on another of your computers asks for that site's login. You approve once in the console, and ibara copies just that site's login, fresh from your browser, into the agent computer's browser. The agent never sees it.
+- Each answer becomes a rule: Share (this computer), Share With All Computers, Don't Share (this time only) or Never Share. Allowed sites are refreshed without asking for agents from your own computers; someone else's agent is asked every time.
+- Agents can name the sites a task needs when they begin, and you get one approval for all of them. They are told why a login is waiting (you are away, your browser is closed, you are signed out there) and what to do next, and a site that turns a shared login away is remembered.
+- Share With…, Sync Logins and Remove on each computer's Logins tab, and turning sharing off reaches every computer at once. Logins already copied stay until they run out or you remove them.
+- A computer that also runs agents can't be the sharing computer yet.
+- Login sharing waits for the new browser document before checking sign-in, ignores hidden password fields, honors Share after Remove, and distinguishes incomplete writes and queued removals. The console sees the last result, extension removal result and confirmed sharing targets; replacing a sharing computer stops the old source loop.
 
 ## 0.1.0
 

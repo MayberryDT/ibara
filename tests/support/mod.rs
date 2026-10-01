@@ -84,18 +84,98 @@ pub struct Node {
 }
 
 pub const NODES: &[Node] = &[
-    Node { name: "vesper", host: "Vesper", ip: "127.0.0.3", os: "linux", user: RILEY, online: true, tags: &[] },
-    Node { name: "tulip1", host: "tulip1", ip: "127.0.0.2", os: "linux", user: RILEY, online: true, tags: &[] },
-    Node { name: "command", host: "command", ip: "127.0.0.4", os: "linux", user: DANA, online: true, tags: &[] },
-    Node { name: "lab", host: "lab", ip: "127.0.0.8", os: "linux", user: DANA, online: true, tags: &[] },
-    Node { name: "hazel", host: "hazel", ip: "127.0.0.5", os: "linux", user: RILEY, online: true, tags: &[] },
-    Node { name: "oldbox", host: "oldbox", ip: "127.0.0.6", os: "linux", user: RILEY, online: false, tags: &[] },
-    Node { name: "server", host: "server", ip: "127.0.0.7", os: "linux", user: TAGGED, online: true, tags: &["tag:server"] },
-    Node { name: "pixel-8a", host: "Pixel 8a", ip: "127.0.0.9", os: "android", user: RILEY, online: true, tags: &[] },
-    Node { name: "vesper-windows", host: "Vesper-Windows", ip: "127.0.0.10", os: "windows", user: RILEY, online: true, tags: &[] },
+    Node {
+        name: "vesper",
+        host: "Vesper",
+        ip: "127.0.0.3",
+        os: "linux",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "tulip1",
+        host: "tulip1",
+        ip: "127.0.0.2",
+        os: "linux",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "command",
+        host: "command",
+        ip: "127.0.0.4",
+        os: "linux",
+        user: DANA,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "lab",
+        host: "lab",
+        ip: "127.0.0.8",
+        os: "linux",
+        user: DANA,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "hazel",
+        host: "hazel",
+        ip: "127.0.0.5",
+        os: "linux",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "oldbox",
+        host: "oldbox",
+        ip: "127.0.0.6",
+        os: "linux",
+        user: RILEY,
+        online: false,
+        tags: &[],
+    },
+    Node {
+        name: "server",
+        host: "server",
+        ip: "127.0.0.7",
+        os: "linux",
+        user: TAGGED,
+        online: true,
+        tags: &["tag:server"],
+    },
+    Node {
+        name: "pixel-8a",
+        host: "Pixel 8a",
+        ip: "127.0.0.9",
+        os: "android",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
+    Node {
+        name: "vesper-windows",
+        host: "Vesper-Windows",
+        ip: "127.0.0.10",
+        os: "windows",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
     // Tailscale lets a computer be called anything, including the name this
     // computer keeps for its own local owner.
-    Node { name: "owner", host: "owner", ip: "127.0.0.11", os: "linux", user: RILEY, online: true, tags: &[] },
+    Node {
+        name: "owner",
+        host: "owner",
+        ip: "127.0.0.11",
+        os: "linux",
+        user: RILEY,
+        online: true,
+        tags: &[],
+    },
 ];
 
 pub fn node(name: &str) -> &'static Node {
@@ -119,11 +199,19 @@ pub fn status_entry(n: &Node) -> Value {
 }
 
 pub fn status_for(own: &Node) -> Value {
-    let peers: serde_json::Map<String, Value> =
-        NODES.iter().filter(|n| n.name != own.name).map(|n| (format!("nodekey:{}", n.name), status_entry(n))).collect();
+    let peers: serde_json::Map<String, Value> = NODES
+        .iter()
+        .filter(|n| n.name != own.name)
+        .map(|n| (format!("nodekey:{}", n.name), status_entry(n)))
+        .collect();
     let users: serde_json::Map<String, Value> = [RILEY, DANA, TAGGED]
         .iter()
-        .map(|id| (id.to_string(), json!({"ID": id, "LoginName": login(*id), "DisplayName": login(*id)})))
+        .map(|id| {
+            (
+                id.to_string(),
+                json!({"ID": id, "LoginName": login(*id), "DisplayName": login(*id)}),
+            )
+        })
         .collect();
     json!({
         "BackendState": "Running", "AuthURL": "", "Self": status_entry(own), "Peer": peers, "User": users,
@@ -167,17 +255,37 @@ impl World {
         write_executable(&root.join("bin/ssh"), FAKE_SSH);
         write_executable(&root.join("bin/ssh-keyscan"), FAKE_SSH_KEYSCAN);
         for n in NODES {
-            fs::write(root.join(format!("tailscale/status-{}.json", n.name)), status_for(n).to_string()).unwrap();
-            fs::write(root.join(format!("tailscale/whois-{}.json", n.ip)), whois_for(n).to_string()).unwrap();
+            fs::write(
+                root.join(format!("tailscale/status-{}.json", n.name)),
+                status_for(n).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                root.join(format!("tailscale/whois-{}.json", n.ip)),
+                whois_for(n).to_string(),
+            )
+            .unwrap();
         }
         fs::write(root.join("ssh-routes"), "").unwrap();
         fs::create_dir_all(root.join("omarchy")).unwrap();
         for n in NODES {
             fs::create_dir_all(root.join("machines").join(n.name).join("bin")).unwrap();
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let evidence = std::env::var_os("IBARA_E2E_EVIDENCE").map(PathBuf::from).inspect(|dir| fs::create_dir_all(dir).unwrap());
-        World { root, port, evidence, tag, wake_address: None }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let evidence = std::env::var_os("IBARA_E2E_EVIDENCE")
+            .map(PathBuf::from)
+            .inspect(|dir| fs::create_dir_all(dir).unwrap());
+        World {
+            root,
+            port,
+            evidence,
+            tag,
+            wake_address: None,
+        }
     }
 
     /// One computer's own programs, first on its daemons' `PATH` (fake `ip`,
@@ -188,7 +296,11 @@ impl World {
 
     pub fn record(&self, entry: Value) {
         if let Some(dir) = &self.evidence {
-            let mut file = fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{}.jsonl", self.tag))).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{}.jsonl", self.tag)))
+                .unwrap();
             writeln!(file, "{entry}").unwrap();
         }
     }
@@ -198,7 +310,14 @@ impl World {
         // Nothing reaches this computer's real Omarchy, settings or session:
         // Omarchy's scripts come only from the machine's own fake bin.
         command
-            .env("PATH", format!("{}:{}:/usr/bin:/bin", self.machine_bin(n.name).display(), self.root.join("bin").display()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    self.machine_bin(n.name).display(),
+                    self.root.join("bin").display()
+                ),
+            )
             .env("OMARCHY_PATH", self.root.join("omarchy"))
             .env_remove("XDG_CONFIG_HOME")
             .env("IBARA_TAILSCALE_BIN", self.root.join("bin/tailscale"))
@@ -240,7 +359,10 @@ pub fn wait_ready(child: &mut Child, marker: &str) -> mpsc::Receiver<String> {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(line) if line.contains(marker) => return rx,
             Ok(line) => log.push(line),
-            Err(_) => panic!("never ready ({marker}): {log:#?} (exit {:?})", child.try_wait()),
+            Err(_) => panic!(
+                "never ready ({marker}): {log:#?} (exit {:?})",
+                child.try_wait()
+            ),
         }
     }
 }
@@ -261,9 +383,22 @@ impl Target {
 
     /// `start`, with `env` set last (so it can replace a stub, such as
     /// `IBARA_TEST_HYPRCTL`, or give the computer a desktop session).
-    pub fn start_with(world: &World, n: &Node, station_label: Option<&str>, window_ms: u64, env: &[(&str, &std::ffi::OsStr)]) -> Target {
+    pub fn start_with(
+        world: &World,
+        n: &Node,
+        station_label: Option<&str>,
+        window_ms: u64,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Target {
         let root = world.root.join(format!("target-{}", n.name));
-        for dir in ["home", "install", "operators", "bin", "authorized", "xdg-run"] {
+        for dir in [
+            "home",
+            "install",
+            "operators",
+            "bin",
+            "authorized",
+            "xdg-run",
+        ] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
         fs::write(root.join("policy.json"), r#"{"principals":[]}"#).unwrap();
@@ -273,9 +408,17 @@ impl Target {
         fs::write(root.join("admin.key"), "admin-e2e-secret\n").unwrap();
         fs::write(root.join("fingerprints.json"), r#"{"fingerprints":{}}"#).unwrap();
         if let Some(label) = station_label {
-            fs::write(root.join("station.json"), json!({"schema_version": 1, "display_label": label}).to_string()).unwrap();
+            fs::write(
+                root.join("station.json"),
+                json!({"schema_version": 1, "display_label": label}).to_string(),
+            )
+            .unwrap();
         }
-        let keygen = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"]).arg(root.join("host_ed25519")).status().unwrap();
+        let keygen = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+            .arg(root.join("host_ed25519"))
+            .status()
+            .unwrap();
         assert!(keygen.success());
         let projections = root.join("projections.jsonl");
         let listener = UnixListener::bind(root.join("access.sock")).unwrap();
@@ -288,10 +431,18 @@ impl Target {
                     continue;
                 }
                 let request: Value = serde_json::from_str(&line).unwrap();
-                let mut file = fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .unwrap();
                 writeln!(file, "{request}").unwrap();
                 for (principal, key) in request["keys"].as_object().into_iter().flatten() {
-                    fs::write(authorized.join(format!("ibara-op-{principal}")), key.as_str().unwrap()).unwrap();
+                    fs::write(
+                        authorized.join(format!("ibara-op-{principal}")),
+                        key.as_str().unwrap(),
+                    )
+                    .unwrap();
                 }
                 let _ = writeln!(reader.get_mut(), "{{\"ok\":true}}");
             }
@@ -302,7 +453,11 @@ impl Target {
             write_executable(&path, &format!("#!/bin/sh\n{script}\n"));
             path
         };
-        let (hyprctl, grim, cua) = (stub("hyprctl", "echo '[]'"), stub("grim", "exit 1"), stub("cua-driver", "exit 1"));
+        let (hyprctl, grim, cua) = (
+            stub("hyprctl", "echo '[]'"),
+            stub("grim", "exit 1"),
+            stub("cua-driver", "exit 1"),
+        );
         let mut command = Command::new(IBARAD);
         world.machine_env(&mut command, n);
         command
@@ -316,7 +471,10 @@ impl Target {
             .env("IBARA_POLICY", root.join("policy.json"))
             .env("IBARA_GATEWAY_KEY", root.join("gateway.key"))
             .env("IBARA_ADMIN_HASH", root.join("admin.sha256"))
-            .env("IBARA_OPERATOR_ACCOUNTS", root.join("absent-operator-accounts.json"))
+            .env(
+                "IBARA_OPERATOR_ACCOUNTS",
+                root.join("absent-operator-accounts.json"),
+            )
             .env("IBARA_OPERATOR_SOCKET_DIR", root.join("operators"))
             .env("IBARA_SSH_HOST_KEY", root.join("host_ed25519.pub"))
             .env("IBARA_STATION_FILE", root.join("station.json"))
@@ -334,9 +492,16 @@ impl Target {
         let mut child = command.spawn().unwrap();
         let lines = wait_ready(&mut child, "\"pairing_listening\"");
         std::thread::spawn(move || for _ in lines.iter() {});
-        let mut routes = fs::OpenOptions::new().append(true).open(world.root.join("ssh-routes")).unwrap();
+        let mut routes = fs::OpenOptions::new()
+            .append(true)
+            .open(world.root.join("ssh-routes"))
+            .unwrap();
         writeln!(routes, "{} {}", n.ip, root.display()).unwrap();
-        Target { child, root, projections }
+        Target {
+            child,
+            root,
+            projections,
+        }
     }
 
     /// The root power helper as systemd runs it (`Accept=yes`): each
@@ -370,11 +535,16 @@ impl Target {
     }
 
     pub fn projections(&self) -> Vec<Value> {
-        fs::read_to_string(&self.projections).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        fs::read_to_string(&self.projections)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     pub fn authority(&self) -> Value {
-        serde_json::from_slice(&fs::read(self.root.join("state/operator-authority.json")).unwrap()).unwrap()
+        serde_json::from_slice(&fs::read(self.root.join("state/operator-authority.json")).unwrap())
+            .unwrap()
     }
 
     /// `computerctl` on this computer: `ibara admin ARGS…` as its local owner.
@@ -387,8 +557,12 @@ impl Target {
             .env("IBARA_ADMIN_KEY", self.root.join("admin.key"))
             .output()
             .unwrap();
-        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        let reply = serde_json::from_str(&stdout).unwrap_or_else(|_| json!({"stdout": stdout, "stderr": stderr}));
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let reply = serde_json::from_str(&stdout)
+            .unwrap_or_else(|_| json!({"stdout": stdout, "stderr": stderr}));
         (out.status.code(), reply)
     }
 }
@@ -414,22 +588,42 @@ pub struct Console<'w> {
 
 impl<'w> Console<'w> {
     pub fn start(world: &'w World, name: &str, n: &Node, target: Option<&Target>) -> Console<'w> {
+        Self::start_with(world, name, n, target, &[])
+    }
+    pub fn start_with(
+        world: &'w World,
+        name: &str,
+        n: &Node,
+        target: Option<&Target>,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Console<'w> {
         let root = world.root.join(format!("console-{name}"));
         fs::create_dir_all(root.join("home")).unwrap();
         fs::create_dir_all(root.join("run")).unwrap();
         fs::set_permissions(root.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         let mut command = Command::new(IBARAD);
         world.machine_env(&mut command, n);
-        command.args(["--role", "operator"]).env("HOME", root.join("home")).env("XDG_RUNTIME_DIR", root.join("run"));
+        command
+            .args(["--role", "operator"])
+            .env("HOME", root.join("home"))
+            .env("XDG_RUNTIME_DIR", root.join("run"));
         match target {
             Some(target) => command.env("IBARA_RUNTIME_DIR", target.root.join("run")),
             None => command.env("IBARA_RUNTIME_DIR", root.join("no-target")),
         };
-        let mut child = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        command.envs(env.iter().copied());
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let lines = wait_ready(&mut child, "operator console serving");
         std::thread::spawn(move || for _ in lines.iter() {});
         let stream = UnixStream::connect(root.join("run/ibara/ibarad.sock")).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(40)))
+            .unwrap();
         Console {
             world,
             name: name.into(),
@@ -444,20 +638,30 @@ impl<'w> Console<'w> {
     pub fn ask(&mut self, command: &str, args: &[&str]) -> Value {
         self.next_id += 1;
         let id = format!("{}-{}", self.name, self.next_id);
-        writeln!(self.writer, "{}", json!({"id": id, "command": command, "args": args})).unwrap();
+        writeln!(
+            self.writer,
+            "{}",
+            json!({"id": id, "command": command, "args": args})
+        )
+        .unwrap();
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
         let reply: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
         assert_eq!(reply["id"], id, "{reply}");
         let envelope = reply["envelope"].clone();
-        self.world.record(json!({"console": self.name, "command": command, "args": args, "envelope": envelope}));
+        self.world.record(
+            json!({"console": self.name, "command": command, "args": args, "envelope": envelope}),
+        );
         envelope
     }
 
     /// `ask`, requiring an ok envelope; its data.
     pub fn ok(&mut self, command: &str, args: &[&str]) -> Value {
         let envelope = self.ask(command, args);
-        assert!(envelope["error"].is_null(), "{command} {args:?}: {envelope}");
+        assert!(
+            envelope["error"].is_null(),
+            "{command} {args:?}: {envelope}"
+        );
         envelope["data"].clone()
     }
 
@@ -465,11 +669,17 @@ impl<'w> Console<'w> {
     pub fn preview(&mut self, args: &[&str]) -> Value {
         self.next_id += 1;
         let id = format!("{}-{}", self.name, self.next_id);
-        writeln!(self.writer, "{}", json!({"id": id, "command": "operator-observe", "args": args})).unwrap();
+        writeln!(
+            self.writer,
+            "{}",
+            json!({"id": id, "command": "operator-observe", "args": args})
+        )
+        .unwrap();
         loop {
             let mut line = String::new();
             self.reader.read_line(&mut line).unwrap();
-            let event: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
+            let event: Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
             if event["event"] == "preview" && event["data"]["request_id"] == id {
                 let envelope = event["data"].clone();
                 self.world.record(json!({"console": self.name, "command": "operator-observe", "args": args, "envelope": envelope}));
@@ -492,7 +702,10 @@ impl<'w> Console<'w> {
     }
 
     pub fn public_key(&self) -> String {
-        fs::read_to_string(self.home.join(".ssh/ibara_agent_ed25519.pub")).unwrap().trim().to_string()
+        fs::read_to_string(self.home.join(".ssh/ibara_agent_ed25519.pub"))
+            .unwrap()
+            .trim()
+            .to_string()
     }
 }
 
@@ -505,18 +718,31 @@ impl Drop for Console<'_> {
 }
 
 pub fn six_digits(code: &Value) -> bool {
-    code.as_str().is_some_and(|c| c.len() == 7 && c.as_bytes()[3] == b' ' && c.bytes().enumerate().all(|(i, b)| i == 3 || b.is_ascii_digit()))
+    code.as_str().is_some_and(|c| {
+        c.len() == 7
+            && c.as_bytes()[3] == b' '
+            && c.bytes()
+                .enumerate()
+                .all(|(i, b)| i == 3 || b.is_ascii_digit())
+    })
 }
 
 pub fn computers(tailnet: &Value) -> BTreeMap<String, Value> {
-    tailnet["computers"].as_array().unwrap().iter().map(|c| (c["node"].as_str().unwrap().to_string(), c.clone())).collect()
+    tailnet["computers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["node"].as_str().unwrap().to_string(), c.clone()))
+        .collect()
 }
 
 /// Selected-route reads through the new directory row reach the real target.
 pub fn route_works(console: &mut Console, computer_id: &str) {
     let session = console.ok("operator-session", &["--computer", computer_id]);
     let epoch = session["controller_epoch"].as_str().unwrap().to_string();
-    let status = console.ok("operator-status", &["--computer", computer_id, "--epoch", &epoch]);
+    let status = console.ok(
+        "operator-status",
+        &["--computer", computer_id, "--epoch", &epoch],
+    );
     assert_eq!(status["computer_id"], computer_id, "{status}");
 }
-

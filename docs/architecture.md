@@ -39,11 +39,11 @@ flowchart TB
 | `ibara` | whoever runs it | Short-lived commands: `ibara mcp` for agents, `ibara setup`, `update`, `rollback` and `uninstall`, `ibara prompt`, and the entry points below. |
 | Agent entry | root sshd on port 2222, Tailscale addresses only | Accepts only keys of paired computers. Each key has a forced command, `ibara agent-entry`, as `ibara-agent` (agents and files) or `ibara-op-NAME` (a paired console). |
 | `ibara access-system` | root, started per connection by `ibara-access.socket` | Turns the saved grants into Unix accounts, key files and the agent entry's key list. It accepts decisions, never commands or paths. |
-| `ibara power-system` | root, started per connection by `ibara-power.socket` | Restart, shut down and sleep, turning on wake-on-network before sleep, and starting an update of ibara (the newest signed release, checked as `ibara update` checks it) or of Omarchy (`omarchy-update -y` as the desktop account, with passwordless `sudo` for that run only), for callers with the Administer permission. |
+| `ibara power-system` | root, started per connection by `ibara-power.socket` | Restart, shut down and sleep, turning on wake-on-network before sleep, and starting an update of ibara (the newest signed release, checked as `ibara update` checks it) or of Omarchy (`omarchy-update -y` as the desktop account, with passwordless `sudo` for that run only), for callers with the Administer permission. It also installs or removes ibara's extension in the browser a person chooses for login sharing (`browser_setup`, `browser_remove`), for the desktop account that asked. |
 | Cua driver | the desktop user, a private child of `ibarad` | Reads apps through accessibility, types, clicks and draws each agent's named cursor. Its Hyprland plugin is built on each computer for its exact Hyprland. |
 | `ibara-stream` | the desktop user, a child of `ibarad` | The streaming host for Take Control, started only while someone holds control. |
 | `ibara-view` | the desktop user, opened by the console | The viewer window for Take Control. |
-| Browser page reader | inside Chrome or Chromium, with `ibara chrome-host` as its native host | Reads pages, finds elements and reports where a click landed. It never clicks or types by itself. |
+| Browser page reader | inside Chrome, Chromium or Brave, with `ibara chrome-host` as its native host | Reads pages, finds elements and reports where a click landed. It never clicks or types by itself. On an agent computer it also writes a shared site's login and reports the tab's site; on the sharing computer, only there and only once the person turns sharing on, it reads a site's login when allowed. `ibarad` tells it which of these jobs it has after it connects. |
 | Console plugin | inside Omarchy's shell | The bar mark, the quick panel and the console. It talks only to the local console service. It lives in the [omarchy-ibara](https://github.com/MayberryDT/omarchy-ibara) repository. |
 
 There is no Node or Python at run time. `ibarad` runs one single-threaded async runtime and streams large bodies instead of holding them, because it has to stay small on a computer that is busy doing other work.
@@ -133,6 +133,29 @@ sequenceDiagram
 
 Each console has one viewer identity, made on the first Take Control. The other computer admits only that viewer, only with a fresh ticket. Closing the viewer keeps control and the pause, and Open Viewer starts it again. Hand Back ends the stream and lets agents work again, unless a person paused them or ibara is still settling earlier work; it never restarts an agent's task by itself.
 
+## Login sharing
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant T as ibarad (agent computer)
+  participant O as ibarad --role operator (sharing computer)
+  participant B as Person's browser
+  A->>T: computer_begin logins, or browser_act sign_in
+  T->>T: request and, for sites to ask, one login attention item
+  loop every 2 s
+    O->>T: login_pending (operator route)
+  end
+  Note over O: the person answers in the console (login-answer)
+  O->>B: read the site's cookies, fresh
+  O->>T: login_deliver
+  T->>T: timeline login_shared, then write them in the agent's browser
+  A->>T: the same sign_in again
+  T-->>A: reload, sign_in {sites, page} and the frame
+```
+
+One computer, usually the person's own, is the sharing computer; each agent computer records which one and accepts logins, rules and answers only from its operator identity, with Allowed Administer. The rules (Allowed, Ask First, Denied, per computer and for All Computers, deny beating ask beating allow) live on the sharing computer, which pushes each computer its share and re-checks them before every delivery. The agent computer never connects to it: the sharing computer's operator daemon asks each computer it administers for requests every 2 seconds over the existing route, whether or not the console is open. Cookie values exist only in the two browsers and in the one `login_deliver` action carrying them; records keep sites, states and counts. See [agent tools](agent-tools.md#logins) for what agents see.
+
 ## What is stored where
 
 | File | On | Holds |
@@ -143,6 +166,7 @@ Each console has one viewer identity, made on the first Take Control. The other 
 | `~/.config/ibara/settings.toml` | every computer | Settings you can change in the console or by hand |
 | `/etc/agent-computer/` | every computer | Root-owned keys, policy and the agent entry's configuration |
 | `~/Downloads/Ibara` | every computer | Files other computers sent to you |
+| `~/.local/state/ibara/login-sharing.json` | the sharing computer | Login rules, each site's last result, who first asked and when it was last shared (never a login) |
 
 The journal is SQLite and changes only by additive migrations. Before an update, `ibara update` copies the journals, and `ibara rollback` puts that copy back when the newer release had moved the journal forward.
 

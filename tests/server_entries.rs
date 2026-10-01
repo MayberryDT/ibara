@@ -548,7 +548,9 @@ fn an_agent_back_on_a_new_connection_carries_on_with_its_task_at_once() {
     let paused = again.call("computer_files", json!({ "task_ref": task, "request_id": "write-3", "op": "write", "path": "note.txt", "text": "again\n" }));
     assert_eq!(paused["error"]["code"], "HUMAN_CONTROL", "{paused}");
     assert!(situation(&paused).contains("paused for a person"), "{paused}");
-    assert!(lease().is_null(), "nothing resumed under the person");
+    let retained = lease();
+    assert_eq!(retained["task_ref"], task, "the paused task stays reserved: {retained}");
+    assert_eq!(retained["connection_id"], resumed["connection_id"], "another connection did not take it under the person: {retained}");
     assert_eq!(std::fs::read_to_string(workspace.join("note.txt")).unwrap(), "back\n");
     drop(dropped);
 }

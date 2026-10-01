@@ -24,6 +24,9 @@
 //! 5. A copy that arrived is sent back (an echo), so a clipboard is set twice.
 //! 6. After Hand Back copies still travel, a clipboard watcher keeps running on
 //!    either computer, or screen sharing keeps running.
+//! 7. Taking control ends the agent's task, hides its question, interrupts
+//!    its attention wait, or prevents the same agent working after Hand Back.
+//! 8. A held step's approval survives a takeover and authorizes old input.
 //!
 //! `IBARA_E2E_EVIDENCE=DIR` keeps every console exchange as JSON lines in DIR.
 
@@ -37,6 +40,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin};
+use std::sync::mpsc;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -230,6 +235,63 @@ fn control(console: &mut Console, computer: &str, epoch: &str, op: &str) -> Valu
     reply["data"].clone()
 }
 
+/// A real agent-entry MCP connection, including pings while a wait is open.
+struct Agent {
+    child: Child,
+    input: Arc<Mutex<ChildStdin>>,
+    replies: mpsc::Receiver<Value>,
+    next_id: u64,
+}
+
+impl Agent {
+    fn start(target: &Target) -> Self {
+        let root = &target.root;
+        let mut child = Command::new(IBARA).args(["agent-entry", "vesper"])
+            .arg(root.join("run/controller.sock")).arg(root.join("gateway.key"))
+            .arg(root.join("state/operator-keys/vesper.key"))
+            .env("SSH_ORIGINAL_COMMAND", "mcp").stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let input = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let (tx, replies) = mpsc::channel();
+        let writer = input.clone();
+        std::thread::spawn(move || {
+            for line in output.lines().map_while(Result::ok) {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == "ping" {
+                    let _ = writeln!(writer.lock(), "{}", json!({"jsonrpc":"2.0", "id":message["id"], "result":{}}));
+                } else if tx.send(message).is_err() { break; }
+            }
+        });
+        let agent = Self { child, input, replies, next_id: 1 };
+        writeln!(agent.input.lock(), "{}", json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"codex", "version":"1"}}})).unwrap();
+        agent.replies.recv_timeout(Duration::from_secs(20)).unwrap();
+        writeln!(agent.input.lock(), "{}", json!({"jsonrpc":"2.0", "method":"notifications/initialized"})).unwrap();
+        agent
+    }
+    fn send(&mut self, tool: &str, args: Value) -> u64 {
+        self.next_id += 1;
+        writeln!(self.input.lock(), "{}", json!({"jsonrpc":"2.0", "id":self.next_id,
+            "method":"tools/call", "params":{"name":tool,"arguments":args}})).unwrap();
+        self.next_id
+    }
+    fn receive(&self, world: &World, id: u64) -> Value {
+        let reply = self.replies.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(reply["id"], id, "{reply}");
+        let result = reply["result"]["structuredContent"].clone();
+        world.record(json!({"agent_reply": result}));
+        result
+    }
+    fn call(&mut self, world: &World, tool: &str, args: Value) -> Value {
+        let id = self.send(tool, args);
+        self.receive(world, id)
+    }
+}
+impl Drop for Agent {
+    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
+}
+
 #[test]
 fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways() {
     let world = World::new("take-control");
@@ -252,7 +314,7 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
         ("IBARA_TEST_IDLE", idle.as_os_str()),
         ("WAYLAND_DISPLAY", OsStr::new("wayland-e2e")),
     ];
-    let _tulip1 = Target::start_with(&world, node("tulip1"), Some("Tulip1"), 300_000, &env);
+    let tulip1 = Target::start_with(&world, node("tulip1"), Some("Tulip1"), 300_000, &env);
     // Vesper: ibara-view (an ELF program; `env` runs `connect`), its identity, and
     // systemd-run and hyprctl that stand in for the session.
     let vesper_bin = world.machine_bin("vesper");
@@ -272,11 +334,35 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     fs::write(identity.join("cert.pem"), pem).unwrap();
     fs::write(identity.join("key.pem"), "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n").unwrap();
     let e = vesper.ok("operator-session", &["--computer", &id])["controller_epoch"].as_str().unwrap().to_string();
+    assert_eq!(tulip1.admin(&["resume"]).0, Some(0));
+    let mut agent = Agent::start(&tulip1);
+    let began = agent.call(&world, "computer_begin", json!({"request_id":"takeover-begin", "goal":"Take over, then press Done"}));
+    assert_eq!(began["status"], "ok", "{began}");
+    let task = began["result"]["task_ref"].as_str().unwrap().to_string();
+    let asked = agent.call(&world, "computer_checkpoint", json!({"task_ref":task,"ask":{"question":"Take over, then press Done","options":["Done"]}}));
+    let attention = asked["result"]["attention"].as_str().unwrap().to_string();
+    let held_args = json!({"task_ref":task,"request_id":"held-step", "command":["/bin/true"], "effect":"send"});
+    let held = agent.call(&world, "computer_exec", held_args.clone());
+    assert_eq!(held["status"], "pending", "{held}");
+    let approval = held["result"]["attention"].as_str().unwrap().to_string();
+    let waiting = agent.send("computer_wait", json!({"task_ref":task,"for":{"attention":attention},"deadline_ms":1500}));
+    std::thread::sleep(Duration::from_millis(300));
     copy(&world, "tulip1", TEXT, b"on Tulip1 before Take Control");
     copy(&world, "vesper", TEXT, b"on Vesper before Take Control");
 
     // Take Control: the viewer, and only the viewer, gets a ticket issued for this console's certificate.
     let taken = control(&mut vesper, &id, &e, "take_control");
+    let pending = vesper.ok("fleet-attention", &["--fresh", &id]);
+    assert!(pending.to_string().contains(&attention), "the question stays in the console: {pending}");
+    assert!(!pending.to_string().contains(&approval), "the held step expires: {pending}");
+    let still_waiting = agent.receive(&world, waiting);
+    assert_eq!(still_waiting["status"], "pending", "a wait started before takeover stays open: {still_waiting}");
+    let refused = agent.call(&world, "computer_exec", json!({"task_ref":task,"request_id":"during-takeover", "command":["/bin/true"]}));
+    assert_eq!(refused["error"]["code"], "HUMAN_CONTROL", "{refused}");
+    assert!(refused["error"]["next"].as_str().unwrap().contains("Hand Back"), "{refused}");
+    let paused_wait = agent.call(&world, "computer_wait", json!({"task_ref":task,"for":{"attention":attention},"deadline_ms":0}));
+    assert_eq!(paused_wait["status"], "pending", "a wait can start during takeover: {paused_wait}");
+    let waiting = agent.send("computer_wait", json!({"task_ref":task,"for":{"attention":attention},"deadline_ms":30000}));
     assert!(taken["viewer_started"] == json!(true) && taken["result"]["owner"].as_str().is_some_and(|o| o.starts_with("operator:")), "{taken}");
     let stream = &taken["result"]["stream"];
     assert!(stream.is_object() && stream.get("ticket").is_none(), "the ticket goes to the viewer only: {taken}");
@@ -308,7 +394,20 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     // Hand Back ends screen sharing, both watchers, and the sharing.
     let stream_pid: u32 = fs::read_to_string(desk.join("stream.pid")).unwrap().trim().parse().unwrap();
     let back = control(&mut vesper, &id, &e, "handback");
-    assert_eq!((&back["result"]["owner"], &back["result"]["agent_resumed"]), (&json!("none"), &json!(false)), "{back}");
+    assert!(back["result"]["owner"].as_str().unwrap().contains(&task), "{back}");
+    assert_eq!(back["result"]["agent_resumed"], true, "{back}");
+    let pending = vesper.ok("fleet-attention", &["--fresh", &id]);
+    assert!(pending.to_string().contains(&attention), "the question stays after Hand Back: {pending}");
+    let answered = on(&mut vesper, &id, &e, "operator-answer-attention", &[&attention,"--answer","Done"]);
+    assert!(answered["error"].is_null(), "{answered}");
+    let waited = agent.receive(&world, waiting);
+    assert_eq!((waited["status"].clone(), waited["result"]["answer"].clone()), (json!("ok"), json!("Done")), "{waited}");
+    let expired = agent.call(&world, "computer_exec", held_args);
+    assert!(expired["error"].is_object(), "the old approval cannot run: {expired}");
+    let ran = agent.call(&world, "computer_exec", json!({"task_ref":task,"request_id":"after-handback", "command":["/usr/bin/printf", "%s", "continued"]}));
+    assert_eq!(ran["status"], "ok", "same task continues: {ran}");
+    let finished = agent.call(&world, "computer_finish", json!({"task_ref":task,"request_id":"takeover-finish", "outcome":"complete", "summary":"Done answered after Take Control and Hand Back; same task's next command succeeded."}));
+    assert_eq!(finished["status"], "ok", "{finished}");
     wait_for("screen sharing and the clipboard watchers to end", 10, || {
         let running: Vec<u32> = [stream_pid].into_iter().chain(watchers(&world, "tulip1")).chain(watchers(&world, "vesper")).filter(|p| alive(*p)).collect();
         running.is_empty().then_some(())

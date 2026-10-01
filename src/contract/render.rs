@@ -32,7 +32,7 @@ pub fn render_text(envelope: &Envelope) -> String {
 }
 
 /// Keys rendered by their own sections, in this order, after the plain fields.
-const SECTIONS: &[&str] = &["help", "computers", "checks", "steps", "entries", "artifacts", "cleanup", "frame"];
+const SECTIONS: &[&str] = &["help", "computers", "checks", "logins", "sign_in", "steps", "entries", "artifacts", "cleanup", "frame"];
 
 fn render_object(map: &Map<String, Value>, out: &mut String) {
     let mut plain = Vec::new();
@@ -55,6 +55,12 @@ fn render_object(map: &Map<String, Value>, out: &mut String) {
                 out.push_str(value.as_str().unwrap_or_default());
             }
             "frame" => render_frame(value, out),
+            "sign_in" => {
+                let _ = write!(out, "\nsign_in page: {}", s(value, "page"));
+                for site in items(value.get("sites")) {
+                    let _ = write!(out, "\nlogin {} {}", s(site, "site"), s(site, "state"));
+                }
+            }
             "cleanup" => {
                 let closed = names(value.get("closed"));
                 let _ = write!(out, "\nclosed: {}", if closed.is_empty() { "nothing".into() } else { closed.join(", ") });
@@ -95,6 +101,15 @@ fn row(section: &str, item: &Value) -> String {
             let mut line = format!("step {} {}: {}", short(&item["index"]), s(item, "outcome"), s(item, "effect"));
             if let Some(op) = item.get("op_ref").and_then(Value::as_str) {
                 let _ = write!(line, " ({op})");
+            }
+            line
+        }
+        "logins" => {
+            let mut line = format!("login {} {}", s(item, "site"), s(item, "state"));
+            for key in ["attention", "last_result"] {
+                if let Some(v) = item.get(key).and_then(Value::as_str) {
+                    let _ = write!(line, " · {v}");
+                }
             }
             line
         }

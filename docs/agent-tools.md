@@ -66,17 +66,18 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 ## The eleven tools
 
 ### `computer_status({ref?})`
-- **With no `ref`:** returns the fleet, meaning every computer this harness may use, each with its name, id, state, current user, holder and a one-line capability summary. With one computer configured, it returns that computer. The summary says "no browser open yet" when the browser is simply closed, which is not a fault, and "browser page reader (not installed)" only when browser checks and `browser_act` cannot work on that computer.
-- **With a `ref`:** returns that thing's state, its parent and children, and its valid next moves.
+- **With no `ref`:** returns the fleet, meaning every computer this harness may use, each with its name, id, state, current user, holder and a one-line capability summary. With one computer configured, it returns that computer. The summary says "no browser open yet" when the browser is simply closed, which is not a fault, and "browser page reader (not installed)" only when browser checks and `browser_act` cannot work on that computer. It ends with the computer's [logins](#logins): "logins from Laptop · 23 sites allowed" or "logins off".
+- **With a `ref`:** returns that thing's state, its parent and children, and its valid next moves. A computer's summary also names its Allowed login sites and counts the Denied ones (never naming them).
 - **`ref: "help:<tool>"`:** returns the long description and examples for that tool, keeping the tool list small.
 - It never captures the screen.
 
-### `computer_begin({computer?, goal, checks?, deliver?, request_id})`
+### `computer_begin({computer?, goal, checks?, deliver?, logins?, request_id})`
 **Inputs:**
 - `computer` is a name, a host or a `cmp_` id. It is resolved once and echoed back as an id. It may be left out when only one computer is reachable. Every ibara command that names a computer takes the same names, so the collector takes them too: `ibara client --computer COMPUTER fetch ARTIFACT_REF NEW_LOCAL_PATH`, with COMPUTER as `computer_status` lists it (its name or `cmp_` id).
 - `checks` is a list of `{id, description, check?}`. `check` is a typed check (see below), such as `{kind: "file_exists", path: "note.txt"}`.
 - `deliver` is an optional `{host, path}` obligation. `host` and `path` are checked as a send's `to` is (see `computer_files`), so a delivery no send could make is refused here, and the delivery is the one a later send to the same computer and path makes, under whichever of the computer's names.
   It is verified when the sent file is collected to exactly that path (after any change a person makes to it): by the agent's collector, or by a person saving it in the console. A copy saved anywhere else does not count.
+- `logins` lists up to 20 sites the task will sign in to, such as `["irs.gov", "id.me"]`. See [Logins](#logins).
 
 **Result:**
 
@@ -88,6 +89,7 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 | `checks` | For each check: `{id, basis: "automatic" \| "your_assessment", state}`. A typed check that can never pass is refused here, not discovered at `finish` |
 | `frame` | The first frame (see `observe`) |
 | `notes` | Any app notes that match what is on screen |
+| `logins` | With `logins`: for each site `{site, state, attention?, last_result?}` (see [Logins](#logins)) |
 
 It is idempotent by `request_id`. Replaying a `request_id` with the same arguments returns the original result, or the original error, in any session. A `request_id` names one request within an MCP session: different arguments under a `request_id` already used in this session return `REQUEST_CONFLICT`. In a later session, different arguments are a new request, once the earlier one under that `request_id` has finished; while it is still running, of unknown outcome or waiting for a person's approval, they return `REQUEST_CONFLICT`. This holds for every tool that takes a `request_id`.
 
@@ -154,7 +156,7 @@ A held step stays held while its approval is open: the same step under a new `re
 - A step that needs approval returns `status: "pending"` with an `att_` reference and a `next`, and does not run. See [Held for approval](#held-for-approval).
 
 ### `browser_act({task_ref, request_id, action, expect?, effect?})`
-A semantic action in the signed-in Chrome, through the extension. `action` is one of `navigate` (`url`), `click` (`target`), `type` (`target?`, `text`), `select` (`target`, `value`), `scroll` (`target?`, `dx?`, `dy?`), `key` (`keys`) or `wait_for` (`target?`, `text?`, `within_ms?`), with `kind` naming it. `target` is a page element id such as `b3`, from observing `surface: "tab"` with `view: "elements"`. `expect` works as in `computer_act`.
+A semantic action in the signed-in Chrome, through the extension. `action` is one of `navigate` (`url`), `click` (`target`), `type` (`target?`, `text`), `select` (`target`, `value`), `scroll` (`target?`, `dx?`, `dy?`), `key` (`keys`), `wait_for` (`target?`, `text?`, `within_ms?`) or `sign_in` (`sites?`, see [Logins](#logins)), with `kind` naming it. `target` is a page element id such as `b3`, from observing `surface: "tab"` with `view: "elements"`. `expect` works as in `computer_act`.
 
 ### `computer_exec({task_ref, request_id, command[], cwd?, timeout_ms?, background?, effect?})`
 Runs a command, bounded, in the task's workspace or in `cwd`. `cwd` takes a path as `computer_files` does. Its effect class is `change` unless declared otherwise with `effect: "send" | "spend" | "destructive"`. A command held for approval replies as in [Held for approval](#held-for-approval) and stays held: the same command and `cwd` under a new `request_id` is refused while its approval is open, and asks again once it was answered, as for `computer_act`.
@@ -198,6 +200,36 @@ Sent again with the same `request_id`:
 A person can also answer **Always Allow**: the step is approved, and from then on your steps of that kind (send, spend or delete) run on that computer without asking, for as long as your computer may run agent tasks there. Where your computer is set to ask first for that kind, they can only approve or deny.
 
 A computer whose access rules make an agent ask before it begins, observes or reads files replies the same way. A `computer_begin` has no task to wait on yet, so its `next` says to send the same `computer_begin` request again after a few seconds until it is no longer pending.
+
+### Logins
+An agent never sees or types a person's password. It says which sites it needs, and the person approves on the computer their logins come from (the sharing computer, usually their own); ibara then copies just those sites' logins (their cookies) fresh from the person's browser into this computer's browser. A site is a registrable domain, such as `irs.gov` or `id.me`.
+
+- **At begin:** `computer_begin({…, logins: [site, …]})` never waits. Its `logins` gives each site's `state`:
+  - `allowed`: copied in without asking (it arrives within a few seconds);
+  - `asking`: in one request for all such sites, with its `att_` in `attention`; carry on meanwhile;
+  - `denied`: not shared here; don't ask;
+  - `sharing_off`: no computer shares logins here yet; the person was offered Turn On Login Sharing;
+  - `rejected_before`: the site turned a shared login away before (`last_result: "site_rejected"`); it is still shared or asked as its rule says, but plan for Take Control;
+  - `not_available`: logins are not shared with this computer.
+- **At a sign-in page:** `browser_act({…, action: {kind: "sign_in", sites?}})`. Without `sites` it covers the focused tab's site and the site the tab came from (a sign-in through `id.me` for `irs.gov` covers both). Allowed sites need no one: the call waits up to 10 seconds for them. Once every site is settled and one was copied, ibara reloads the tab and replies `sign_in: {sites: [{site, state}], page}` with the reloaded tab's `frame`. `page` is `left_sign_in` (the reloaded page shows no password field), `still_sign_in` or `unknown`; `unknown` is never success. A copied site's `state` is `shared`.
+- **Reason codes** in `sign_in.sites[].state`, each with a `next`:
+
+  | Code | Meaning | What to do |
+  |---|---|---|
+  | `waiting_for_person` | The request is with the person (`attention`) | Wait on the `att_` with `computer_wait`, then send the same request again |
+  | `waiting_for_browser` | The person's browser isn't running | Keep waiting; send the same request again later |
+  | `waiting_for_sharing_computer` | The sharing computer is off or asleep (it has not asked in 15 seconds) | Do other work or wait, then send the same request again |
+  | `signed_out_there` | The person isn't signed in to the site in their browser | Wait: they were asked to sign in there and choose Retry |
+  | `sharing_off` | No sharing computer | Wait: the person was offered Turn On Login Sharing |
+  | `declined` | The person chose Don't Share this time | Don't ask again in this task; take another route or ask with `computer_checkpoint` |
+  | `denied` | A Denied rule | Don't ask; the site is not shared |
+  | `site_rejected` | Copied, but the site still shows its sign-in page | Ask the person to sign in with Take Control |
+  | `unknown` | ibara couldn't confirm the whole login was written | Send `sign_in` again to retry, or ask the person to use Take Control |
+
+  A reply with a waiting code has `status: "pending"`; send the same request (same `request_id`) again, and it completes once the wait is over. A resend never asks the person twice. `declined`, `denied` and `site_rejected` are final: later `sign_in` calls for that site in the same task return them at once. A settled result is replayed for the same `request_id`, as for every tool.
+- **Other people's agents:** an Allowed site is copied without asking only for agents from the person's own computers. An agent from someone else's computer is asked every time.
+- **Site memory:** when a site rejects a shared login, the sharing computer keeps that with its rules; later tasks see `rejected_before` at begin. A later success clears it.
+- **What you see happen:** `since` says "login for irs.gov shared" (or refreshed) and "login for chase.com refused". The open login request counts in the situation line's attention. Only the sharing computer can answer a login request; `answer_attention` from any other console refuses it.
 
 ### `computer_checkpoint({task_ref, note?, ask?, stop_asking?})`
 - **`note`:** stores the agent's continuation note and returns its `note_ref`. The task's `computer_status` lists the last note among its children and repeats its text in `next`, so an agent that lost its context can continue; `computer_status({ref: note_ref})` returns the text.

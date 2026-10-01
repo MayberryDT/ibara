@@ -614,6 +614,47 @@ fn approvals_keep_their_details_and_older_open_approvals_expire_once() {
     assert_eq!(j.get_attention(&again.att_ref).unwrap().unwrap().state, "open", "only the first open after the column is added expires approvals");
 }
 
+// Failure cases for login requests on a journal made by an older build:
+// 1. Its attention table's kind check still refuses `login`.
+// 2. Rebuilding the table loses an item, its details or its answer.
+#[test]
+fn an_older_attention_table_takes_login_requests_and_keeps_its_items() {
+    let dir = tempdir();
+    let (j, _) = open(&dir);
+    drop(j);
+    let db = Connection::open(dir.join("journal.sqlite")).unwrap();
+    db.execute_batch(
+        r#"DROP TABLE attention_items;
+           CREATE TABLE attention_items (att_ref TEXT PRIMARY KEY, task_ref TEXT NOT NULL, principal TEXT NOT NULL,
+             kind TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question','approval')), operation_ref TEXT, generation TEXT,
+             question TEXT NOT NULL, options TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL CHECK (state IN ('open','answered','expired')),
+             answer TEXT, answered_by TEXT, created_at TEXT NOT NULL, answered_at TEXT);
+           ALTER TABLE attention_items ADD COLUMN details TEXT;
+           INSERT INTO attention_items(att_ref, task_ref, principal, kind, question, options, state, answer, answered_by, created_at, answered_at, details) VALUES
+             ('att_done', 'task_a', 'vesper', 'approval', 'codex@vesper wants to send.', '["approve","deny"]', 'answered', 'approve', 'riley', '2026-09-25T00:00:00.000Z', '2026-09-25T00:00:01.000Z', '{"effect":"send"}');"#,
+    )
+    .unwrap();
+    assert!(db.execute("INSERT INTO attention_items(att_ref, task_ref, principal, kind, question, state, created_at) VALUES ('att_x', 't', 'p', 'login', 'q', 'open', 'now')", []).is_err());
+    drop(db);
+    let (j, _) = open(&dir);
+    let kept = j.get_attention("att_done").unwrap().unwrap();
+    assert_eq!((kept.state.as_str(), kept.answer.as_deref(), kept.details.clone()), ("answered", Some("approve"), json!({"effect": "send"})));
+    let login = j
+        .raise_attention(NewAttention {
+            task_ref: "task_b",
+            principal: "vesper",
+            kind: "login",
+            operation_ref: None,
+            generation: None,
+            question: "codex@vesper, working on “Renew the license” on Tulip1, wants your login for example.org",
+            details: Some(&json!({ "sites": [{ "site": "example.org" }] })),
+            options: &[],
+            now_iso: "2026-09-25T00:00:02.000Z",
+        })
+        .unwrap();
+    assert_eq!(j.count_open_attention(Some("task_b")).unwrap(), 1, "{login:?}");
+}
+
 #[test]
 fn app_notes_count_confirmations_per_fact() {
     let dir = tempdir();

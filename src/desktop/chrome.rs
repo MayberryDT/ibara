@@ -8,11 +8,21 @@
 //! without parsing them. The bridge accepts one extension at a time, requires
 //! `{"hello":1}` within 3 s, and keeps at most one request in flight.
 //!
+//! After the hello the bridge names the jobs this daemon needs (`jobs`, e.g.
+//! `["pages","receive"]` on an agent computer, `["share"]` on the sharing
+//! computer) and waits up to 3 s for any reply before the extension counts as
+//! connected; an older extension refuses the request, which is fine. The
+//! extension refuses every operation outside its jobs, and allows only
+//! `pages` until told otherwise.
+//!
 //! A request is `{"id":"chrome_<hex>","op":…,"args":…,"deadline":<ms>}` (4 s
-//! ahead); replies are `{"id","result":{…}}` or `{"id","error":{…}}`. An
-//! *effect* that is not acknowledged (error without `execution_not_started`,
-//! a malformed reply, a timeout after 6 s, or a disconnect) leaves the bridge
-//! unsettled: disconnected until `ibarad` restarts, as today.
+//! ahead; 12 s for `cookies_*`); replies are `{"id","result":{…}}` or
+//! `{"id","error":{…}}`. An *effect* that is not acknowledged (error without
+//! `execution_not_started`, a malformed reply, a timeout after 6 s, or a
+//! disconnect) leaves the bridge unsettled: disconnected until `ibarad`
+//! restarts, as today. Writing or removing cookies is an effect that is safe
+//! to repeat: when unacknowledged (within 15 s) its outcome is unknown, but
+//! the bridge stays usable for reading pages.
 
 use crate::error::{IbaraError, Result, internal, invalid};
 use serde::Serialize;
@@ -29,9 +39,14 @@ use tokio::time::Instant;
 pub const MAX_CHROME_FRAME: usize = 512 * 1024;
 pub const CHROME_PROTOCOL: u64 = 1;
 const HELLO_WITHIN: Duration = Duration::from_millis(3000);
+const JOBS_WITHIN: Duration = Duration::from_millis(3000);
 const REPLY_WITHIN: Duration = Duration::from_millis(6000);
 const DEADLINE_AHEAD_MS: i64 = 4000;
+/// Cookie bundles can hold 100+ cookies, each set and checked on its own.
+const COOKIE_REPLY_WITHIN: Duration = Duration::from_millis(15000);
+const COOKIE_DEADLINE_AHEAD_MS: i64 = 12000;
 const CANCEL_WAIT: Duration = Duration::from_millis(6500);
+const LOGIN_UNKNOWN: &str = "The login copy may be incomplete; share it again or remove it.";
 
 /// Read one frame. `Ok(None)` at end of stream (a trailing partial frame is
 /// discarded); `InvalidData` for a length outside 2..=512 KiB.
@@ -79,9 +94,37 @@ pub struct ChromeTab {
     pub focused: bool,
 }
 
+/// What an unanswered request leaves behind.
+#[derive(Clone, Copy, PartialEq)]
+enum Dispatch {
+    Read,
+    /// Unacknowledged, it leaves the bridge unsettled.
+    Effect,
+    /// An effect safe to repeat (cookies): unknown, but the bridge stays usable.
+    Repeatable,
+}
+
+impl Dispatch {
+    fn of(op: &str, effect: bool) -> Self {
+        match (effect, op.starts_with("cookies_")) {
+            (false, _) => Dispatch::Read,
+            (true, false) => Dispatch::Effect,
+            (true, true) => Dispatch::Repeatable,
+        }
+    }
+
+    /// The error for a dispatched request whose outcome is not known.
+    fn unknown(self, message: &str) -> IbaraError {
+        match self {
+            Dispatch::Read | Dispatch::Effect => IbaraError::new("OUTCOME_UNKNOWN", message, false).requires_reconciliation(),
+            Dispatch::Repeatable => IbaraError::new("OUTCOME_UNKNOWN", LOGIN_UNKNOWN, true),
+        }
+    }
+}
+
 struct Pending {
     id: String,
-    effect: bool,
+    dispatch: Dispatch,
     deadline: Instant,
     reply: oneshot::Sender<Result<Value>>,
 }
@@ -104,7 +147,7 @@ impl State {
         if let Some(pending) = &self.pending
             && pending.deadline <= Instant::now()
         {
-            if pending.effect {
+            if pending.dispatch == Dispatch::Effect {
                 self.unsettled = true;
             }
             self.pending = None;
@@ -112,6 +155,12 @@ impl State {
     }
     fn is_current(&self, generation: u64) -> bool {
         self.peer.as_ref().is_some_and(|(g, _)| *g == generation)
+    }
+    /// The peer of `generation` may take requests.
+    fn open(&mut self, generation: u64) {
+        if self.is_current(generation) {
+            self.ready = true;
+        }
     }
 }
 
@@ -128,8 +177,9 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 
 impl ChromeBridge {
     /// Listen on `path` (mode 0600). Refuses if another listener answers
-    /// there; removes a stale socket file.
-    pub async fn listen(path: &Path) -> Result<Arc<ChromeBridge>> {
+    /// there; removes a stale socket file. Each extension that connects is
+    /// told `jobs` after its hello (nothing is sent when `jobs` is empty).
+    pub async fn listen(path: &Path, jobs: &'static [&'static str]) -> Result<Arc<ChromeBridge>> {
         if tokio::fs::symlink_metadata(path).await.is_ok() {
             if UnixStream::connect(path).await.is_ok() {
                 return Err(internal(format!("Chrome bridge socket already active: {}", path.display())));
@@ -161,7 +211,7 @@ impl ChromeBridge {
                     s.peer = Some((s.generation, tx));
                     s.generation
                 };
-                tokio::spawn(serve_peer(state.clone(), stream, generation, rx));
+                tokio::spawn(serve_peer(state.clone(), stream, generation, rx, jobs));
             }
         });
         *bridge.accept.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
@@ -181,8 +231,12 @@ impl ChromeBridge {
         lock(&self.state).generation
     }
 
-    /// Send one request and wait for its reply (6 s).
+    /// Send one request and wait for its reply (6 s; 15 s for `cookies_*`).
+    /// Writing or removing cookies never leaves the bridge unsettled.
     pub async fn call(&self, op: &str, args: Value, effect: bool) -> Result<Value> {
+        let dispatch = Dispatch::of(op, effect);
+        let (ahead_ms, within) =
+            if op.starts_with("cookies_") { (COOKIE_DEADLINE_AHEAD_MS, COOKIE_REPLY_WITHIN) } else { (DEADLINE_AHEAD_MS, REPLY_WITHIN) };
         let (reply, id, deadline) = {
             let mut state = lock(&self.state);
             state.expire();
@@ -193,7 +247,7 @@ impl ChromeBridge {
                 return Err(IbaraError::new("BUSY", "Chrome request already in flight.", true).with("execution_not_started", true));
             }
             let id = crate::ids::id("chrome");
-            let message = json!({"id": id, "op": op, "args": args, "deadline": crate::ids::now_millis() + DEADLINE_AHEAD_MS});
+            let message = json!({"id": id, "op": op, "args": args, "deadline": crate::ids::now_millis() + ahead_ms});
             let payload = serde_json::to_vec(&message).map_err(|e| internal(format!("chrome request: {e}")))?;
             if payload.len() > MAX_CHROME_FRAME {
                 return Err(invalid("Chrome request too large.").with("execution_not_started", true));
@@ -205,8 +259,8 @@ impl ChromeBridge {
                 return Err(disconnected());
             }
             let (tx, rx) = oneshot::channel();
-            let deadline = Instant::now() + REPLY_WITHIN;
-            state.pending = Some(Pending { id: id.clone(), effect, deadline, reply: tx });
+            let deadline = Instant::now() + within;
+            state.pending = Some(Pending { id: id.clone(), dispatch, deadline, reply: tx });
             (rx, id, deadline)
         };
         match tokio::time::timeout_at(deadline, reply).await {
@@ -216,13 +270,14 @@ impl ChromeBridge {
                 if state.pending.as_ref().is_some_and(|p| p.id == id) {
                     state.pending = None;
                 }
-                if effect {
+                if dispatch == Dispatch::Effect {
                     state.unsettled = true;
-                    Err(IbaraError::new("OUTCOME_UNKNOWN", "Chrome request timed out.", false).requires_reconciliation())
-                } else {
-                    Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Chrome request timed out.", true)
-                        .with("execution_not_started", true))
                 }
+                Err(if dispatch == Dispatch::Read {
+                    IbaraError::new("CAPABILITY_UNAVAILABLE", "Chrome request timed out.", true).with("execution_not_started", true)
+                } else {
+                    dispatch.unknown("Chrome request timed out.")
+                })
             }
         }
     }
@@ -277,14 +332,15 @@ impl ChromeBridge {
     }
 
     /// Wait (≤6.5 s) for an in-flight request; `CONTROL_UNSETTLED` if one is
-    /// still pending or an effect was never acknowledged.
+    /// still pending or an effect was never acknowledged. A cookie write or
+    /// removal in flight does not hold it up: its own caller gets its outcome.
     pub async fn cancel(&self) -> Result<()> {
         let end = Instant::now() + CANCEL_WAIT;
         loop {
             {
                 let mut state = lock(&self.state);
                 state.expire();
-                if state.pending.is_none() {
+                if state.pending.as_ref().is_none_or(|p| p.dispatch == Dispatch::Repeatable) {
                     if state.unsettled {
                         break;
                     }
@@ -328,29 +384,33 @@ fn settle_reply(state: &Mutex<State>, message: &Value) {
     let error = message.get("error").filter(|e| !e.is_null() && **e != Value::Bool(false));
     let result = if let Some(error) = error {
         let not_started = error.get("execution_not_started") == Some(&Value::Bool(true));
-        if pending.effect && !not_started {
-            s.unsettled = true;
-        }
-        Err(if not_started {
-            IbaraError::new("STALE_TARGET", "Chrome refused dispatch; observe again.", true).with("execution_not_started", true)
+        if not_started {
+            Err(IbaraError::new("STALE_TARGET", "Chrome refused dispatch; observe again.", true).with("execution_not_started", true))
         } else {
-            IbaraError::new("OUTCOME_UNKNOWN", "Chrome operation needs reconciliation.", false)
-                .requires_reconciliation()
-                .with("execution_not_started", false)
-        })
+            if pending.dispatch == Dispatch::Effect {
+                s.unsettled = true;
+            }
+            Err(pending.dispatch.unknown("Chrome operation needs reconciliation.").with("execution_not_started", false))
+        }
     } else if let Some(result) = message.get("result").filter(|r| r.is_object()) {
         Ok(result.clone())
     } else {
-        if pending.effect {
+        if pending.dispatch == Dispatch::Effect {
             s.unsettled = true;
         }
-        Err(IbaraError::new("OUTCOME_UNKNOWN", "Invalid Chrome reply.", false).requires_reconciliation())
+        Err(pending.dispatch.unknown("Invalid Chrome reply."))
     };
     drop(s);
     let _ = pending.reply.send(result);
 }
 
-async fn serve_peer(state: Arc<Mutex<State>>, stream: UnixStream, generation: u64, mut outgoing: mpsc::Receiver<Vec<u8>>) {
+async fn serve_peer(
+    state: Arc<Mutex<State>>,
+    stream: UnixStream,
+    generation: u64,
+    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    jobs: &'static [&'static str],
+) {
     let (mut reader, mut writer) = stream.into_split();
     let writing = tokio::spawn(async move {
         while let Some(frame) = outgoing.recv().await {
@@ -364,19 +424,34 @@ async fn serve_peer(state: Arc<Mutex<State>>, stream: UnixStream, generation: u6
         &hello,
         Ok(Ok(Some(frame))) if serde_json::from_slice::<Value>(frame).ok().and_then(|m| m.get("hello").and_then(Value::as_u64)) == Some(CHROME_PROTOCOL)
     );
+    let mut opening = None;
     if greeted {
-        {
-            let mut s = lock(&state);
-            if s.is_current(generation) {
-                s.ready = true;
+        // Any reply to `jobs` (an older extension refuses it) or 3 s of
+        // silence opens the bridge. The timer never interrupts a frame read.
+        let jobs_id = if jobs.is_empty() { None } else { send_jobs(&state, generation, jobs) };
+        match &jobs_id {
+            None => lock(&state).open(generation),
+            Some(_) => {
+                let state = state.clone();
+                opening = Some(tokio::spawn(async move {
+                    tokio::time::sleep(JOBS_WITHIN).await;
+                    lock(&state).open(generation);
+                }));
             }
         }
         while let Ok(Some(frame)) = read_frame(&mut reader).await {
             let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
                 break;
             };
+            if jobs_id.is_some() && message.get("id").and_then(Value::as_str) == jobs_id.as_deref() {
+                lock(&state).open(generation);
+                continue;
+            }
             settle_reply(&state, &message);
         }
+    }
+    if let Some(opening) = opening {
+        opening.abort();
     }
     // A peer dropped by `reconnect` is no longer current; a request in
     // flight then belongs to its successor.
@@ -388,21 +463,30 @@ async fn serve_peer(state: Arc<Mutex<State>>, stream: UnixStream, generation: u6
             s.peer = None;
             s.ready = false;
             let pending = s.pending.take();
-            if pending.as_ref().is_some_and(|p| p.effect) {
+            if pending.as_ref().is_some_and(|p| p.dispatch == Dispatch::Effect) {
                 s.unsettled = true;
             }
             pending
         }
     };
     if let Some(pending) = pending {
-        let error = if pending.effect {
-            IbaraError::new("OUTCOME_UNKNOWN", "Chrome disconnected during dispatch.", false).requires_reconciliation()
-        } else {
-            disconnected()
+        let error = match pending.dispatch {
+            Dispatch::Read => disconnected(),
+            dispatch => dispatch.unknown("Chrome disconnected during dispatch."),
         };
         let _ = pending.reply.send(Err(error));
     }
     writing.abort();
+}
+
+/// Send the `jobs` request to the peer of `generation`; its id, or `None`
+/// when it could not be queued.
+fn send_jobs(state: &Mutex<State>, generation: u64, jobs: &[&str]) -> Option<String> {
+    let id = crate::ids::id("chrome");
+    let message = json!({"id": id, "op": "jobs", "args": {"jobs": jobs}, "deadline": crate::ids::now_millis() + DEADLINE_AHEAD_MS});
+    let s = lock(state);
+    let (g, peer) = s.peer.as_ref()?;
+    (*g == generation && peer.try_send(framed(message.to_string().as_bytes())).is_ok()).then_some(id)
 }
 
 /// The origin Chrome passed: the argument after `chrome-host`, or argv[1]
@@ -492,6 +576,20 @@ pub async fn chrome_host_main() -> i32 {
     if !allowed {
         return 1;
     }
+    if let Ok(raw)=std::fs::read(install.join("browser/selection.json")) {
+        let Ok(selection)=serde_json::from_slice::<Value>(&raw) else {return 1;};
+        let Some(root)=selection["root"].as_str() else {return 1;};
+        if crate::logins::check_profile(Path::new(root)).is_err() {return 1;}
+        let parent=unsafe {libc::getppid()};
+        let expected=selection["executable"].as_str().map(PathBuf::from);
+        if std::fs::read_link(format!("/proc/{parent}/exe")).ok()!=expected {return 1;}
+        let Ok(cmd)=std::fs::read(format!("/proc/{parent}/cmdline")) else {return 1;};
+        let args:Vec<_>=cmd.split(|b|*b==0).filter_map(|b|std::str::from_utf8(b).ok()).collect();
+        for (i,arg) in args.iter().enumerate() {
+            let data=arg.strip_prefix("--user-data-dir=").or_else(||(*arg=="--user-data-dir").then(||args.get(i+1).copied()).flatten());
+            if data.is_some_and(|d|Path::new(d)!=Path::new(root)) || *arg=="--incognito" || arg.strip_prefix("--profile-directory=").is_some_and(|p|p!="Default") {return 1;}
+        }
+    }
     let runtime = std::env::var_os("IBARA_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| "/run/agent-computer".into());
     let Ok(socket) = UnixStream::connect(runtime.join("chrome.sock")).await else {
         return 1;
@@ -558,7 +656,7 @@ mod tests {
         let dir = std::env::temp_dir().join(crate::ids::id("ibara-chrome-test"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chrome.sock");
-        let bridge = ChromeBridge::listen(&path).await.unwrap();
+        let bridge = ChromeBridge::listen(&path, &[]).await.unwrap();
         assert_eq!(bridge.call("tabs", json!({}), false).await.unwrap_err().code, "CAPABILITY_UNAVAILABLE");
 
         let mut ext = UnixStream::connect(&path).await.unwrap();
@@ -611,7 +709,7 @@ mod tests {
         assert_eq!(bridge.cancel().await.unwrap_err().code, "CONTROL_UNSETTLED");
         // Probing a live socket refuses a second listener (the probe itself
         // briefly occupies the single peer slot, so it runs last).
-        assert!(ChromeBridge::listen(&path).await.is_err());
+        assert!(ChromeBridge::listen(&path, &[]).await.is_err());
         bridge.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -621,7 +719,7 @@ mod tests {
         let dir = std::env::temp_dir().join(crate::ids::id("ibara-chrome-test"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chrome.sock");
-        let bridge = ChromeBridge::listen(&path).await.unwrap();
+        let bridge = ChromeBridge::listen(&path, &[]).await.unwrap();
         let mut first = UnixStream::connect(&path).await.unwrap();
         write_json(&mut first, json!({"hello": 1})).await;
         while !bridge.connected() {
@@ -651,6 +749,87 @@ mod tests {
         assert!(!bridge.reconnect(Duration::from_millis(300)).await);
         assert!(!bridge.connected());
         drop(second);
+        bridge.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Catches: `jobs` not sent, sent with the wrong list, or sent before the
+    // hello; the bridge counting as connected before the extension answered
+    // it; an older extension's refusal of `jobs` keeping the bridge closed;
+    // the `jobs` reply being mistaken for, or blocking, the next request's.
+    #[tokio::test]
+    async fn jobs_are_named_after_the_hello_and_any_reply_opens_the_bridge() {
+        let dir = std::env::temp_dir().join(crate::ids::id("ibara-chrome-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrome.sock");
+        let bridge = ChromeBridge::listen(&path, &["pages", "receive"]).await.unwrap();
+        let mut ext = UnixStream::connect(&path).await.unwrap();
+        write_json(&mut ext, json!({"hello": 1})).await;
+        let request = read_json(&mut ext).await;
+        assert_eq!(request["op"], "jobs");
+        assert_eq!(request["args"], json!({"jobs": ["pages", "receive"]}));
+        assert!(request["deadline"].is_i64());
+        assert!(!bridge.connected(), "not connected before the extension answers");
+        // An older extension refuses the operation it does not know.
+        write_json(&mut ext, json!({"id": request["id"], "error": {"execution_not_started": true}})).await;
+        for _ in 0..100 {
+            if bridge.connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(bridge.connected());
+        let call = bridge.call("tabs", json!({}), false);
+        let ext_side = async {
+            let request = read_json(&mut ext).await;
+            assert_eq!(request["op"], "tabs");
+            write_json(&mut ext, json!({"id": request["id"], "result": {"tabs": []}})).await;
+        };
+        let (result, ()) = tokio::join!(call, ext_side);
+        assert_eq!(result.unwrap()["tabs"], json!([]));
+        drop(ext);
+        bridge.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Catches: a failed cookie write fencing the page reader (the bridge left
+    // unsettled until ibarad restarts); a cookie failure reported as done or
+    // as not started; cookie requests keeping the short 4 s deadline; cancel
+    // refusing after a cookie failure.
+    #[tokio::test]
+    async fn a_failed_cookie_write_is_unknown_and_pages_still_work() {
+        let dir = std::env::temp_dir().join(crate::ids::id("ibara-chrome-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrome.sock");
+        let bridge = ChromeBridge::listen(&path, &[]).await.unwrap();
+        let mut ext = UnixStream::connect(&path).await.unwrap();
+        write_json(&mut ext, json!({"hello": 1})).await;
+        while !bridge.connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let call = bridge.call("cookies_write", json!({"site": "example.test", "cookies": []}), true);
+        let ext_side = async {
+            let request = read_json(&mut ext).await;
+            let ahead = request["deadline"].as_i64().unwrap() - crate::ids::now_millis();
+            assert!(ahead > 10_000, "cookie requests get the longer deadline: {ahead} ms");
+            write_json(&mut ext, json!({"id": request["id"], "error": {"execution_not_started": false}})).await;
+        };
+        let (result, ()) = tokio::join!(call, ext_side);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "OUTCOME_UNKNOWN");
+        assert_eq!(error.message, LOGIN_UNKNOWN);
+        assert!(bridge.connected(), "the page reader stays usable");
+        bridge.cancel().await.unwrap();
+
+        let call = bridge.call("tabs", json!({}), false);
+        let ext_side = async {
+            let request = read_json(&mut ext).await;
+            write_json(&mut ext, json!({"id": request["id"], "result": {"tabs": []}})).await;
+        };
+        let (result, ()) = tokio::join!(call, ext_side);
+        assert_eq!(result.unwrap()["tabs"], json!([]));
+        drop(ext);
         bridge.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

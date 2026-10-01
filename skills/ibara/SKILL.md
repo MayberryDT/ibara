@@ -51,6 +51,20 @@ A task holds the computer: your person sees it in their console, and no other ag
 - **Continuation notes:** use `computer_checkpoint` with `note` before a long pause, so you or another session can continue.
 - **`stop_asking: true`** only when your person told you that you don't need to ask before you send, spend or delete. ibara asks them once.
 
+## Signing in to websites
+
+Your person can share their logins with you, one site at a time. You never see a password or a login; ibara copies it from their browser into the computer's browser.
+
+- **Name the sites you know you'll need when you begin:** `computer_begin({…, logins: ["irs.gov", "id.me"]})`. Your person answers once for all of them, and you can start working meanwhile. The reply gives each site's `state`. For `rejected_before`, plan for your person to sign in with Take Control.
+- **At a sign-in page, use `browser_act` with `{kind: "sign_in"}`** before anything else. It covers the site the tab shows and the site it came from. The reply's `page` is `left_sign_in` when the page is past its sign-in form. `unknown` is not success, so check the page.
+- **Every other outcome has a reason code with a `next`.** Follow it:
+  - `waiting_for_person`, `waiting_for_browser` or `waiting_for_sharing_computer`: wait as `next` says, then resend the same request.
+  - `declined` or `denied`: don't ask again for that site. Take another route, or ask with `computer_checkpoint`.
+  - `site_rejected`: the site didn't accept the shared login. Ask your person to sign in with Take Control.
+- **Each site gets one try per task.**
+- **Never ask your person for a password or a code in chat.** A code the site texts or emails goes through `computer_checkpoint` with `ask`.
+- `computer_status` shows each computer's logins ("logins from Laptop · 23 sites allowed"). Prefer a computer that already has the sites you need.
+
 ## When something goes wrong
 
 - **Every error names the cause and gives `next`.** Do what `next` says.

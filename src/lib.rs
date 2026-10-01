@@ -17,6 +17,7 @@ pub mod storage;
 pub mod store;
 
 pub mod access;
+pub mod logins;
 
 pub mod access_system;
 pub mod power_system;

@@ -331,8 +331,9 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         return Ok(ctx.ready(data));
     }
     if op == "handback" {
-        let settled = matches!(reply.get("owner").and_then(Value::as_str), Some("none" | "human"))
-            && reply.get("agent_resumed") == Some(&json!(false))
+        let owner = reply.get("owner").and_then(Value::as_str).unwrap_or("");
+        let settled = expected_owner(owner) && !owner.starts_with("operator:")
+            && reply.get("agent_resumed").and_then(Value::as_bool).is_some_and(|resumed| !resumed || owner.starts_with("agent:"))
             && js::truthy(reply.get("ownership_revision"));
         if !settled {
             return uncertain("Handback did not prove settled ownership; inspect the target.");

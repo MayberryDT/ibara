@@ -150,6 +150,8 @@ impl Controller {
         {
             log_event("watchdog_failed", &e.to_string());
         }
+        // A login removed while the browser was closed goes once it connects.
+        self.login_deferred_removals().await;
     }
 
     /// A person's repair (`needs_person.fix`), now: `fixed`, `still_broken`

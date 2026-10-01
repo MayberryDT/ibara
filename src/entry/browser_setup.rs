@@ -21,6 +21,12 @@
 //! what setup wrote outside the install root: both policies and both system
 //! host manifests, so every profile drops the extension and no browser starts
 //! the host again. `--delete-key` also removes the key and the build record.
+//! `--remove --browser B <desktop user>` undoes one browser's setup for that
+//! account (sharing turned off).
+//!
+//! With `--operator` (the sharing computer) the native host runs the desktop
+//! account's `~/.local/bin/ibara`, else the packaged `/usr/lib/ibara/bin/ibara`.
+//! Every run prints its report as one JSON line.
 
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -47,10 +53,13 @@ pub fn main(args: Vec<OsString>) -> i32 {
     let text: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
     let result = match text.as_slice() {
         [Some("--remove")] => as_root().and_then(|()| remove(Path::new("/"), false)),
+        [Some("--remove"), Some("--browser"), Some(browser), Some(user)] => as_root().and_then(|()| remove_selected(browser,user)),
         [Some("--remove"), Some("--delete-key")] => as_root().and_then(|()| remove(Path::new("/"), true)),
-        [first, _] if *first != Some("--remove") => setup(Path::new(&args[0]), &args[1].to_string_lossy()),
+        [first, _] if *first != Some("--remove") => setup(Path::new(&args[0]), &args[1].to_string_lossy(), None, false),
+        [_, _, Some("--browser"), Some(browser)] => setup(Path::new(&args[0]), &args[1].to_string_lossy(), Some(browser), false),
+        [_, _, Some("--browser"), Some(browser), Some("--operator")] => setup(Path::new(&args[0]), &args[1].to_string_lossy(), Some(browser), true),
         _ => {
-            eprintln!("Usage: ibara browser-setup <extension dir> <desktop user>\n       ibara browser-setup --remove [--delete-key]");
+            eprintln!("Usage: ibara browser-setup <extension dir> <desktop user> [--browser chromium|chrome|brave|brave-origin] [--operator]\n       ibara browser-setup --remove [--delete-key]\n       ibara browser-setup --remove --browser chromium|chrome|brave|brave-origin <desktop user>");
             return 64;
         }
     };
@@ -84,6 +93,14 @@ fn remove(root: &Path, delete_key: bool) -> Result<serde_json::Value, String> {
     let at = |path: &str| root.join(path.trim_start_matches('/'));
     let mut files: Vec<PathBuf> =
         BROWSERS.iter().flat_map(|(policy_dir, host_dir, _)| [at(policy_dir).join(POLICY_FILE), at(host_dir).join(format!("{HOST_NAME}.json"))]).collect();
+    files.push(at("/etc/brave/policies/managed").join(POLICY_FILE));
+    if let Ok(passwd)=std::fs::read_to_string(at("/etc/passwd")) {
+        for fields in passwd.lines().map(|l|l.split(':').collect::<Vec<_>>()).filter(|f|f.len()>=7) {
+            for browser in ["brave","brave-origin"] {
+                if let Ok(profile)=crate::logins::profile_root(browser,&at(fields[5])) {files.push(profile.join("NativeMessagingHosts").join(format!("{HOST_NAME}.json")));}
+            }
+        }
+    }
     if delete_key {
         files.extend([at(KEY), at(STATE)]);
     }
@@ -106,9 +123,41 @@ pub fn reader_installed(root: &Path) -> bool {
     BROWSERS.iter().any(|(policy_dir, host_dir, _)| at(policy_dir).join(POLICY_FILE).is_file() && at(host_dir).join(format!("{HOST_NAME}.json")).is_file())
 }
 
-fn setup(source: &Path, desktop: &str) -> Result<serde_json::Value, String> {
+fn remove_selected(browser: &str, user: &str) -> Result<serde_json::Value,String> {
+    let home=home_of(user)?;
+    let (policy,host)=match browser {
+        "brave"|"brave-origin" => ("/etc/brave/policies/managed",None),
+        "chromium" => (BROWSERS[0].0,Some(BROWSERS[0].1)),
+        "chrome" => (BROWSERS[1].0,Some(BROWSERS[1].1)),
+        _=>return Err("Choose a supported browser.".into()),
+    };
+    let mut files=vec![Path::new(policy).join(POLICY_FILE),crate::logins::profile_root(browser,&home).map_err(|e|e.message)?.join("NativeMessagingHosts").join(format!("{HOST_NAME}.json"))];
+    if let Some(host)=host {files.push(Path::new(host).join(format!("{HOST_NAME}.json")));}
+    let mut removed=Vec::new();
+    for file in files {match std::fs::remove_file(&file) {Ok(())=>removed.push(file.display().to_string()),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string())}}
+    Ok(serde_json::json!({"removed":removed}))
+}
+
+fn setup(source: &Path, desktop: &str, selected: Option<&str>, operator: bool) -> Result<serde_json::Value, String> {
     as_root()?;
     let home = home_of(desktop)?;
+    // Validate the choice before making any files. A chosen browser never
+    // installs policy into another browser on this computer.
+    let browsers: Vec<(&str, &str, &str)> = match selected {
+        None => BROWSERS.to_vec(),
+        Some("chromium") => vec![BROWSERS[0]],
+        Some("chrome") => vec![BROWSERS[1]],
+        Some("brave") => vec![("/etc/brave/policies/managed", "", ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts")],
+        Some("brave-origin") => vec![("/etc/brave/policies/managed", "", ".config/BraveSoftware/Brave-Origin/NativeMessagingHosts")],
+        _ => return Err("Choose chromium, chrome, brave or brave-origin.".into()),
+    };
+    if operator && selected.is_none() { return Err("An operator must choose one browser.".into()); }
+    let selected_root=if operator {
+        let root=crate::logins::profile_root(selected.unwrap(),&home).map_err(|e|e.message)?;
+        crate::logins::check_profile(&root).map_err(|e|e.message)?;
+        Some(root)
+    } else {None};
+    std::fs::create_dir_all("/etc/agent-computer").map_err(|e| e.to_string())?;
     let public = public_key()?;
     let id = extension_id(&public);
     let files: Vec<(&str, Vec<u8>)> =
@@ -167,21 +216,48 @@ fn setup(source: &Path, desktop: &str) -> Result<serde_json::Value, String> {
         "ExtensionInstallForcelist": [format!("{id};{update_url}")],
         "ExtensionInstallBlocklist": [HAND_LOADED],
     });
+    if let Some(root)=selected_root {
+        let binary=match selected.unwrap() {
+            "brave-origin"=>"/opt/brave-origin-bin/brave", "brave"=>"/opt/brave-bin/brave",
+            "chromium"=>"/usr/lib/chromium/chromium", "chrome"=>"/opt/google/chrome/chrome", _=>unreachable!(),
+        };
+        let executable=std::fs::canonicalize(binary).map_err(|_|"The selected browser executable is unavailable.")?;
+        write_file(&package.join("selection.json"),&pretty(&serde_json::json!({"browser":selected,"profile":"Default","root":root,"executable":executable}))?,0o644)?;
+    }
+    let host_program = if operator {
+        let uid = uid_of(desktop)?;
+        let program = package.join("ibara-chrome-native-operator");
+        // The desktop account's own install, else the packaged one.
+        let binary = Some(home.join(".local/bin/ibara"))
+            .filter(|b| b.is_file())
+            .unwrap_or_else(|| Path::new(crate::install::LIB).join("bin/ibara"));
+        if !binary.is_file() { return Err("Install ibara for this user before setting up their browser.".into()); }
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let script = format!("#!/bin/sh\nexport IBARA_INSTALL_ROOT=/opt/agent-computer\nexport IBARA_RUNTIME_DIR=/run/user/{uid}/ibara\nexec {} chrome-host \"$@\"\n", quote(&binary.to_string_lossy()));
+        write_file(&program, script.as_bytes(), 0o755)?;
+        program.display().to_string()
+    } else { HOST_PROGRAM.to_string() };
     let host = serde_json::json!({
         "name": HOST_NAME,
-        "description": "ibara page reader",
-        "path": HOST_PROGRAM,
+        "description": "ibara pages and shared logins",
+        "path": host_program,
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{id}/")],
     });
     // `ibara chrome-host` accepts only the origins listed here.
     write_file(&package.join("native-host.json"), &pretty(&host)?, 0o644)?;
     let mut removed = Vec::new();
-    for (policy_dir, host_dir, user_dir) in BROWSERS {
+    for (policy_dir, host_dir, user_dir) in browsers {
         write_file(&Path::new(policy_dir).join(POLICY_FILE), &pretty(&policy)?, 0o644)?;
-        write_file(&Path::new(host_dir).join(format!("{HOST_NAME}.json")), &pretty(&host)?, 0o644)?;
         let user_copy = home.join(user_dir).join(format!("{HOST_NAME}.json"));
-        if user_copy.exists() {
+        if host_dir.is_empty() {
+            // Brave Origin has no system native-host directory. Its existing
+            // per-user directory also holds unrelated hosts; preserve them.
+            write_file(&user_copy, &pretty(&host)?, 0o644)?;
+        } else {
+            write_file(&Path::new(host_dir).join(format!("{HOST_NAME}.json")), &pretty(&host)?, 0o644)?;
+        }
+        if !host_dir.is_empty() && user_copy.exists() {
             std::fs::remove_file(&user_copy).map_err(|e| format!("{}: {e}", user_copy.display()))?;
             removed.push(user_copy.display().to_string());
         }
@@ -192,7 +268,13 @@ fn setup(source: &Path, desktop: &str) -> Result<serde_json::Value, String> {
         std::fs::remove_dir_all(legacy).map_err(|e| format!("{}: {e}", legacy.display()))?;
         removed.push(legacy.display().to_string());
     }
-    Ok(serde_json::json!({ "extension_id": id, "version": version, "repacked": changed, "removed": removed }))
+    Ok(serde_json::json!({ "extension_id": id, "version": version, "repacked": changed, "removed": removed, "browser": selected, "operator": operator }))
+}
+
+fn uid_of(user: &str) -> Result<u32, String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").map_err(|e| e.to_string())?;
+    passwd.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f| f.len() >= 7 && f[0] == user)
+        .and_then(|f| f[2].parse().ok()).ok_or_else(|| format!("no such user: {user}"))
 }
 
 fn home_of(user: &str) -> Result<PathBuf, String> {

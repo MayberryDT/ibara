@@ -31,6 +31,7 @@ libc = "0.2"
 png = "0.18"
 parking_lot = "0.12"
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
+psl = "2"
 
 [profile.release]
 opt-level = "s"

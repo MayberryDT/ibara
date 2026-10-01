@@ -86,7 +86,9 @@ fn an_agent_back_after_a_person_took_control_is_told_the_person_has_it() {
         let back = call_as(c, "connection_b", "codex", "computer_checkpoint", checkpoint(&task)).await;
         assert_eq!(code(&back), "HUMAN_CONTROL", "{back}");
         assert!(situation(&back).contains("a person controls"), "{back}");
-        assert!(c.journal.get_active_lease().unwrap().is_none(), "nothing resumed under the person");
+        let retained = c.journal.get_active_lease().unwrap().unwrap();
+        assert_eq!(retained.task_ref, task, "the paused task is retained");
+        assert_eq!(retained.connection_id, "connection_a", "another connection did not take it under the person");
     });
 }
 

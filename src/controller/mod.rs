@@ -38,11 +38,13 @@ mod situation;
 pub mod stream;
 mod watchdog;
 mod windows;
+mod logins;
 
 #[cfg(test)]
 mod tests;
 
 pub use everyday::{EVERYDAY_OPS, SLOW_OPS};
+pub(crate) use everyday::{power_request, power_socket_exists};
 pub use live::LiveConfig;
 pub use operator::SLOW_FILE_OPS;
 pub use ports::*;
@@ -337,6 +339,10 @@ pub struct Controller {
     /// The live title of the window a `window_close` or `window_move` names,
     /// read just before its access gate (see `windows::note_window_title`).
     window_title: RefCell<Option<(String, String)>>,
+    /// When the sharing computer last asked for login requests
+    /// (`login_pending`); kept in memory only, so a restart reads as absent
+    /// until it asks again (every 2 s).
+    login_seen: Cell<i64>,
 }
 
 impl Controller {
@@ -420,6 +426,7 @@ impl Controller {
             wake_cache: RefCell::new(None),
             disk_cache: RefCell::new(None),
             virtual_size_applied: RefCell::new(None),
+            login_seen: Cell::new(0),
             previews: RefCell::new(HashMap::new()),
             window_title: RefCell::new(None),
         })

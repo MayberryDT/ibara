@@ -54,7 +54,9 @@ pub struct AttentionItem {
     pub att_ref: String,
     pub task_ref: String,
     pub principal: String,
-    /// `question` (from `computer_checkpoint({ask})`) or `approval` (a held step).
+    /// `question` (from `computer_checkpoint({ask})`), `approval` (a held
+    /// step) or `login` (an agent asks for the person's logins; answered only
+    /// by the sharing computer).
     pub kind: String,
     /// The held step, when the item is an approval for an operation.
     pub operation_ref: Option<String>,
@@ -81,7 +83,7 @@ pub struct AttentionItem {
 pub struct NewAttention<'a> {
     pub task_ref: &'a str,
     pub principal: &'a str,
-    /// `question` or `approval`.
+    /// `question`, `approval` or `login`.
     pub kind: &'a str,
     pub operation_ref: Option<&'a str>,
     pub generation: Option<&'a str>,
@@ -273,8 +275,8 @@ impl Journal {
         if input.question.trim().is_empty() {
             return Err(invalid("An attention item needs a question."));
         }
-        if input.kind != "question" && input.kind != "approval" {
-            return Err(invalid("An attention item is a question or an approval."));
+        if !matches!(input.kind, "question" | "approval" | "login") {
+            return Err(invalid("An attention item is a question, an approval or a login request."));
         }
         if input.options.len() > MAX_OPTIONS {
             return Err(invalid(format!("At most {MAX_OPTIONS} options are allowed.")));

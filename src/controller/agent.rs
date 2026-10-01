@@ -353,6 +353,11 @@ impl Controller {
             "browser_act" => {
                 let input: BrowserActInput = parse_input(tool, args)?;
                 let (task_ref, request_id) = (input.task_ref.to_string(), input.request_id.to_string());
+                if let BrowserAction::SignIn(sign_in) = &input.action {
+                    self.require_live_lease(principal, connection_id, &task_ref)?;
+                    let work = self.sign_in_call(principal, connection_id, &task_ref, &request_id, args, &sign_in.sites, gone);
+                    return self.once(principal, &task_ref, &request_id, args, work).await;
+                }
                 let steps = vec![StepSpec::Browser { action: input.action, expect: input.expect, effect: input.effect }];
                 self.require_live_lease(principal, connection_id, &task_ref)?;
                 self.once(principal, &task_ref, &request_id, args, self.act(principal, connection_id, tool, &task_ref, &request_id, args, steps, gone)).await
@@ -406,6 +411,57 @@ impl Controller {
         self.in_flight.borrow_mut().insert(key.clone(), source);
         let _flight = InFlight { map: &self.in_flight, key };
         self.enqueue(work).await
+    }
+
+    /// `browser_act` `sign_in` (`logins.rs`): planned once per request, then
+    /// answered from its login requests each time the same request is sent,
+    /// until it settles; a settled result is replayed as it is.
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_in_call(&self, principal: &str, connection_id: &str, task_ref: &str, request_id: &str, args: &Value, sites: &[String], gone: &Cancel) -> Result<Reply> {
+        let lease = self.require_live_lease(principal, connection_id, task_ref)?;
+        let mut task = self.task(task_ref)?;
+        self.charge(&mut task, Charge::Action)?;
+        let ctx = CallCtx { principal, task_ref, request_id, session: connection_id, tool: "browser_act", lease: &lease, gone };
+        let op = match self.remember(&ctx, request_id, &fingerprint_source(args), "change")? {
+            Remembered::Fresh(op) => op,
+            Remembered::Replay(op) | Remembered::FailedBeginReplay { operation: op, .. } => {
+                let settled = op.receipt.get("call").is_some_and(|c| c.get("status").and_then(Value::as_str) != Some("pending"));
+                if settled {
+                    return self.stored_call(&op, task_ref).unwrap_or_else(|| Err(crate::error::internal("stored sign_in without a result")));
+                }
+                if op.receipt.get("sign_in").is_none() {
+                    return Err(fail("OUTCOME_UNKNOWN", "This sign_in was interrupted before it was planned; send sign_in again with a new request_id.", false));
+                }
+                op
+            }
+        };
+        let mut receipt = op.receipt.as_object().cloned().unwrap_or_default();
+        let plan = match receipt.get("sign_in").cloned() {
+            Some(plan) => plan,
+            None => {
+                let planned = self.sign_in_plan(&task, &lease, &op.operation_ref, sites).await;
+                match planned {
+                    Ok(plan) => {
+                        receipt.insert("operation_ref".into(), json!(op.operation_ref));
+                        receipt.insert("sign_in".into(), plan.clone());
+                        self.save_receipt(&op.operation_ref, &receipt, Some(false))?;
+                        plan
+                    }
+                    Err(e) => {
+                        let outcome = Err(e);
+                        self.store_call(&op.operation_ref, &mut receipt, &outcome, None)?;
+                        return outcome;
+                    }
+                }
+            }
+        };
+        let outcome = self.sign_in_outcome(&task, &lease, &plan, gone).await;
+        let settled = matches!(&outcome, Ok(reply) if reply.status != Status::Pending) || outcome.is_err();
+        if settled {
+            receipt.insert("execution".into(), json!("completed"));
+        }
+        self.store_call(&op.operation_ref, &mut receipt, &outcome, None)?;
+        outcome
     }
 
     // ---- receipts and operations ----------------------------------------------------
@@ -586,6 +642,10 @@ impl Controller {
         if self.viewer_state.borrow().owner.is_some() {
             return Some("a person".into());
         }
+        let control = self.journal.get_control().ok()?;
+        if control.human_control || control.paused {
+            return Some("a person (paused)".into());
+        }
         match self.journal.get_active_lease().ok().flatten() {
             Some(l) if self.holds_lease(&l, principal, connection_id, agent) => Some(format!("you ({agent})")),
             Some(_) => Some("another agent".into()),
@@ -624,6 +684,7 @@ impl Controller {
         if browser_status == "not_open" {
             line.push_str("; no browser open yet (its page reader connects when one opens)");
         }
+        line.push_str(&format!("; {}", self.login_phrase()));
         if let Some(p) = self.desktop.memory_pressure() {
             line.push_str(&format!("; {p}"));
         }
@@ -678,7 +739,7 @@ impl Controller {
                         reference: reference.clone(),
                         kind: "computer".into(),
                         state: s.state.clone(),
-                        summary: Some(format!("{} · {} · {}", s.name, s.holder.unwrap_or_else(|| "nobody controls".into()), s.capabilities)),
+                        summary: Some(format!("{} · {} · {}{}", s.name, s.holder.unwrap_or_else(|| "nobody controls".into()), s.capabilities, self.login_sites())),
                         parent: None,
                         children,
                         next: vec![format!("computer_begin({{computer: \"{}\", goal, request_id}})", self.computer_name())],
@@ -816,6 +877,10 @@ impl Controller {
             op.effect_class,
             r.get("summary").and_then(Value::as_str).map(|s| squash(s, 120)).unwrap_or_default()
         );
+        let summary = match r.get("job_state").and_then(Value::as_str) {
+            Some(state) => format!("{summary} · job {state}"),
+            None => summary,
+        };
         Ok((
             RefStatus {
                 reference: reference.to_string(),
@@ -1225,6 +1290,14 @@ impl Controller {
                 detail: None,
             })
             .collect();
+        let logins = if input.logins.is_empty() {
+            Vec::new()
+        } else {
+            self.begin_logins(&task, &lease, &input.logins).unwrap_or_else(|e| {
+                super::log_event("login_request_failed", &e.to_string());
+                Vec::new()
+            })
+        };
         let result = BeginResult {
             task_ref: task_ref.clone(),
             computer: ComputerId { id: self.computer_id.clone(), name: self.computer_name() },
@@ -1233,6 +1306,7 @@ impl Controller {
             checks,
             frame,
             notes,
+            logins,
         };
         Ok(Reply::ok(result, Some(&task_ref)))
     }
@@ -1964,6 +2038,7 @@ impl Controller {
                 (None, BrowserOp::Key(k.keys.clone()), format!("press {}", clip(&k.keys, 40)), format!("press {}", approval::key_words(&k.keys)), "browser_key")
             }
             BrowserAction::WaitFor(_) => unreachable!("handled above"),
+            BrowserAction::SignIn(_) => unreachable!("sign_in never becomes a step"),
         };
         Ok(Resolved { plan: Planned::Browser(Box::new(BrowserStep { window, target, op })), describe, said, class, route })
     }
@@ -2514,6 +2589,9 @@ impl Controller {
                 receipt.insert("summary".into(), json!(clip(describe, 2000)));
                 if let Some(job_ref) = value.get("job_ref").and_then(Value::as_str) {
                     receipt.insert("job_ref".into(), json!(job_ref));
+                    if let Some(state) = value.get("state").and_then(Value::as_str) {
+                        receipt.insert("job_state".into(), json!(state));
+                    }
                 }
                 self.save_receipt(&op_ref, &receipt, Some(true))?;
                 self.timeline("step", Some(ctx.task_ref), ctx.principal, &clip(describe, 200), json!({ "op": op_ref, "effect_class": class }));
@@ -2791,9 +2869,12 @@ impl Controller {
     /// `computer_wait`: returns when the thing is met, at the deadline, or when
     /// the caller goes away (`pending`, like the deadline).
     async fn wait(&self, principal: &str, connection_id: &str, input: WaitInput, gone: &Cancel) -> Result<Reply> {
-        let lease = self.require_live_lease(principal, connection_id, input.task_ref.as_str())?;
+        let attention_wait = matches!(&input.wait_for, WaitFor::Attention(_));
+        let lease = self.require_task_lease(principal, connection_id, input.task_ref.as_str(), attention_wait)?;
         let mut task = self.task(&lease.task_ref)?;
-        self.charge(&mut task, Charge::Control)?;
+        if !self.journal.get_control()?.human_control {
+            self.charge(&mut task, Charge::Control)?;
+        }
         let deadline = Duration::from_millis(input.deadline_ms.min(600_000));
         let started = Instant::now();
         let result = match &input.wait_for {
@@ -2829,7 +2910,7 @@ impl Controller {
                         };
                     }
                     pause(Duration::from_millis(250).min(deadline.saturating_sub(started.elapsed())), gone).await;
-                    self.assert_authority(&lease)?;
+                    self.require_task_lease(principal, connection_id, &task.task_ref, true)?;
                 }
             }
             WaitFor::Expect(expect) => {
@@ -2880,7 +2961,7 @@ impl Controller {
             updated.insert("verification".into(), json!("unknown"));
             updated.insert("effect".into(), json!("unknown"));
         }
-        updated.insert("summary".into(), json!(format!("Job {job_ref} is {state}.")));
+        updated.insert("job_state".into(), json!(state));
         if let Some(call) = updated.get_mut("call").and_then(Value::as_object_mut) {
             call.insert("status".into(), json!("ok"));
             if let Some(result) = call.get_mut("result").and_then(Value::as_object_mut) {
@@ -2966,7 +3047,8 @@ impl Controller {
             return Err(refused);
         }
         let over = matches!(self.task(task_ref)?.state.as_str(), "completed" | "partial" | "cancelled" | "blocked");
-        let held_elsewhere = self.journal.get_active_lease()?.is_some_and(|l| l.task_ref == task_ref);
+        let held_elsewhere = self.journal.get_active_lease()?.is_some_and(|l| l.task_ref == task_ref
+            && (l.principal != principal || l.connection_id != connection_id));
         if over || held_elsewhere {
             return Err(refused);
         }
@@ -3067,6 +3149,12 @@ impl Controller {
         self.save_receipt(&op.operation_ref, &receipt, Some(true))?;
         if let Some(lease) = &lease {
             self.release_lease(Some(lease.clone()), Release::Finished, true).await?;
+        } else if self.journal.get_active_lease()?.is_some_and(|l| l.task_ref == task_ref
+            && l.principal == principal && l.connection_id == connection_id)
+        {
+            // The paused task can finish without taking the screen back or
+            // releasing input held by its person. Its work already settled.
+            self.journal.revoke_active_leases("finished", self.now_ms())?;
         }
         let control = self.journal.get_control()?;
         let complete = !control.unsettled

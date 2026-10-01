@@ -1,5 +1,5 @@
 [Unit]
-Description=ibara restart, shut down, sleep or update request
+Description=ibara restart, shut down, sleep, update or browser setup request
 Requires=ibara-power.socket
 After=ibara-power.socket
 CollectMode=inactive-or-failed
@@ -9,10 +9,15 @@ Type=exec
 User=root
 Group=root
 # One JSON request per connection: disk, restart, shutdown, sleep,
-# update_ibara or update_omarchy. The reply is sent before systemctl runs; an
-# update runs as its own unit (ibara-update.service or
-# ibara-omarchy-update.service), started before the reply.
+# update_ibara, update_omarchy, browser_setup or browser_remove. The reply is
+# sent before systemctl runs; an update runs as its own unit
+# (ibara-update.service or ibara-omarchy-update.service), started before the
+# reply. browser_setup and browser_remove run the ibara program below with
+# `browser-setup` for the account that opened the socket (Default profile
+# only) and relay its report.
 ExecStart=/usr/bin/ibara power-system
+Environment=IBARA_POWER_IBARA=/usr/lib/ibara/bin/ibara
+Environment=IBARA_POWER_EXTENSION_DIR=/usr/lib/ibara/chrome-extension
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal

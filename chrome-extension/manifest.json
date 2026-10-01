@@ -2,9 +2,9 @@
   "manifest_version": 3,
   "name": "ibara",
   "version": "1.0.0.0",
-  "minimum_chrome_version": "110",
-  "description": "Lets agents on this computer read pages through ibara. Installed by ibara; it never clicks or types.",
-  "permissions": ["nativeMessaging", "scripting", "tabs", "alarms"],
+  "minimum_chrome_version": "130",
+  "description": "Lets agents read pages and use logins you share through ibara. It never clicks or types.",
+  "permissions": ["nativeMessaging", "scripting", "tabs", "alarms", "cookies", "webNavigation"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "worker.js", "type": "module" },
   "incognito": "not_allowed"

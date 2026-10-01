@@ -26,6 +26,10 @@
 //! - `operations.session`: the agent session (connection id) that made the
 //!   request, so a request_id can be reused for a new request in a later
 //!   session. Rows from before it have none and count as another session's.
+//! - `attention_items.kind` also allows `login` (an agent's request for the
+//!   person's logins). SQLite cannot change a CHECK in place, so the table is
+//!   rebuilt once with the same columns and rows; an older build reads the
+//!   rows as they are and never writes that kind.
 //!
 //! Well-known agents' short names (`codex@vesper`, formerly
 //! `codex-mcp-client@vesper`) need no version either: at every open, what an
@@ -158,6 +162,11 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
     }
     if !columns(&tx, "operations")?.iter().any(|c| c == "session") {
         tx.execute_batch("ALTER TABLE operations ADD COLUMN session TEXT")?;
+    }
+    let attention_sql: String =
+        tx.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attention_items'", [], |r| r.get(0))?;
+    if !attention_sql.contains("'login'") {
+        tx.execute_batch(ATTENTION_WITH_LOGIN)?;
     }
     crate::access::rename_agents(&tx)?;
     if from < CORE_SCHEMA_VERSION {
@@ -486,7 +495,7 @@ const V3_DDL: &str = r#"
         att_ref TEXT PRIMARY KEY,
         task_ref TEXT NOT NULL,
         principal TEXT NOT NULL,
-        kind TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question','approval')),
+        kind TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question','approval','login')),
         operation_ref TEXT,
         generation TEXT,
         question TEXT NOT NULL,
@@ -510,6 +519,32 @@ const V3_DDL: &str = r#"
         UNIQUE(app, version, surface_signature, fact_kind)
       );
       CREATE INDEX IF NOT EXISTS app_notes_updated ON app_notes(updated_at);
+    "#;
+
+/// `attention_items` rebuilt so its kind may be `login`: the same columns in
+/// the same order (`details` last, as `ALTER TABLE` added it) and every row.
+const ATTENTION_WITH_LOGIN: &str = r#"
+      CREATE TABLE attention_items_login (
+        att_ref TEXT PRIMARY KEY,
+        task_ref TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question','approval','login')),
+        operation_ref TEXT,
+        generation TEXT,
+        question TEXT NOT NULL,
+        options TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL CHECK (state IN ('open','answered','expired')),
+        answer TEXT,
+        answered_by TEXT,
+        created_at TEXT NOT NULL,
+        answered_at TEXT,
+        details TEXT
+      );
+      INSERT INTO attention_items_login(att_ref, task_ref, principal, kind, operation_ref, generation, question, options, state, answer, answered_by, created_at, answered_at, details)
+        SELECT att_ref, task_ref, principal, kind, operation_ref, generation, question, options, state, answer, answered_by, created_at, answered_at, details FROM attention_items;
+      DROP TABLE attention_items;
+      ALTER TABLE attention_items_login RENAME TO attention_items;
+      CREATE INDEX IF NOT EXISTS attention_items_open ON attention_items(state, task_ref);
     "#;
 
 /// Core schema 6: the windows each task opened.

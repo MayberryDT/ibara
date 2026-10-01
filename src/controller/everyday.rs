@@ -65,9 +65,24 @@ pub(super) fn number(action: &Value, key: &str) -> Option<i64> {
     }
 }
 
+fn power_socket() -> PathBuf {
+    std::env::var_os("IBARA_POWER_SOCKET").map(PathBuf::from).unwrap_or_else(|| POWER_SOCKET.into())
+}
+
+/// Whether this computer's root power helper is installed (its socket exists).
+pub(crate) fn power_socket_exists() -> bool {
+    power_socket().exists()
+}
+
 /// One request to the root power helper: a JSON line out, a JSON line back.
 async fn power_helper(request: Value) -> Result<Value> {
-    let socket = std::env::var_os("IBARA_POWER_SOCKET").map(PathBuf::from).unwrap_or_else(|| POWER_SOCKET.into());
+    power_request(request, POWER_DEADLINE).await
+}
+
+/// One request to the root power helper within `deadline`; its reply when
+/// `ok`, else its message as `CAPABILITY_UNAVAILABLE`.
+pub(crate) async fn power_request(request: Value, deadline: Duration) -> Result<Value> {
+    let socket = power_socket();
     let missing = || {
         IbaraError::new(
             "CAPABILITY_UNAVAILABLE",
@@ -84,7 +99,7 @@ async fn power_helper(request: Value) -> Result<Value> {
         BufReader::new(stream.take(64 * 1024)).read_line(&mut reply).await.map_err(|_| missing())?;
         serde_json::from_str::<Value>(&reply).map_err(|_| missing())
     };
-    let reply = tokio::time::timeout(POWER_DEADLINE, exchange).await.map_err(|_| missing())??;
+    let reply = tokio::time::timeout(deadline, exchange).await.map_err(|_| missing())??;
     if reply["ok"] != json!(true) {
         let message = reply["error"]["message"].as_str().unwrap_or("The power helper refused.");
         return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", message, true));

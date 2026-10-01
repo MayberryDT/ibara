@@ -361,6 +361,25 @@ pub struct BrowserWaitFor {
     pub within_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignInAction {
+    /// Sites like irs.gov; omit for the tab's site and the site it came from.
+    #[serde(default, deserialize_with = "at_most::<_, _, 20>", skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 20))]
+    pub sites: Vec<String>,
+}
+
+/// Each name in `sites` is one registrable site (`irs.gov`), as ibara reads it.
+pub(crate) fn check_sites(field: &str, sites: &[String]) -> Result<(), FieldError> {
+    for (i, name) in sites.iter().enumerate() {
+        if crate::logins::site(name).is_err() {
+            return Err(FieldError::new(format!("{field}[{i}]"), "give a site name such as irs.gov, without a scheme or path"));
+        }
+    }
+    Ok(())
+}
+
 tagged_union! {
     /// An action in the signed-in browser. ibara clicks and types with real
     /// input; the extension only reads the page.
@@ -372,6 +391,8 @@ tagged_union! {
         "scroll" => Scroll(BrowserScroll),
         "key" => Key(KeyAction),
         "wait_for" => WaitFor(BrowserWaitFor),
+        /// At a sign-in page: ask for the person's login for these sites.
+        "sign_in" => SignIn(SignInAction),
     }
 }
 
@@ -382,6 +403,9 @@ impl Validate for BrowserAction {
             && w.text.is_none()
         {
             return Err(FieldError::new("target", "wait_for needs a target, a text, or both"));
+        }
+        if let BrowserAction::SignIn(s) = self {
+            check_sites("sites", &s.sites)?;
         }
         Ok(())
     }
@@ -459,7 +483,7 @@ pub struct CheckSpec {
     pub check: Option<Check>,
 }
 
-/// `computer_begin({computer, goal, checks?, deliver?, request_id})`
+/// `computer_begin({computer, goal, checks?, deliver?, logins?, request_id})`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BeginInput {
@@ -472,6 +496,10 @@ pub struct BeginInput {
     pub checks: Vec<CheckSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver: Option<Destination>,
+    /// Sites the task will sign in to, like irs.gov.
+    #[serde(default, deserialize_with = "at_most::<_, _, 20>", skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 20))]
+    pub logins: Vec<String>,
     pub request_id: Ref,
 }
 
@@ -485,7 +513,7 @@ impl Validate for BeginInput {
                 check.validate().map_err(|e| FieldError::new(format!("checks[{i}].check.{}", e.path), e.message))?;
             }
         }
-        Ok(())
+        check_sites("logins", &self.logins)
     }
 }
 

@@ -1,6 +1,7 @@
 //! `ibara power-system`: the root helper that lets the desktop user's `ibarad`
 //! restart, shut down or sleep this computer, update ibara or Omarchy on it,
-//! and report whether it will come back without a person typing a disk
+//! set up or remove ibara's extension in the desktop account's browser, and
+//! report whether it will come back without a person typing a disk
 //! passphrase.
 //!
 //! systemd runs it per connection (`ibara-power.socket`, `Accept=yes`, a socket
@@ -12,8 +13,13 @@
 //! running `ibara system omarchy-update`), because it outlives this helper and
 //! an ibara update restarts its socket; the reply says whether it started. One
 //! update of either kind at a time. Requests name an operation and at most a
-//! network adapter; programs and paths come from the unit's environment, never
-//! from the request, and nothing runs through a shell.
+//! network adapter or a browser; programs and paths come from the unit's
+//! environment, never from the request, and nothing runs through a shell.
+//!
+//! `browser_setup {browser, profile: "Default"}` and `browser_remove {browser}`
+//! run `ibara browser-setup` (`IBARA_POWER_IBARA`, with the extension from
+//! `IBARA_POWER_EXTENSION_DIR`) for the account on the other end of the socket
+//! (`SO_PEERCRED`, named through `/etc/passwd`), and relay its JSON report.
 use crate::wake::{ETHTOOL_GWOL, ETHTOOL_SWOL, WAKE_MAGIC, WolInfo, ethtool_wol};
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
@@ -31,6 +37,10 @@ struct Roots {
     bin: PathBuf,
     sys: PathBuf,
     proc: PathBuf,
+    /// The `ibara` program that sets up the browser.
+    ibara: PathBuf,
+    /// The extension it installs.
+    extension: PathBuf,
 }
 
 impl Roots {
@@ -38,10 +48,13 @@ impl Roots {
         let dir = |name: &str, default: &str| {
             PathBuf::from(std::env::var_os(name).filter(|v| !v.is_empty()).unwrap_or_else(|| default.into()))
         };
+        let lib = Path::new(crate::install::LIB);
         Roots {
             bin: dir("IBARA_POWER_BIN_DIR", "/usr/bin"),
             sys: dir("IBARA_POWER_SYSFS", "/sys"),
             proc: dir("IBARA_POWER_PROC", "/proc"),
+            ibara: dir("IBARA_POWER_IBARA", &lib.join("bin/ibara").to_string_lossy()),
+            extension: dir("IBARA_POWER_EXTENSION_DIR", &lib.join("chrome-extension").to_string_lossy()),
         }
     }
 
@@ -58,7 +71,12 @@ enum Op {
     Shutdown,
     Sleep(Option<String>),
     Update(&'static Job),
+    BrowserSetup(&'static str),
+    BrowserRemove(&'static str),
 }
+
+/// Browsers `ibara browser-setup` can set up for sharing logins.
+const BROWSERS: [&str; 4] = ["chromium", "chrome", "brave", "brave-origin"];
 
 /// An update that runs as its own unit.
 struct Job {
@@ -125,6 +143,12 @@ fn only_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), String
     }
 }
 
+/// The request's `browser`, one of [`BROWSERS`].
+fn browser(object: &Map<String, Value>) -> Result<&'static str, String> {
+    let name = object.get("browser").and_then(Value::as_str).ok_or("The request needs a \"browser\".")?;
+    BROWSERS.into_iter().find(|b| *b == name).ok_or_else(|| format!("\"{name}\" is not a browser ibara can set up. Use chromium, chrome, brave or brave-origin."))
+}
+
 fn parse(line: &str) -> Result<Op, String> {
     let value: Value = serde_json::from_str(line).map_err(|_| "The request is not valid JSON.".to_string())?;
     let object = value.as_object().ok_or("The request must be a JSON object.")?;
@@ -152,8 +176,21 @@ fn parse(line: &str) -> Result<Op, String> {
                 Some(_) => Err("\"wake\" must be null or an object with an \"ifname\".".into()),
             }
         }
+        "browser_setup" => {
+            only_keys(object, &["op", "browser", "profile"])?;
+            let browser = browser(object)?;
+            match object.get("profile").and_then(Value::as_str) {
+                Some("Default") => Ok(Op::BrowserSetup(browser)),
+                None => Err("The request needs a \"profile\".".into()),
+                Some(_) => Err("Only the browser's Default profile can share logins.".into()),
+            }
+        }
+        "browser_remove" => {
+            only_keys(object, &["op", "browser"])?;
+            Ok(Op::BrowserRemove(browser(object)?))
+        }
         other => Err(format!(
-            "\"{other}\" is not something this computer can do. Use disk, restart, shutdown, sleep, update_ibara or update_omarchy."
+            "\"{other}\" is not something this computer can do. Use disk, restart, shutdown, sleep, update_ibara, update_omarchy, browser_setup or browser_remove."
         )),
     }
 }
@@ -189,6 +226,8 @@ fn handle(roots: &Roots, op: Op) -> (Value, Option<&'static str>) {
             (reply, Some("suspend"))
         }
         Op::Update(job) => (update(roots, job), None),
+        Op::BrowserSetup(browser) => (browser_setup(roots, "browser_setup", browser), None),
+        Op::BrowserRemove(browser) => (browser_setup(roots, "browser_remove", browser), None),
     }
 }
 
@@ -237,6 +276,65 @@ fn update(roots: &Roots, job: &Job) -> Value {
         Err(_) => "systemd-run could not run.".into(),
     };
     json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": format!("The update did not start: {detail}")}})
+}
+
+/// The desktop account on the other end of the socket on stdin.
+fn peer_account() -> Result<String, String> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes of the sizes given.
+    let got = unsafe { libc::getsockopt(0, libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len) };
+    if got != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+        return Err("This request did not come over the power socket, so its account is unknown.".into());
+    }
+    if cred.uid == 0 {
+        return Err("The browser belongs to a desktop account, not root.".into());
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd").map_err(|_| "The account list could not be read.".to_string())?;
+    passwd
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|f| f.len() >= 7 && f[2].parse::<u32>().ok() == Some(cred.uid))
+        .map(|f| f[0].to_string())
+        .ok_or_else(|| format!("Account {} is not in /etc/passwd.", cred.uid))
+}
+
+/// Set up (`browser_setup`) or remove (`browser_remove`) ibara's extension in
+/// the calling account's browser, relaying `ibara browser-setup`'s report.
+fn browser_setup(roots: &Roots, action: &'static str, browser: &'static str) -> Value {
+    let user = match peer_account() {
+        Ok(user) => user,
+        Err(message) => return refusal(message),
+    };
+    let mut command = Command::new(&roots.ibara);
+    command.env("LC_ALL", "C").stdin(Stdio::null()).arg("browser-setup");
+    if action == "browser_setup" {
+        command.arg(&roots.extension).args([user.as_str(), "--browser", browser, "--operator"]);
+    } else {
+        command.args(["--remove", "--browser", browser, user.as_str()]);
+    }
+    let failed = |detail: &str| {
+        let what = if action == "browser_setup" { "The browser was not set up" } else { "ibara was not removed from the browser" };
+        json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": format!("{what}: {detail}")}})
+    };
+    let out = match command.output() {
+        Ok(out) => out,
+        Err(_) => return failed("ibara could not run."),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given");
+        return failed(detail.strip_prefix("ibara browser-setup: ").unwrap_or(detail));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = stdout.lines().find(|l| !l.trim().is_empty()).and_then(|l| serde_json::from_str::<Value>(l).ok());
+    let Some(Value::Object(mut reply)) = report else {
+        return failed("ibara gave no report.");
+    };
+    reply.insert("ok".into(), true.into());
+    reply.insert("action".into(), action.into());
+    reply.insert("browser".into(), browser.into());
+    Value::Object(reply)
 }
 
 pub fn main(args: Vec<OsString>) -> i32 {

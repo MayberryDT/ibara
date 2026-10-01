@@ -105,7 +105,8 @@ impl Controller {
             op.as_str(),
             "session" | "status" | "task_status" | "observe" | "observe_video" | "take_control" | "handback" | "pause" | "resume" | "access" | "access_set"
                 | "access_remove" | "access_unpair" | "attention" | "answer_attention" | "viewer_register" | "viewer_ticket"
-                | "clipboard_get" | "clipboard_set"
+                | "clipboard_get" | "clipboard_set" | "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer"
+                | "login_remove" | "login_probe"
         )
             || FILE_OPS.contains(&op.as_str())
             || super::EVERYDAY_OPS.contains(&op.as_str());
@@ -135,6 +136,18 @@ impl Controller {
             Ok(grant)
         };
         let mut grant = authorize()?;
+        // Cookie-bearing actions must never enter the generic approval gate:
+        // it persists the action for review. Require current unconditional
+        // administer access and fail closed before any cookie effect.
+        if op.starts_with("login_") {
+            let access=crate::access::Access::load(&self.journal)?.ok_or_else(||denied("Login sharing needs current access records."))?;
+            if access.pairings.get(operator_id).and_then(|p| p.endpoint.as_deref()) == Some(self.endpoint_id.as_str()) {
+                return Err(denied("This computer also runs agents, so it can't share logins yet. Turn on sharing from the computer you use."));
+            }
+            if access.rule(operator_id,"administer",self.now_ms())!=super::Rule::Allow {
+                return Err(denied("Login sharing requires Allowed administer access; no cookie-bearing approval is created."));
+            }
+        }
         if op == "access" { return self.access_view(operator_id).map(|mut v| { v["endpoint_id"]=json!(self.endpoint_id); v["controller_epoch"]=json!(self.epoch); v["authorization_generation"]=grant.generation.clone(); v }); }
         // `attention` is read by every paired computer: approvals are listed
         // only to one that may answer them (see `attention` below).
@@ -169,6 +182,12 @@ impl Controller {
             out
         };
         match op.as_str() {
+            op if op.starts_with("login_") => {
+                let mut value=self.login_operator(operator_id,&action).await?;
+                authorize()?;
+                value.as_object_mut().unwrap().extend(identity(&grant.generation));
+                Ok(value)
+            }
             "access_set"|"access_remove"|"access_unpair" => {
                 let mut v=self.change_access_authorized(operator_id,&action).await?;
                 v.as_object_mut().unwrap().extend(identity(&grant.generation)); Ok(v)
@@ -193,6 +212,9 @@ impl Controller {
             "answer_attention" => {
                 let (att_ref, answer) = (action["att_ref"].as_str().unwrap_or(""), action["answer"].as_str().unwrap_or(""));
                 let asked = self.journal.get_attention(att_ref)?.ok_or_else(|| invalid("Unknown attention item."))?;
+                if asked.kind == "login" {
+                    return Err(invalid("Answer this on the computer your logins come from."));
+                }
                 // Always Allow, or Allow on an agent's request to stop asking, also changes access.
                 let mut allowed = None;
                 // An agent's question takes one of its options (any short answer when it

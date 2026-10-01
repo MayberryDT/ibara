@@ -15,6 +15,11 @@ fn fail(code: &'static str, message: &str, retry_safe: bool) -> IbaraError {
     IbaraError::new(code, message, retry_safe)
 }
 
+fn person_holds_control() -> IbaraError {
+    fail("HUMAN_CONTROL", "Your person has control of the computer.", true)
+        .with("next", "Your person has control; wait for Hand Back. You can keep waiting for their answer with computer_wait.")
+}
+
 /// A task's control ended because ibara restarted: the step stops here, and
 /// the agent begins again once ibara has started.
 pub(crate) fn restart_ended() -> IbaraError {
@@ -170,17 +175,22 @@ impl Controller {
 
     /// `requireLiveLease` (`core.ts:963-985`).
     pub(crate) fn require_live_lease(&self, principal: &str, connection_id: &str, task_ref: &str) -> Result<LeaseRecord> {
+        self.require_task_lease(principal, connection_id, task_ref, false)
+    }
+
+    /// Attention waits read a person's answer without taking input authority.
+    pub(crate) fn require_task_lease(&self, principal: &str, connection_id: &str, task_ref: &str, attention_wait: bool) -> Result<LeaseRecord> {
         self.require_readable_task(principal, task_ref)?;
         self.require_access(&self.task_subject(task_ref,principal),"agents")?;
         let control = self.journal.get_control()?;
-        if control.human_control {
+        if control.human_control && !(attention_wait && control.pause_origin == Some(PauseOrigin::Person)) {
             let Some(wait) = self.system_wait(&control) else {
-                return Err(fail("HUMAN_CONTROL", "A person currently holds the computer.", false));
+                return Err(person_holds_control());
             };
             let restarted = self.journal.list_leases_for_task(task_ref)?.first().and_then(|l| l.reason.clone()).as_deref() == Some(Release::Restart.reason());
             return Err(if restarted { restart_ended() } else { wait.refusal() });
         }
-        if control.unsettled {
+        if control.unsettled && !attention_wait {
             return Err(fail("CONTROL_UNSETTLED", "Previous controllable work has not settled.", false).requires_reconciliation());
         }
         let Some(lease) = self.journal.get_active_lease()? else {
@@ -258,7 +268,7 @@ impl Controller {
         let control = self.journal.get_control()?;
         if control.human_control {
             // Only a start or stop pauses for the system while an agent holds control.
-            return Err(if control.paused_by_system() { restart_ended() } else { fail("HUMAN_CONTROL", "A person currently holds the computer.", false) });
+            return Err(if control.paused_by_system() { restart_ended() } else { person_holds_control() });
         }
         match self.journal.get_active_lease()? {
             Some(live) if live.generation == lease.generation => {
@@ -331,17 +341,35 @@ impl Controller {
                 self.journal.expire_lease(&lease.generation, how.reason())?;
             } else {
                 self.journal.revoke_active_leases(how.reason(), self.now_ms())?;
+                if how == Release::OperatorPause {
+                    // Keep the task reserved for this agent, but fence old work
+                    // and approvals, including approvals answered just before take.
+                    let mut paused = lease.clone();
+                    paused.generation = id("lease");
+                    paused.acquired_at = self.now_iso();
+                    self.journal.put_lease(&paused)?;
+                }
             }
             if let Some(mut task) = self.journal.get_task(&lease.task_ref)?
                 && (task.state == "active" || task.state == "created")
             {
                 self.stop_charging(&mut task);
-                task.state = "interrupted".into();
+                if how != Release::OperatorPause {
+                    task.state = "interrupted".into();
+                }
                 task.updated_at = self.now_iso();
                 self.journal.put_task(&task)?;
-                // Its questions and approvals go with it: no agent can read an
-                // answer on a task whose control ended (old handles are not revived).
-                self.journal.expire_attention(None, Some(&task.task_ref), how.reason(), &task.updated_at)?;
+                if how == Release::OperatorPause {
+                    // Only approvals tied to a held step depend on the old
+                    // screen and control. Questions and access decisions survive.
+                    for item in self.journal.list_attention(Some("open"), Some(&task.task_ref), 500)? {
+                        if item.kind == "approval" && item.generation.is_some() {
+                            self.journal.expire_attention(Some(&item.att_ref), None, how.reason(), &task.updated_at)?;
+                        }
+                    }
+                } else {
+                    self.journal.expire_attention(None, Some(&task.task_ref), how.reason(), &task.updated_at)?;
+                }
             }
             self.push_event(Some(&lease.task_ref), how.phrase());
         }
@@ -607,6 +635,19 @@ impl Controller {
                 return Err(fail("CONTROL_UNSETTLED", "Viewer access prevents agent handback.", false));
             }
         }
+        self.reconcile().await?;
+        if !self.journal.get_control()?.unsettled
+            && let Some(lease) = self.journal.get_active_lease()?
+        {
+            let mut task = self.require_readable_task(&lease.principal, &lease.task_ref)?;
+            task.last_charge_ms = Some(self.now_ms());
+            task.updated_at = self.now_iso();
+            self.journal.put_task(&task)?;
+            if let Err(e) = self.desktop.set_idle_inhibited(true).await {
+                log_event("idle_inhibit_failed", &e.to_string());
+            }
+            self.desktop.set_agent(Some(self.task_subject(&lease.task_ref, &lease.principal)));
+        }
         self.journal.set_control(ControlPatch {
             human_control: Some(false),
             paused: Some(false),
@@ -617,7 +658,7 @@ impl Controller {
         Ok(json!({
             "ok": true,
             "availability": self.availability()?,
-            "note": "Resume clears human-control; it does not restore a lease or clear unsettled work."
+            "note": "Resume lets the paused task continue when its control is still valid; it does not clear unsettled work."
         }))
     }
 
@@ -662,11 +703,14 @@ impl Controller {
         if let Some(owner) = &self.viewer_state.borrow().owner {
             return Ok(format!("operator:{owner}"));
         }
+        let control = self.journal.get_control()?;
+        if control.human_control || control.paused {
+            return Ok("human".into());
+        }
         if let Some(lease) = self.journal.get_active_lease()? {
             return Ok(format!("agent:{}:{}", lease.principal, lease.task_ref));
         }
-        let control = self.journal.get_control()?;
-        Ok(if control.human_control || control.paused { "human" } else { "none" }.into())
+        Ok("none".into())
     }
 
     /// `viewerRevisionName` (`core.ts:299-302`).
@@ -919,7 +963,8 @@ impl Controller {
                 // Who still pauses agents after the hand back: none (they can work
                 // again), a person, or ibara while it settles the computer.
                 "pause_origin": self.journal.get_control()?.pause_origin.map(|o| o.as_str()),
-                "agent_resumed": false,
+                "agent_resumed": !self.journal.get_control()?.human_control
+                    && !self.journal.get_control()?.unsettled && self.journal.get_active_lease()?.is_some(),
             }))
         }
         .await;

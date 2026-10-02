@@ -2,7 +2,7 @@
 # Build, check and upload one ibara release as a GitHub release of the
 # repository packaging/release.env names.
 #
-#   packaging/publish.sh [--publish] [--sign-key KEY] [--private-markers FILE] [--out DIR] \
+#   packaging/publish.sh [--publish] [--sign-key KEY] [--private-markers FILE] [--out DIR] [--built VERIFIED_DIR] \
 #     --plugin PLUGIN_CHECKOUT --stream IBARA_STREAM_CHECKOUT --view IBARA_VIEW_CHECKOUT \
 #     --notes NOTES_FILE VERSION
 #
@@ -32,17 +32,19 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: packaging/publish.sh [--publish] [--sign-key KEY] [--private-markers FILE] [--out DIR] --plugin DIR --stream DIR --view DIR --notes FILE VERSION" >&2
+  echo "Usage: packaging/publish.sh [--publish] [--sign-key KEY] [--private-markers FILE] [--out DIR] [--built VERIFIED_DIR] --plugin DIR --stream DIR --view DIR --notes FILE VERSION" >&2
   exit 64
 }
+built=''
 publish=0 key=${XDG_CONFIG_HOME:-$HOME/.config}/ibara-release/ibara-release out=''
 markers=${XDG_CONFIG_HOME:-$HOME/.config}/ibara-release/private-markers plugin='' stream='' view='' notes='' version=''
 while (($#)); do
   case $1 in
     --publish) publish=1; shift ;;
+    --built) built=${2:?}; shift 2 ;;
     --sign-key) key=${2:?}; shift 2 ;;
     --private-markers) markers=${2:?}; shift 2 ;;
-    --out) out=${2:?}; shift 2 ;;
+    --out) out=${2:?}; out_override=1; shift 2 ;;
     --plugin) plugin=${2:?}; shift 2 ;;
     --stream) stream=${2:?}; shift 2 ;;
     --view) view=${2:?}; shift 2 ;;
@@ -86,11 +88,16 @@ if existing=$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha 2>/dev/nul
 fi
 
 out=${out:-${XDG_CACHE_HOME:-$HOME/.cache}/ibara-release/$version}
+if [[ -n $built ]]; then
+  [[ -z ${out_override:-} ]] || fail "Use --built without --out."
+  out=$built
+else
 if [[ -e $out ]]; then
   [[ -d $out && -z $(ls -A "$out") ]] || fail "$out already holds files; remove it or name another with --out."
 fi
 IBARA_PKGREL=$pkgrel "$core/packaging/release.sh" --plugin "$plugin" --stream "$stream" --view "$view" \
   --sign-key "$key" --notes "$notes" --private-markers "$markers" "$out"
+fi
 out=$(cd -- "$out" && pwd -P)
 
 # The files of the release, exactly: GitHub keeps names made of these characters as they are.
@@ -135,7 +142,7 @@ echo "Release $version in $out is complete and signed." >&2
   jq -r '.notes[] | "- " + .' "$out/stable.json"
   printf '\n## Install\n\nOn an Omarchy computer:\n\n```bash\ncurl -fsSL %s/install | sh\n```\n\n' "$IBARA_BASE_URL"
   echo 'Already installed? Run `ibara update`.'
-  printf '\n`ibara-%s-source.tar.gz` is the full source of the three packages (GPL-3.0; the Omarchy plugin is MIT).\n' "$version"
+  printf '\n`ibara-%s-source.tar.gz` is the full source of the three packages. Core and the Omarchy plugin are MIT; the separate ibara-stream (Sunshine) and ibara-view (Moonlight) programs remain GPL-3.0.\n' "$version"
 } >"$check/body.md"
 
 if ((publish)); then

@@ -48,6 +48,7 @@ impl Engine for crate::controller::Controller {
 }
 
 pub(super) async fn run_target(paths: Paths) -> anyhow::Result<()> {
+    crate::install::user::start_shell_retry();
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("install SIGINT handler")?;

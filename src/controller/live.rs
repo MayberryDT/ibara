@@ -54,7 +54,7 @@ impl ControllerOptions {
             versions: RefCell::new(HashMap::new()),
             pasting: RefCell::new(None),
         });
-        let mut options = ControllerOptions::new(&cfg.state_dir, storage, port);
+        let mut options = ControllerOptions::new(&cfg.state_dir, storage, port.clone());
         let limit = |key: &str| cfg.policy.get(key).and_then(Value::as_u64);
         options.journal = JournalOptions {
             max_metadata_bytes: limit("max_metadata_bytes"),
@@ -62,7 +62,7 @@ impl ControllerOptions {
             metadata_retention_ms: limit("metadata_retention_ms").map(|v| v as i64),
             ..Default::default()
         };
-        options.stream = Some(Rc::new(LiveStream::new(&cfg.state_dir)));
+        options.stream = Some(Rc::new(LiveStream::new(&cfg.state_dir, port)));
         options.operator_grants = cfg.operator_grants;
         options.effect_rules = EffectRules::from_policy(&cfg.policy);
         options.computer = computer_identity();
@@ -282,6 +282,10 @@ impl DesktopPort for LiveDesktop {
                 display_revision: frame.display_revision.clone(),
             })
         })
+    }
+
+    fn vaapi_render_node(&self) -> Option<PathBuf> {
+        self.desktop.vaapi_render_node()
     }
 
     fn video_capability(&self) -> super::ports::VideoCapability {

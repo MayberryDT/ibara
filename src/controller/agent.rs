@@ -681,6 +681,11 @@ impl Controller {
         } else {
             format!("all available except {}", not_ok.join(", "))
         };
+        for cap in caps.iter().filter(|c| c["name"] == "native.input") {
+            if let Some(reason) = cap["reason"].as_str() {
+                line.push_str(&format!("; {}", clip(reason, 600)));
+            }
+        }
         if browser_status == "not_open" {
             line.push_str("; no browser open yet (its page reader connects when one opens)");
         }
@@ -3011,6 +3016,7 @@ impl Controller {
                 options: &ask.options,
                 now_iso: &now,
             })?;
+            self.request_stream_warm(90_000);
             self.push_event(Some(&task.task_ref), &format!("{} asks a person: {}", item.att_ref, squash(&ask.question, 80)));
             result.insert("attention".into(), json!(item.att_ref));
             status = Status::Pending;

@@ -105,6 +105,7 @@ impl Controller {
             op.as_str(),
             "session" | "status" | "task_status" | "observe" | "observe_video" | "take_control" | "handback" | "pause" | "resume" | "access" | "access_set"
                 | "access_remove" | "access_unpair" | "attention" | "answer_attention" | "viewer_register" | "viewer_ticket"
+                | "warm"
                 | "clipboard_get" | "clipboard_set" | "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer"
                 | "login_remove" | "login_probe"
         )
@@ -273,6 +274,12 @@ impl Controller {
             }
             "take_control" | "handback" => self.operator_control(operator_id, op == "take_control", &action, &authorize).await,
             // Only the holder, who was allowed control when taking it.
+            "warm" => {
+                let mut value = self.warm_stream().await?;
+                authorize()?;
+                value.as_object_mut().unwrap().extend(identity(&grant.generation));
+                Ok(value)
+            },
             "viewer_ticket" => self.viewer_ticket(operator_id, &authorize).await,
             // The server saves the certificate once this has authorized it.
             "viewer_register" => {
@@ -444,6 +451,7 @@ impl Controller {
         out.insert("disk_password".into(), self.disk_password().await);
         out.insert("version".into(), json!(crate::version()));
         out.insert("omarchy_update".into(), crate::install::omarchy_update::status());
+        out.insert("ibara_update".into(), crate::install::update::status());
         if let Some(a)=crate::access::Access::load(&self.journal)? {
             out.insert("access".into(),a.own_row(operator_id,self.now_ms(),(self.ask_first)()));
             if a.rule(operator_id,"administer",self.now_ms())==super::Rule::Allow { out.insert("attention".into(),json!(self.journal.list_attention(Some("open"),None,20)?)); }

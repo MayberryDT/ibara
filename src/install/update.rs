@@ -53,7 +53,13 @@ pub struct Channel {
 impl Channel {
     /// From `packaging/release.env` as built in; none while either is unset.
     pub fn built_in() -> Option<Channel> {
-        Channel::parse(RELEASE_ENV)
+        let mut channel = Channel::parse(RELEASE_ENV)?;
+        // Alternate mirrors still require the built-in release signing key.
+        if let Ok(url) = std::env::var("IBARA_UPDATE_BASE_URL") {
+            if !url.starts_with("https://") && !url.starts_with("http://") { return None; }
+            channel.base_url = url.trim_end_matches('/').into();
+        }
+        Some(channel)
     }
 
     fn parse(text: &str) -> Option<Channel> {
@@ -74,10 +80,18 @@ impl Channel {
 
     /// curl, limited to the channel's own scheme, following redirects on it only.
     fn fetch(&self, file: &str, to: &Path) -> Result<(), String> {
+        self.fetch_with_limits(file, to, "900", "536870912")
+    }
+
+    fn fetch_manifest(&self, file: &str, to: &Path) -> Result<(), String> {
+        self.fetch_with_limits(file, to, "5", "262144")
+    }
+
+    fn fetch_with_limits(&self, file: &str, to: &Path, seconds: &str, bytes: &str) -> Result<(), String> {
         let proto = if self.base_url.starts_with("https://") { "=https" } else { "=http" };
         output(
             Command::new("curl")
-                .args(["-fsSL", "--proto", proto, "--proto-redir", proto, "--connect-timeout", "15", "--max-time", "900", "-o"])
+                .args(["-fsSL", "--proto", proto, "--proto-redir", proto, "--connect-timeout", "5", "--max-time", seconds, "--max-filesize", bytes, "-o"])
                 .arg(to)
                 .arg(self.url(file)),
         )
@@ -101,6 +115,8 @@ pub struct Release {
     pub version: String,
     pub packages: Vec<Package>,
     pub notes: Vec<String>,
+    pub released_at: String,
+    pub history: Vec<Value>,
 }
 
 /// Check `signature` over `manifest` with `key` (an `ssh-ed25519 …` line), then
@@ -155,22 +171,26 @@ pub fn verify(manifest: &[u8], signature: &[u8], key: &str, dir: &Path) -> Resul
         packages.push(package);
     }
     let notes = value["notes"].as_array().map(|n| n.iter().filter_map(text).collect()).unwrap_or_default();
-    Ok(Release { version, packages, notes })
+    let released_at = text(&value["released_at"]).unwrap_or_default();
+    let history = value["history"].as_array().map(|rows| rows.iter().take(10).filter(|r|
+        r["version"].as_str().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-:".contains(&b)))
+        && r["notes"].is_array()).cloned().collect()).unwrap_or_default();
+    Ok(Release { version, packages, notes, released_at, history })
 }
 
 /// A private folder in the person's cache for one update.
-fn scratch() -> Result<PathBuf, String> {
+pub(crate) fn scratch() -> Result<PathBuf, String> {
     let dir = crate::server::home_dir().join(format!(".cache/ibara/update-{}-{}", crate::ids::now_millis(), std::process::id()));
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
 
 /// The newest release, verified.
-fn latest(channel: &Channel, dir: &Path) -> Result<Release, String> {
+pub(crate) fn latest(channel: &Channel, dir: &Path) -> Result<Release, String> {
     let manifest = dir.join("download.json");
     let signature = dir.join("download.json.sig");
-    channel.fetch("stable.json", &manifest)?;
-    channel.fetch("stable.json.sig", &signature)?;
+    channel.fetch_manifest("stable.json", &manifest)?;
+    channel.fetch_manifest("stable.json.sig", &signature)?;
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     verify(&read(&manifest)?, &read(&signature)?, &channel.key, dir)
 }
@@ -216,6 +236,25 @@ pub fn update(args: &[String]) -> Result<(), String> {
     result
 }
 
+/// Script-friendly check: true means available (exit 0), false current (exit 1).
+pub fn check(args: &[String]) -> Result<bool, String> {
+    if args.iter().any(|a| a != "--check" && a != "--json") { return Err("Usage: ibara update --check [--json]".into()); }
+    let channel = Channel::built_in().ok_or("This build has no update channel.")?;
+    let installed = installed_version().ok_or("The ibara package is not installed.")?;
+    let dir = scratch()?;
+    let result = (|| {
+        let release = latest(&channel, &dir)?;
+        let available = vercmp(&release.version, &installed)? > 0;
+        if args.iter().any(|a| a == "--json") {
+            println!("{}", json!({"state": if available {"available"} else {"current"}, "version": release.version, "installed": installed, "notes": release.notes}));
+        } else if available { println!("ibara {} is available (this computer has {installed}).", release.version); }
+        else { println!("ibara is already current ({installed})."); }
+        Ok(available)
+    })();
+    let _ = std::fs::remove_dir_all(dir);
+    result
+}
+
 /// Download the packages of a verified release into `dir`, each checked
 /// against the manifest: `PATH SHA256` pairs for [`system_update`].
 fn download(channel: &Channel, release: &Release, dir: &Path) -> Result<Vec<String>, String> {
@@ -237,11 +276,76 @@ fn download(channel: &Channel, release: &Release, dir: &Path) -> Result<Vec<Stri
 fn after_install(release: &Release, installed: &str, plugin_before: String) -> Result<(), String> {
     restart_services()?;
     super::user::reload_plugin(plugin_before)?;
-    record_whats_new(&release.version, &release.notes, Some(installed))
+    record_whats_new(&release.version, &release.notes, Some(installed))?;
+    let path = whats_new_path();
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    record["history"] = json!(release.history.iter().filter(|r| r["version"].as_str().is_some_and(|v| vercmp(v, installed).is_ok_and(|n| n > 0))).collect::<Vec<_>>());
+    std::fs::write(path, format!("{record}\n")).map_err(|e| e.to_string())
 }
 
 /// The unit a remote update runs in (`ibara power-system` starts it).
 pub const UPDATE_UNIT: &str = "ibara-update.service";
+const STATE: &str = "/var/lib/ibara/ibara-update.json";
+
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().into()
+}
+
+fn record(state: &Value) -> Result<(), String> {
+    root_dir(Path::new(STATE).parent().unwrap(), 0o755)?;
+    write_root(Path::new(STATE), format!("{state}\n").as_bytes(), 0o644)
+}
+
+/// Refuse busy computers before any network or download. A current computer
+/// answers without starting an update unit. Failure to check is an error.
+pub fn preflight() -> Result<Option<Value>, String> {
+    if let Some(message) = busy()? {
+        return Ok(Some(json!({"ok": true, "action": "update_ibara", "state": "busy", "message": message})));
+    }
+    let installed = installed_version().ok_or("The ibara package is not installed.")?;
+    let channel = Channel::built_in().ok_or("This build has no update channel.")?;
+    let dir = scratch()?;
+    let result = latest(&channel, &dir).and_then(|release| {
+        Ok((vercmp(&release.version, &installed)? <= 0).then(|| json!({"ok": true, "action": "update_ibara", "state": "current", "version": installed, "message": format!("ibara is already current ({installed}).")})))
+    });
+    let _ = std::fs::remove_dir_all(dir);
+    result
+}
+
+/// A stopped unit must not leave a permanent running indicator.
+pub fn system_update_end() -> Result<(), String> {
+    if let Some(mut state) = std::fs::read(STATE).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        && state["state"] == "running" {
+        state["state"] = json!("failed");
+        state["finished_at"] = json!(crate::ids::now_millis());
+        state["message"] = json!("The update stopped before it finished.");
+        record(&state)?;
+    }
+    Ok(())
+}
+
+pub fn status() -> Value {
+    let Some(mut state) = std::fs::read(STATE).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object) else { return Value::Null };
+    if state["boot_id"] != json!(boot_id()) && state["state"] == "running" {
+        state["state"] = json!("failed");
+        state["message"] = json!("The computer restarted before the update finished.");
+    }
+    if state["shell"] == "deferred_locked"
+        && let Some(owner) = super::system::station_owner().and_then(|name| Account::desktop(&name).ok())
+        && let Some(shell) = super::user::shell_outcome_at(&owner.home)
+        && shell["at"].as_i64() >= state["started_at"].as_i64() {
+        state["shell"] = shell["state"].clone();
+        if shell["state"] == "restarted" || shell["state"] == "failed" {
+            state["finished_at"] = shell["at"].clone();
+        }
+        if shell["state"] == "failed" {
+            state["state"] = json!("failed");
+            state["message"] = shell["message"].clone();
+        }
+    }
+    state.as_object_mut().unwrap().remove("boot_id");
+    state
+}
 
 /// Root, with nobody at the computer (`ibara system update-latest`): all of
 /// `ibara update` for the desktop account named in the station file. The root
@@ -250,29 +354,47 @@ pub const UPDATE_UNIT: &str = "ibara-update.service";
 /// goes to the journal. The release is checked exactly as `ibara update`
 /// checks it, and the account's own part runs as that account, in its session.
 pub fn system_update_latest() -> Result<(), String> {
-    let owner = super::system::station_owner().ok_or("ibara is not set up on this computer, so there is nobody to update it for.")?;
-    let desktop = Account::desktop(&owner)?;
-    let channel = Channel::built_in().ok_or("This build of ibara has no update channel. Install a published release to get updates.")?;
-    let installed = installed_version().ok_or("The ibara package is not installed.")?;
+    let mut state = json!({"state": "running", "version": installed_version(), "from": installed_version(), "step": "checking", "started_at": crate::ids::now_millis(), "finished_at": null, "message": "", "shell": "unchanged", "boot_id": boot_id()});
+    record(&state)?;
     let dir = Path::new(PACKAGE_CACHE).with_file_name(format!("update-{}", crate::ids::now_millis()));
-    root_dir(&dir, 0o700)?;
     let result = (|| {
+        let owner = super::system::station_owner().ok_or("ibara is not set up on this computer.")?;
+        let desktop = Account::desktop(&owner)?;
+        refuse_while_busy()?;
+        let channel = Channel::built_in().ok_or("This build has no update channel.")?;
+        let installed = installed_version().ok_or("The ibara package is not installed.")?;
+        root_dir(&dir, 0o700)?;
         let release = latest(&channel, &dir)?;
+        state["version"] = json!(release.version);
+        record(&state)?;
         if vercmp(&release.version, &installed)? <= 0 {
             println!("ibara is up to date ({installed}).");
             return Ok(());
         }
         println!("Updating ibara from {installed} to {} for {}, asked for from another computer.", release.version, desktop.name);
+        state["step"] = json!("downloading");
+        record(&state)?;
         let pairs = download(&channel, &release, &dir)?;
         let plugin_before = super::user::plugin_digest();
+        state["step"] = json!("installing");
+        record(&state)?;
         system_update(&desktop, &pairs.iter().map(String::as_str).collect::<Vec<_>>())?;
-        if !as_desktop(&desktop, || after_install(&release, &installed, plugin_before)) {
-            return Err(format!("ibara is installed, but restarting its services as {} did not finish (see above).", desktop.name));
+        state["step"] = json!("restarting");
+        record(&state)?;
+        let restarted = as_desktop(&desktop, || after_install(&release, &installed, plugin_before));
+        let shell = super::user::shell_outcome_at(&desktop.home).filter(|s| s["at"].as_i64() >= state["started_at"].as_i64());
+        if let Some(shell) = &shell { state["shell"] = shell["state"].clone(); }
+        if !restarted {
+            return Err(shell.and_then(|s| s["message"].as_str().map(str::to_string)).filter(|m| !m.is_empty()).unwrap_or_else(|| format!("ibara is installed, but restarting its services as {} failed.", desktop.name)));
         }
         println!("ibara {} is installed. To go back to {installed}: ibara rollback", release.version);
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&dir);
+    state["state"] = json!(if result.is_ok() { "done" } else { "failed" });
+    state["finished_at"] = json!(crate::ids::now_millis());
+    if let Err(message) = &result { state["message"] = json!(message.lines().next().unwrap_or(message).chars().take(240).collect::<String>()); }
+    record(&state)?;
     result
 }
 
@@ -353,16 +475,19 @@ fn restart_services() -> Result<(), String> {
 }
 
 /// Whether an agent task holds this computer, from its controller (`ibara admin status`).
-fn busy() -> Option<String> {
-    let status = output(Command::new(Path::new(LIB).join("bin/ibara")).args(["admin", "status"])).ok()?;
-    let status: Value = serde_json::from_str(&status).ok()?;
-    let lease = status.pointer("/result/lease").filter(|l| !l.is_null())?;
-    Some(lease["client_name"].as_str().or(lease["principal"].as_str()).unwrap_or("An agent").to_string())
+fn busy() -> Result<Option<String>, String> {
+    let status = output(Command::new(Path::new(LIB).join("bin/ibara")).args(["admin", "status"]))?;
+    let status: Value = serde_json::from_str(&status).map_err(|_| "Could not check whether this computer is busy.")?;
+    let result = status.get("result").filter(|r| r.is_object()).ok_or("Could not check whether this computer is busy.")?;
+    if result["control"]["human_control"] == true && result["control"]["pause_origin"] == "person" {
+        return Ok(Some("A person holds control. Try again after Hand Back.".into()));
+    }
+    Ok(result.get("lease").filter(|l| !l.is_null()).map(|l| format!("{} is working on this computer. Try again once it has finished.", l["client_name"].as_str().or(l["principal"].as_str()).unwrap_or("An agent"))))
 }
 
 pub(super) fn refuse_while_busy() -> Result<(), String> {
-    match busy() {
-        Some(who) => Err(format!("{who} is working on this computer right now. Try again once it has finished.")),
+    match busy()? {
+        Some(message) => Err(message),
         None => Ok(()),
     }
 }
@@ -665,7 +790,7 @@ pub fn whats_new() -> Value {
     if record.get("seen") != Some(&Value::Bool(false)) || !record.get("version").is_some_and(Value::is_string) {
         return json!({"version": null});
     }
-    json!({"version": record["version"], "from": record.get("from").cloned().unwrap_or(Value::Null), "notes": record.get("notes").cloned().unwrap_or(json!([]))})
+    json!({"version": record["version"], "from": record.get("from").cloned().unwrap_or(Value::Null), "notes": record.get("notes").cloned().unwrap_or(json!([])), "history": record.get("history").cloned().unwrap_or(json!([]))})
 }
 
 /// The console's `whats-new-seen`: the notes are not shown again.

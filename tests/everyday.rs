@@ -318,7 +318,7 @@ fn a_computer_is_looked_after_from_another_over_the_pairing_route() {
     // This console's own settings, in its own file.
     let own = vesper.ok("settings", &["get"]);
     let ids: Vec<&str> = own["sections"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["approvals", "notifications", "files", "fleet"]);
+    assert_eq!(ids, ["approvals", "notifications", "updates", "files", "fleet"]);
     assert_eq!(setting(&own, "fleet_preview_seconds")["scope"], "console");
     assert_eq!(vesper.ok("settings", &["set", "fleet_preview_seconds", "10"])["value"], 10);
     let refused = vesper.ask("settings", &["set", "download_folder", "Downloads"]);

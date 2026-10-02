@@ -19,11 +19,11 @@ pub struct Head {
 }
 
 /// Commands whose lost reply is safe to repeat (ibara-bridge.mjs:872).
-const READ_ONLY: [&str; 21] = [
+const READ_ONLY: [&str; 22] = [
     "directory", "tailnet", "pair-status", "pair-requests", "invites", "operator-session", "operator-status",
     "operator-task-status", "operator-observe", "status", "operator-logs", "operator-health", "operator-tasks",
     "operator-task", "operator-artifacts", "operator-procedures", "operator-procedure", "operator-access",
-    "fleet-attention", "away", "operator-windows",
+    "fleet-attention", "away", "operator-windows", "update-check",
 ];
 
 /// A handler failure that the bridge threw rather than returned.

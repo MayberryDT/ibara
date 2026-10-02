@@ -316,6 +316,15 @@ impl Hyprland {
         self.json(self.cmd(&["-j", "clients"]), "clients").await
     }
 
+    pub async fn devices(&self) -> Result<serde_json::Value> {
+        self.json(self.cmd(&["-j", "devices"]), "devices").await
+    }
+
+    pub async fn hypoland_version(&self) -> Result<Option<String>> {
+        let version: serde_json::Value = self.json(self.cmd(&["-j", "version"]), "version").await?;
+        Ok(version["hypolandVersion"].as_str().filter(|v| !v.is_empty()).map(str::to_owned))
+    }
+
     /// The focused window, or `None` when nothing is focused.
     pub async fn active_window(&self) -> Result<Option<Window>> {
         let value: serde_json::Value = self.json(self.cmd(&["-j", "activewindow"]), "activewindow").await?;
@@ -330,10 +339,20 @@ impl Hyprland {
     /// Cua's Hyprland plugin is loaded for this compositor's ABI and its input
     /// transport is open (`hyprctl -j cua:status`).
     pub async fn cua_status(&self) -> Result<bool> {
-        let status: serde_json::Value = self.json(self.cmd(&["-j", "cua:status"]), "cua:status").await?;
-        Ok(status["abi"]["match"] == serde_json::json!(true)
-            && status["transport"]["ready"] == serde_json::json!(true)
-            && status["state"] == serde_json::json!("input_v3_candidate"))
+        let out = run(self.cmd(&["-j", "cua:status"])).await?;
+        if !out.success() && session_gone(&out.failure_text("hyprctl")) { return Err(ctl_failure(&out)); }
+        let raw = out.stdout_text();
+        let status: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "Cua's Hyprland plugin is not loaded. Sign in again after setup, or select dispatcher input in ibara's agent settings.", true)
+                .with("reason", "plugin_not_loaded")
+        })?;
+        if status["abi"]["match"] != serde_json::json!(true) {
+            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Cua's plugin does not match the running Hyprland. Rebuild it with ibara setup and sign in again, or select dispatcher input.",true).with("reason","plugin_abi_mismatch"));
+        }
+        if status["transport"]["ready"] != serde_json::json!(true) || status["state"] != serde_json::json!("input_v3_candidate") {
+            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Cua's Hyprland plugin input transport is unavailable. Sign in again after setup, or select dispatcher input.",true).with("reason","plugin_transport_unavailable"));
+        }
+        Ok(true)
     }
 
     /// Live Hyprland instances, in the order `-i <n>` indexes them.

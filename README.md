@@ -7,7 +7,7 @@ ibara gives your agents computer use across the Omarchy machines you own. Put a 
 [ibara.app](https://ibara.app) · [Docs](https://ibara.app/docs) · [Benchmarks](https://ibara.app/docs/benchmarks) · [Roadmap](https://ibara.app/docs/roadmap)
 
 [![CI](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml/badge.svg)](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml)
-[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ![Your agent works there, you keep working here: your computer and a spare joined over Tailscale, with Claude Code on yours and the agent using the spare's desktop](docs/media/what-it-is.webp)
 
@@ -15,6 +15,28 @@ Every computer you add shows up as a live picture in a console on the others, wh
 Your agents work on those computers' real desktops, with their own cursor, while you approve what matters and step in whenever you like.
 
 ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland), and your computers reach each other only over your own [Tailscale](https://tailscale.com) network. It is free and open source.
+
+Hypoland is also supported through optional compositor input. ibara selects it
+automatically on Hypoland, which has no plugin system. Screen capture,
+accessibility reads, app launch, clicks, US keyboard text, shortcuts, scrolling,
+and drags within one window work without the Cua plugin. Other text uses
+accessibility insertion when the app supports it. This route has reduced input
+safety: it checks window geometry before input, cannot enforce the plugin's
+surface and popup rules, and cannot detect a person's physical keystrokes.
+Mouse movement stops input between steps. Dispatcher keys require a seat
+keyboard. Doctor and agent status state these limits. This was tested on a nested Hypoland desktop; old GPU hardware and
+Take Control on Hypoland still need verification.
+
+On stock Hyprland, the plugin remains the default. To select the fallback when
+the plugin is unavailable, put this in `~/.config/ibara/settings.toml`:
+
+```toml
+[agents]
+input_backend = "dispatchers"
+```
+
+Use `"auto"` to return to the normal compositor choice, or `"plugin"` to require
+the plugin. A plugin refusal never retries input through dispatchers.
 
 ## Install
 
@@ -252,6 +274,8 @@ The forks have no repositories of their own. Every release on the [releases page
 
 ## License
 
-ibara's core is licensed under the [GNU General Public License version 3 only](LICENSE). The console plugin is MIT-licensed. `ibara-stream` and `ibara-view` are GPL-3.0, like the projects they come from, and the vendored Cua plugin keeps its MIT license.
+ibara's core is licensed under the [MIT License](LICENSE), copyright 2026 Tyler Mayberry. The console plugin is also MIT-licensed, and the vendored Cua plugin keeps its own MIT license and copyright notice.
+
+The bundled stream and viewer programs, `ibara-stream` (a Sunshine fork) and `ibara-view` (a Moonlight fork), remain GPL-3.0 as separate programs. They are distributed alongside core; their licenses and source remain available with the release.
 
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and our [code of conduct](CODE_OF_CONDUCT.md).

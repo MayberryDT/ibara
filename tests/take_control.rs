@@ -23,7 +23,8 @@
 //! 4. What either clipboard held before Take Control is shared.
 //! 5. A copy that arrived is sent back (an echo), so a clipboard is set twice.
 //! 6. After Hand Back copies still travel, a clipboard watcher keeps running on
-//!    either computer, or screen sharing keeps running.
+//!    either computer, or screen sharing still admits the viewer; bounded
+//!    ticketless warmth changes ownership, or opens a window before Take Control.
 //! 7. Taking control ends the agent's task, hides its question, interrupts
 //!    its attention wait, or prevents the same agent working after Hand Back.
 //! 8. A held step's approval survives a takeover and authorizes old input.
@@ -319,7 +320,14 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     // systemd-run and hyprctl that stand in for the session.
     let vesper_bin = world.machine_bin("vesper");
     std::os::unix::fs::symlink("/usr/bin/env", vesper_bin.join("ibara-view")).unwrap();
-    write_executable(&vesper_bin.join("connect"), "#!/bin/sh\ncat > \"$(dirname \"$0\")/../viewer-bundle.json\"\n");
+    write_executable(&vesper_bin.join("connect"), r#"#!/usr/bin/python3
+import ctypes, pathlib, signal, sys
+bundle = sys.stdin.buffer.read()
+if not bundle: sys.exit(0)
+(pathlib.Path(__file__).parent / "../viewer-bundle.json").write_bytes(bundle)
+ctypes.CDLL(None).prctl(15, b"ibara-view", 0, 0, 0)
+signal.pause()
+"#);
     write_executable(&vesper_bin.join("systemd-run"), "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n");
     write_executable(&vesper_bin.join("hyprctl"), "#!/bin/sh\nexit 1\n");
     let vesper_target = Target::start(&world, node("vesper"), None, 300_000);
@@ -349,6 +357,19 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     std::thread::sleep(Duration::from_millis(300));
     copy(&world, "tulip1", TEXT, b"on Tulip1 before Take Control");
     copy(&world, "vesper", TEXT, b"on Vesper before Take Control");
+
+    // Warm is idempotent, ticketless and does not change the agent's ownership.
+    let before_warm = on(&mut vesper, &id, &e, "operator-status", &[]);
+    for _ in 0..2 {
+        let warmed = on(&mut vesper, &id, &e, "operator-control", &["--op", "warm"]);
+        assert!(warmed["error"].is_null(), "{warmed}");
+    }
+    let after_warm = on(&mut vesper, &id, &e, "operator-status", &[]);
+    for field in ["owner", "ownership_revision"] {
+        assert_eq!(before_warm["data"]["result"][field], after_warm["data"]["result"][field]);
+    }
+    assert!(issued.lock().is_empty(), "warming never issues a ticket");
+    assert!(!vesper_bin.join("../viewer-bundle.json").exists(), "standby waits for explicit Take Control");
 
     // Take Control: the viewer, and only the viewer, gets a ticket issued for this console's certificate.
     let taken = control(&mut vesper, &id, &e, "take_control");
@@ -391,7 +412,7 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     assert_eq!((copies(&world, "tulip1"), copies(&world, "vesper")), (3, 3), "no starting content shared and no echo");
     assert_eq!(clipboard(&world, "tulip1"), Some((PNG.into(), picture.clone())));
 
-    // Hand Back ends screen sharing, both watchers, and the sharing.
+    // Hand Back fences screen sharing and ends both clipboard watchers. The child stays warm.
     let stream_pid: u32 = fs::read_to_string(desk.join("stream.pid")).unwrap().trim().parse().unwrap();
     let back = control(&mut vesper, &id, &e, "handback");
     assert!(back["result"]["owner"].as_str().unwrap().contains(&task), "{back}");
@@ -408,8 +429,9 @@ fn take_control_hands_the_viewer_its_ticket_and_shares_the_clipboard_both_ways()
     assert_eq!(ran["status"], "ok", "same task continues: {ran}");
     let finished = agent.call(&world, "computer_finish", json!({"task_ref":task,"request_id":"takeover-finish", "outcome":"complete", "summary":"Done answered after Take Control and Hand Back; same task's next command succeeded."}));
     assert_eq!(finished["status"], "ok", "{finished}");
-    wait_for("screen sharing and the clipboard watchers to end", 10, || {
-        let running: Vec<u32> = [stream_pid].into_iter().chain(watchers(&world, "tulip1")).chain(watchers(&world, "vesper")).filter(|p| alive(*p)).collect();
+    assert!(alive(stream_pid), "the fenced stream stays warm after Hand Back");
+    wait_for("the clipboard watchers to end", 10, || {
+        let running: Vec<u32> = watchers(&world, "tulip1").into_iter().chain(watchers(&world, "vesper")).filter(|p| alive(*p)).collect();
         running.is_empty().then_some(())
     });
     copy(&world, "vesper", TEXT, b"on Vesper after Hand Back");

@@ -266,6 +266,8 @@ pub struct Controller {
     stream: Option<Rc<dyn StreamPort>>,
     /// The highest stream generation used, so every new one is above it.
     stream_generation: Cell<u64>,
+    stream_warm_until: Cell<i64>,
+    stream_was_busy: Cell<bool>,
     clipboard: RefCell<clipboard::Clipboard>,
     operator_grants: GrantSource,
     reader: Arc<reader::JournalReader>,
@@ -375,6 +377,8 @@ impl Controller {
             desktop: options.desktop,
             stream: options.stream,
             stream_generation: Cell::new(0),
+            stream_warm_until: Cell::new(0),
+            stream_was_busy: Cell::new(false),
             clipboard: RefCell::new(clipboard::Clipboard::default()),
             operator_grants: options.operator_grants,
             reader,

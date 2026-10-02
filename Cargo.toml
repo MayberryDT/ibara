@@ -2,7 +2,7 @@
 name = "ibara"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-only"
+license = "MIT"
 description = "ibara: use your computers from any other, by you and your agents"
 publish = false
 
@@ -32,6 +32,8 @@ png = "0.18"
 parking_lot = "0.12"
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 psl = "2"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [profile.release]
 opt-level = "s"

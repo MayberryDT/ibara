@@ -64,7 +64,7 @@ fn request(principal: &str, line: &[u8], fingerprint: &str) -> Result<(Value, Du
         }
         action["operator_key_fingerprint"] = json!(fingerprint);
     }
-    let slow = matches!(op.as_str(), "take_control" | "handback" | "pause" | "resume" | "viewer_ticket")
+    let slow = matches!(op.as_str(), "take_control" | "handback" | "pause" | "resume" | "viewer_ticket" | "warm")
         || crate::controller::SLOW_OPS.contains(&op.as_str())
         || crate::controller::SLOW_FILE_OPS.contains(&op.as_str());
     let deadline = if slow { 150_000 } else { 6_000 };

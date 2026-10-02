@@ -1,8 +1,26 @@
 # Changelog
 
+## Unreleased — Viewer Hand Back
+
+- Carry expected owner/revision in viewer bundles and accept viewer Hand Back without closing the viewer before the target confirms.
+
+## Unreleased — Signed Update Awareness
+
+- License core under MIT, copyright 2026 Tyler Mayberry. The bundled Sunshine and Moonlight forks remain separate GPL-3.0 programs.
+- Reuse the Cua plugin until its source, Hyprland or GCC changes.
+- Report remote ibara updates through persistent progress/results; refuse busy/current computers before dispatch and report shell failures or defer until unlock.
+- Check the signed channel in the operator daemon at startup and every six hours, with a Settings opt-out and cached version/history. Checks install nothing.
+- Make `ibara update --check --json` script-friendly.
+- Package the console's loaded-version stamp so it can detect a stale shell without a missing-file warning.
+- Take Control removes viewer reading waits and controller setup, reuses H.264 encoder validation, starts screen sharing during agent settlement, and keeps fenced streams and one ticketless viewer warm for bounded intent and return periods. Hand Back closes the window first.
+
 Each release's notes are also in its signed manifest, and the console shows them once after an update, under What's New. Versions are `PKGVER-PKGREL`: all 3 packages (`ibara`, `ibara-stream` and `ibara-view`) always share one version.
 
 ## Unreleased
+
+- Added optional Hypoland dispatcher input, clear compositor and input safety
+  reasons in doctor and agent status, and virtual-screen setup independent of
+  the Cua plugin build.
 
 - Take Control pauses the agent's task and keeps its questions answerable. Hand Back lets the same agent continue. Approvals tied to a held step expire when the person takes control.
 

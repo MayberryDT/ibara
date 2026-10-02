@@ -76,7 +76,8 @@ pub(crate) fn power_socket_exists() -> bool {
 
 /// One request to the root power helper: a JSON line out, a JSON line back.
 async fn power_helper(request: Value) -> Result<Value> {
-    power_request(request, POWER_DEADLINE).await
+    let deadline = if request["op"] == "update_ibara" { Duration::from_secs(14) } else { POWER_DEADLINE };
+    power_request(request, deadline).await
 }
 
 /// One request to the root power helper within `deadline`; its reply when
@@ -353,7 +354,7 @@ impl Controller {
                     let what = if action == "update_ibara" { "ibara" } else { "Omarchy" };
                     log_event("power", &format!("{what} update at a person's request"));
                 }
-                Ok(json!({"action": action, "state": reply["state"], "message": reply["message"]}))
+                Ok(json!({"action": action, "state": reply["state"], "version": reply["version"], "message": reply["message"]}))
             }
             _ => Err(invalid("Choose restart, shutdown, sleep, lock, update_ibara or update_omarchy.")),
         }

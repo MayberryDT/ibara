@@ -901,7 +901,13 @@ impl Controller {
                     }
                     Ok::<(), IbaraError>(())
                 };
-                let (fenced, paused) = tokio::join!(stream.revoke(), pause);
+                // Start fenced in parallel with input settlement. No ticket yet.
+                let start = async {
+                    let fenced = stream.revoke().await?;
+                    stream.start().await?;
+                    Ok::<_, IbaraError>(fenced)
+                };
+                let (fenced, paused) = tokio::join!(start, pause);
                 paused?;
                 if fenced?.is_some_and(|s| !s.settled) {
                     return Err(fail("CONTROL_UNSETTLED", "Keys held through the earlier viewer were not released in time.", false));
@@ -939,7 +945,12 @@ impl Controller {
                 }));
             }
             transition_started = true;
-            self.end_stream().await?;
+            self.stream_warm_until.set(self.now_ms() + 60_000);
+            let settlement = stream.revoke().await?;
+            if settlement.is_some_and(|s| !s.settled) {
+                return Err(fail("CONTROL_UNSETTLED", "Keys held through the viewer were not released in time.", false));
+            }
+            self.stream_was_busy.set(false);
             self.clear_viewer_owner();
             authorize()?;
             // After a person's own pause the computer stays theirs. Otherwise
@@ -1086,9 +1097,8 @@ pub(crate) async fn sweep_viewer(me: Weak<Controller>) {
     }
 }
 
-/// Closing the viewer ends its stream: checked every second, an idle
-/// `ibara-stream` (no live ticket, no launch waiting, no stream) is stopped. The holder
-/// keeps control and the computer stays paused; Open Viewer starts it again.
+/// Idle streams are checked every second and stopped when their warm deadline
+/// expires. Closing a viewer keeps control and the computer paused.
 pub(crate) async fn stream_watch(me: Weak<Controller>) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1101,19 +1111,77 @@ pub(crate) async fn stream_watch(me: Weak<Controller>) {
 }
 
 impl Controller {
-    /// Stop the stream when idle. A transition in progress (it holds the
-    /// viewer lock) decides for itself.
+    /// Warming changes no ownership or admission. Each intent extends the deadline.
+    pub(crate) fn request_stream_warm(&self, duration_ms: i64) {
+        self.stream_warm_until.set(
+            self.stream_warm_until
+                .get()
+                .max(self.now_ms() + duration_ms),
+        );
+    }
+
+    pub(crate) async fn warm_stream(&self) -> Result<Value> {
+        let stream = self.usable_stream()?;
+        if !self.desktop.session_available() {
+            return Err(fail(
+                "CAPABILITY_UNAVAILABLE",
+                "Desktop session unavailable.",
+                true,
+            ));
+        }
+        self.request_stream_warm(90_000);
+        let _turn = self.viewer_lock.lock().await;
+        stream.start().await?;
+        Ok(
+            json!({"endpoint_id": self.endpoint_id, "controller_epoch": self.epoch,
+            "warm_until_ms": self.stream_warm_until.get()}),
+        )
+    }
+
+    /// Transitions hold the viewer lock. Idle warmth expires even when ignored.
     pub(crate) async fn stop_idle_stream(&self) {
         let Some(stream) = self.stream.clone() else { return };
-        if !stream.status().await.ok().flatten().is_some_and(|s| s.idle) {
+        let Ok(_turn) = self.viewer_lock.try_lock() else { return };
+        let status = match stream.status().await {
+            Ok(status) => status,
+            Err(e) => {
+                // A failed status socket must not turn unused warmth into an
+                // unbounded child. Active viewing still follows its own revoke.
+                if self.stream_warm_until.get() > 0 && self.stream_warm_until.get() <= self.now_ms()
+                    && !self.stream_was_busy.get()
+                {
+                    let _ = stream.stop().await;
+                    log_event("stream_warm_expired", &e.to_string());
+                }
+                return;
+            }
+        };
+        if status.is_none() {
+            self.stream_was_busy.set(false);
+            if self.stream_warm_until.get() > self.now_ms()
+                && !self.viewer_state.borrow().fault
+                && self.desktop.session_available()
+            {
+                if let Err(e) = stream.start().await {
+                    self.stream_warm_until.set(0);
+                    log_event("stream_warm_failed", &e.to_string());
+                }
+            }
             return;
         }
-        let Ok(_turn) = self.viewer_lock.try_lock() else { return };
-        if stream.status().await.ok().flatten().is_some_and(|s| s.idle) {
-            match stream.stop().await {
-                Ok(()) => log_event("stream_stopped", "nobody is viewing"),
-                Err(e) => log_event("stream_stop_failed", &e.to_string()),
-            }
+        if !status.unwrap().idle {
+            self.stream_was_busy.set(true);
+            return;
+        }
+        if self.stream_was_busy.replace(false) {
+            self.stream_warm_until.set(self.now_ms() + 60_000);
+        }
+        if self.stream_warm_until.get() > self.now_ms() {
+            return;
+        }
+        match stream.stop().await {
+            Ok(()) => log_event("stream_stopped", "warm deadline expired; nobody is viewing"),
+            Err(e) => log_event("stream_stop_failed", &e.to_string()),
         }
     }
 }

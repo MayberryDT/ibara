@@ -33,9 +33,9 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 # D-Bus to systemd and logind, nl80211 for Wi-Fi wake, and a datagram socket
-# for the wired wake-on-LAN ioctl, which sends nothing.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
-IPAddressDeny=any
+# for wired wake-on-LAN. Update preflight also fetches the signed release
+# manifest before deciding whether an update unit is needed.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0077
 RuntimeMaxSec=30s
 MemoryMax=64M

@@ -344,6 +344,7 @@ impl Controller {
                 options: &[],
                 now_iso: &now,
             })?;
+            self.request_stream_warm(90_000);
             let names: Vec<&str> = asked.iter().map(|e| e.site.as_str()).collect();
             self.push_event(
                 Some(&request.task_ref),

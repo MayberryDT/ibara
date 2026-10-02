@@ -225,6 +225,9 @@ fn restart_shell_in(find: Find, waits: &ShellWaits) -> Result<bool, String> {
     const BY_HAND: &str = "Run: omarchy restart shell";
     let old = shell_pids(find);
     let restarted = omarchy_in(find, "omarchy-restart-shell", &[]).ok_or("Omarchy's restart command is missing, so the shell was not restarted.")?;
+    if let Err(e) = &restarted && old.iter().any(|&pid| alive(pid)) {
+        return Err(format!("The shell did not restart ({e}). {BY_HAND}"));
+    }
     if !within(waits.stop, || !old.iter().any(|&pid| alive(pid))) {
         return Err(match restarted {
             Err(e) => format!("The shell did not restart ({e}). {BY_HAND}"),
@@ -350,15 +353,65 @@ fn show_plugin(changed: bool) -> Result<(), String> {
 /// plugin changed, so it loads the new one.
 pub(super) fn reload_plugin(before: String) -> Result<(), String> {
     if plugin_digest() == before || !shell_running() {
+        shell_outcome("unchanged", "")?;
+        return Ok(());
+    }
+    if session_locked() {
+        let path = shell_restart_path();
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(path, format!("{}\n", serde_json::json!({"plugin_digest": plugin_digest(), "since": crate::ids::now_millis(), "reason": "locked"}))).map_err(|e| e.to_string())?;
+        shell_outcome("deferred_locked", "Its bar restarts after unlock.")?;
         return Ok(());
     }
     println!("Restarting Omarchy's shell once to load the new ibara plugin…");
     match restart_shell() {
-        Ok(false) => {}
-        Ok(true) => println!("The new shell closed right away, so ibara started it again."),
-        Err(e) => println!("{e}"),
+        Ok(_) => {
+            let _ = std::fs::remove_file(shell_restart_path());
+            shell_outcome("restarted", "")?;
+        }
+        Err(e) => { shell_outcome("failed", &e)?; return Err(e); }
     }
     Ok(())
+}
+
+fn shell_restart_path() -> PathBuf {
+    crate::operator::directory::operator_state_dir().join("shell-restart.json")
+}
+
+fn session_locked() -> bool {
+    program("omarchy-hyprland-session-locked").is_some_and(|p| Command::new(p).status().is_ok_and(|s| s.success()))
+}
+
+fn shell_outcome(state: &str, message: &str) -> Result<(), String> {
+    let path = crate::operator::directory::operator_state_dir().join("shell-restart-result.json");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(path, format!("{}\n", serde_json::json!({"state": state, "message": message, "at": crate::ids::now_millis()}))).map_err(|e| e.to_string())
+}
+
+pub(super) fn shell_outcome_at(home: &Path) -> Option<serde_json::Value> {
+    std::fs::read(home.join(".local/state/ibara/shell-restart-result.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Only poll the lock when an update left a restart pending. The target owns
+/// this loop; console-only installations start it in their operator daemon.
+pub(crate) fn start_shell_retry() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            if !shell_restart_path().is_file() { continue; }
+            let _ = tokio::task::spawn_blocking(|| {
+                if session_locked() { return; }
+                match restart_shell() {
+                    Ok(_) => { let _ = shell_outcome("restarted", ""); let _ = std::fs::remove_file(shell_restart_path()); }
+                    Err(e) => {
+                        // An unlock/lock race should stay pending, not break a live lock.
+                        if !session_locked() { let _ = shell_outcome("failed", &e); let _ = std::fs::remove_file(shell_restart_path()); }
+                    }
+                }
+            }).await;
+        }
+    });
 }
 
 /// One plain line about Tailscale: signed in, or how to sign in.

@@ -191,6 +191,11 @@ pub trait DesktopPort {
     fn outputs(&self) -> LocalFuture<'_, Result<Vec<DisplayInfo>>>;
     /// `format` is `png` or `jpeg`.
     fn preview<'a>(&'a self, display_id: &'a str, quality: &'a str, format: &'a str) -> LocalFuture<'a, Result<Preview>>;
+    /// A cached successful H.264 encode probe; absence leaves encoder selection automatic.
+    fn vaapi_render_node(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Whether this computer streams live video: `{capable, reason}`.
     fn video_capability(&self) -> VideoCapability {
         VideoCapability { capable: false, reason: Some(crate::desktop::video::UNSUPPORTED.into()) }

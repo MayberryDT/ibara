@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -52,6 +53,7 @@ fn is_sha256_hex(s: &str) -> bool {
 
 /// The live stream port.
 pub struct LiveStream {
+    desktop: Rc<dyn super::ports::DesktopPort>,
     program: PathBuf,
     dir: PathBuf,
     base_port: u16,
@@ -61,10 +63,12 @@ pub struct LiveStream {
 }
 
 impl LiveStream {
-    pub fn new(state_dir: &Path) -> LiveStream {
+    pub fn new(state_dir: &Path, desktop: Rc<dyn super::ports::DesktopPort>) -> LiveStream {
         let program = std::env::var_os("IBARA_STREAM_BIN").filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| BIN.into());
         let base_port = std::env::var("IBARA_STREAM_PORT").ok().and_then(|p| p.parse().ok()).filter(|p: &u16| *p > 5).unwrap_or(BASE_PORT);
-        LiveStream { program, dir: state_dir.join("stream"), base_port, child: RefCell::new(None), sequence: Cell::new(0) }
+        LiveStream {
+            desktop,
+            program, dir: state_dir.join("stream"), base_port, child: RefCell::new(None), sequence: Cell::new(0) }
     }
 
     fn socket(&self) -> PathBuf {
@@ -95,8 +99,9 @@ impl LiveStream {
         if !apps.exists() {
             std::fs::write(&apps, json!({"env": {}, "apps": [{"name": "Desktop", "image-path": "desktop.png"}]}).to_string())?;
         }
-        let config = format!(
+        let mut config = format!(
             "port = {port}\nbind_address = {address}\naddress_family = ipv4\ncapture = wlr\n\
+             hevc_mode = 1\nav1_mode = 1\n\
              lan_encryption_mode = 2\nwan_encryption_mode = 2\n\
              file_apps = {apps}\nfile_state = {state}\ncredentials_file = {credentials}\n\
              pkey = {key}\ncert = {cert}\nlog_path = {log}\nmin_log_level = info\n",
@@ -108,6 +113,12 @@ impl LiveStream {
             cert = file("cert.pem"),
             log = file("ibara-stream.log"),
         );
+        if let Some(node) = self.desktop.vaapi_render_node() {
+            config.push_str(&format!(
+                "encoder = vaapi\nadapter_name = {}\n",
+                node.display()
+            ));
+        }
         let path = self.dir.join("ibara-stream.conf");
         std::fs::write(&path, config)?;
         Ok(path)
@@ -226,7 +237,7 @@ impl LiveStream {
                 self.kill_child().await;
                 return Err(unavailable("Screen sharing did not start in time; see its log on this computer."));
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 

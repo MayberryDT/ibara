@@ -12,6 +12,7 @@ pub mod atspi;
 pub mod capture;
 pub mod chrome;
 pub mod clipboard;
+pub mod compositor_input;
 pub mod cua;
 pub mod handover;
 pub mod hyprland;
@@ -343,6 +344,7 @@ pub struct Desktop {
     env: Arc<[(OsString, OsString)]>,
     hypr: Hyprland,
     cua: cua::Cua,
+    compositor_input: compositor_input::CompositorInput,
     /// When text was last typed, for [`input::AFTER_TYPING`].
     typed_at: Mutex<Option<Instant>>,
     idle: idle::Idle,
@@ -363,9 +365,10 @@ impl Desktop {
         let (events, _) = broadcast::channel(watch::EVENT_CAPACITY);
         // Where helpers find Hyprland's sockets.
         let runtime = cfg.env.iter().rev().find(|(k, _)| k == "XDG_RUNTIME_DIR").map(|(_, v)| PathBuf::from(v)).or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
+        let compositor_input = compositor_input::CompositorInput::new(hypr.clone(), cua.clone(), runtime.clone());
         let handover = handover::Handover::new(hypr.clone(), cua.clone(), cfg.state_dir.join("pointer-hidden"), runtime);
         let video = video::Video::new(cfg.wf_recorder.clone(), env.clone());
-        Desktop { cfg, env, hypr, cua, typed_at: Mutex::new(None), idle, events, preview: Mutex::new(None), handover, video }
+        Desktop { cfg, env, hypr, cua, compositor_input, typed_at: Mutex::new(None), idle, events, preview: Mutex::new(None), handover, video }
     }
 
     pub fn config(&self) -> &DesktopConfig {
@@ -548,6 +551,24 @@ impl Desktop {
 
     // ---- effects ----
 
+    async fn uses_dispatchers(&self) -> bool {
+        match crate::settings::current().text("input_backend").as_deref() {
+            Some("dispatchers") => true,
+            Some("plugin") => false,
+            _ => self.hypr.hypoland_version().await.ok().flatten().is_some(),
+        }
+    }
+
+    async fn prepare_dispatchers(&self) -> Result<()> {
+        let created = self.compositor_input.prepare().await?;
+        if created && self.cua.cursor_shown() {
+            // Creating the seat pointer resets the compositor's hide timer.
+            // Let its next cursor tick pass before sending any agent input.
+            tokio::time::sleep(Duration::from_millis(650)).await;
+        }
+        Ok(())
+    }
+
     /// Run an effect; on failure wait for helpers and release held input
     /// (`CONTROL_UNSETTLED` if that fails), and mark the error
     /// `execution_not_started` when no mutating helper ran (`act`, §4).
@@ -556,16 +577,21 @@ impl Desktop {
     /// the agent's input takes it back.
     async fn effect<T>(&self, cancel: Option<&Cancel>, work: impl Future<Output = Result<T>>) -> Result<T> {
         cua::unless_cancelled(cancel)?;
+        if self.uses_dispatchers().await {
+            // The passive seat pointer must exist before hiding it. Launch
+            // and window management still work if wheel support is missing.
+            let _ = self.prepare_dispatchers().await;
+        }
         self.handover.to_agent().await?;
         cua::unless_cancelled(cancel)?;
-        let before = (run::mutating_spawn_count(), cua::dispatch_count());
+        let before = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count());
         match work.await {
             Ok(value) => Ok(value),
             Err(error) => {
                 if error.details.get("reason").and_then(Value::as_str) == Some("interrupted") {
                     self.handover.person_moved().await;
                 }
-                let started = (run::mutating_spawn_count(), cua::dispatch_count()) != before
+                let started = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count()) != before
                     && error.details.get("execution_not_started") != Some(&Value::Bool(true));
                 if let Err(release) = self.release_input().await {
                     return Err(if release.code == "CONTROL_UNSETTLED" {
@@ -649,6 +675,11 @@ impl Desktop {
                 ClickTarget::Point { x, y, surface } => {
                     let (window, lx, ly, screens) = self.window_at(*x, *y, surface.as_ref()).await?;
                     let (gx, gy) = (window.at[0] as f64 + lx, window.at[1] as f64 + ly);
+                    if self.uses_dispatchers().await {
+                        self.prepare_dispatchers().await?;
+                        self.compositor_input.click(&window, (gx,gy), &screens, button, double, cancel).await?;
+                        return Ok(screens.fraction(gx,gy));
+                    }
                     self.point_from_cursor(&window).await;
                     self.cua.pace(gx, gy, &screens).await;
                     cua::unless_cancelled(cancel)?;
@@ -672,6 +703,11 @@ impl Desktop {
                                     .with("next", "Scroll it into view, observe again and click it."));
                             }
                             let (lx, ly) = (gx - live.at[0] as f64, gy - live.at[1] as f64);
+                            if self.uses_dispatchers().await {
+                                self.prepare_dispatchers().await?;
+                                self.compositor_input.click(&live, (gx,gy), &screens, button, double, cancel).await?;
+                                return Ok(screens.fraction(gx,gy));
+                            }
                             self.point_from_cursor(&live).await;
                             self.cua.pace(gx, gy, &screens).await;
                             cua::unless_cancelled(cancel)?;
@@ -764,6 +800,10 @@ impl Desktop {
             if !screens.show(to.x, to.y) {
                 return Err(invalid("No screen shows the point to drag to.").with("field", "to"));
             }
+            if self.uses_dispatchers().await {
+                self.prepare_dispatchers().await?;
+                return self.compositor_input.drag(&window, (from.x,from.y), (to.x,to.y), &screens, duration, cancel).await;
+            }
             self.cua.lead(from.x, from.y, &screens).await;
             cua::unless_cancelled(cancel)?;
             let (tx, ty) = (to.x - window.at[0] as f64, to.y - window.at[1] as f64);
@@ -782,6 +822,11 @@ impl Desktop {
                 Some(at) => self.window_at(at.x, at.y, None).await?.0,
                 None => self.hypr.active_window().await?.ok_or_else(|| stale("No window has focus."))?,
             };
+            if self.uses_dispatchers().await {
+                self.prepare_dispatchers().await?;
+                let at = at.map(|p| (p.x,p.y)).unwrap_or((window.at[0] as f64 + window.size[0] as f64/2.0, window.at[1] as f64 + window.size[1] as f64/2.0));
+                return self.compositor_input.scroll(&window,at,&self.screens().await,dx,dy,cancel).await;
+            }
             self.cua.scroll(window.pid, cua::window_id(&window.address)?, dx, dy).await
         })
         .await
@@ -795,6 +840,9 @@ impl Desktop {
             let keys = input::cua_keys(combo)?;
             let live = self.ensure_focused(surface).await?;
             self.after_typing().await;
+            if self.uses_dispatchers().await {
+                return self.compositor_input.key(surface,&keys,cancel).await;
+            }
             let window = cua::window_id(&live.address)?;
             match self.cua.key(live.pid, window, &keys).await {
                 Err(refused) if held(&refused) => self.key_past_menu(surface, live.pid, window, &keys, refused, cancel).await,
@@ -883,11 +931,17 @@ impl Desktop {
             let live = self.ensure_focused(surface).await?;
             let window = cua::window_id(&live.address)?;
             let to_field = cursor == TypingCursor::ToField && self.cua.cursor_shown();
-            let result = if text.is_ascii() {
+            let dispatchers = self.uses_dispatchers().await;
+            let ascii = text.is_ascii() && (!dispatchers || self.compositor_input.ascii_keyboard().await?);
+            let result = if ascii {
                 if to_field && let Some(field) = self.cua.typing_field(live.pid, window).await {
                     self.cua.to_field(&field, live.geometry(), &self.screens().await).await;
                 }
-                self.cua.type_ascii(live.pid, window, text, cancel, async || self.ensure_focused(surface).await.map(drop)).await
+                if dispatchers {
+                    self.compositor_input.type_ascii(surface,text,cancel).await
+                } else {
+                    self.cua.type_ascii(live.pid, window, text, cancel, async || self.ensure_focused(surface).await.map(drop)).await
+                }
             } else {
                 async {
                     let field = self.cua.insert_field(live.pid, window).await?;
@@ -924,24 +978,26 @@ impl Desktop {
     /// Once no agent holds control, the screen goes back to the person's
     /// pointer first, or, while Cua's call was in flight, once it has ended.
     pub async fn release_input(&self) -> Result<()> {
+        let dispatcher_release = self.compositor_input.release().await;
         if !self.cua.has_agent() {
             self.handover.release().await;
         }
-        run::wait_for_helpers(run::HELPER_SETTLE).await?;
-        self.cua.settle(cua::SETTLE).await?;
+        let helpers = run::wait_for_helpers(run::HELPER_SETTLE).await;
+        let cua = self.cua.settle(cua::SETTLE).await;
         if !self.cua.has_agent() {
             self.handover.release().await;
         }
-        Ok(())
+        dispatcher_release.and(helpers).and(cua)
     }
 
     /// Stop the Cua worker (startup, shutdown), which takes the named cursor
     /// with it, and draw Hyprland's pointer again. The Hyprland plugin
     /// releases anything it held when the worker's connection closes.
     pub async fn reset_input(&self) -> Result<()> {
+        let dispatcher_release = self.compositor_input.release().await;
         self.cua.stop().await;
         self.handover.reset().await;
-        Ok(())
+        dispatcher_release
     }
 
     /// Keep the screen awake while an agent works (§12.1).
@@ -1168,9 +1224,13 @@ impl Desktop {
         })
     }
 
-    /// Whether this computer streams live video. Until the one probe has
-    /// finished (it needs an unlocked session and runs in the background,
-    /// started here) the answer says it is still checking.
+    /// The cached render node proven to encode H.264.
+    pub fn vaapi_render_node(&self) -> Option<PathBuf> {
+        self.video.encoder_node()
+    }
+
+    /// Whether this computer streams live video. Until the background probe
+    /// finishes, the answer says it is still checking.
     pub fn video_capability(&self) -> video::VideoCapability {
         if let Some(known) = self.video.capability() {
             return known;
@@ -1210,15 +1270,37 @@ impl Desktop {
             };
             Capability { name, status, backend, last_tested_at: tested.clone(), reason }
         };
-        let (monitors, plugin, idle_status) = tokio::join!(self.hypr.monitors(), self.hypr.cua_status(), self.idle.status());
+        let (monitors, plugin, hypoland, idle_status) = tokio::join!(self.hypr.monitors(), self.hypr.cua_status(), self.hypr.hypoland_version(), self.idle.status());
         let hypr_ok = monitors.as_ref().map(|m| !m.is_empty()).map_err(Clone::clone);
         let cua_present = on_path(&self.cfg.cua);
+        let input = if self.uses_dispatchers().await {
+            let compositor = hypoland.ok().flatten().map(|v| format!("Hypoland {v}, without plugin support. ")).unwrap_or_default();
+            let ready = self.prepare_dispatchers().await;
+            let keyboard = self.hypr.devices().await.map(|d| d["keyboards"].as_array().is_some_and(|ks| ks.iter().any(|k| k["main"] == true)));
+            let keyboard_reason = match &keyboard {
+                Ok(true) => String::new(),
+                Ok(false) => " No seat keyboard: dispatcher keys are unavailable.".into(),
+                Err(error) => format!(" The seat keyboard could not be checked: {}",error.message),
+            };
+            Capability {
+                name: "native.input",
+                status: if ready.is_ok() && cua_present && matches!(keyboard, Ok(true)) { "available" } else { "unavailable" },
+                backend: "cua-driver+compositor-dispatchers".into(),
+                last_tested_at: tested.clone(),
+                reason: Some(format!("{compositor}{}{keyboard_reason}{}", compositor_input::SAFETY, ready.err().map(|e| format!(" {}",e.message)).unwrap_or_else(|| if cua_present { String::new() } else { " cua-driver is missing.".into() }))),
+            }
+        } else {
+            let plugin = if let Some(version) = hypoland.ok().flatten() {
+                Err(IbaraError::new("CAPABILITY_UNAVAILABLE", format!("Hypoland {version} has no plugin support. Select Automatic or Compositor Dispatchers for agent input."),true))
+            } else { plugin.map(|ready| ready && cua_present) };
+            row("native.input", "cua-driver+hyprland-plugin".into(), plugin)
+        };
         vec![
             row("hyprland", "hyprctl".into(), hypr_ok.clone()),
             row("native.hyprland", "hyprctl".into(), hypr_ok),
             row("session", "hyprland-session-lock".into(), idle::require_unlocked(monitors).map(|()| true)),
             row("native.capture", "grim".into(), Ok(on_path(&self.cfg.grim))),
-            row("native.input", "cua-driver+hyprland-plugin".into(), plugin.map(|ready| ready && cua_present)),
+            input,
             row("native.atspi", "cua-driver".into(), Ok(cua_present)),
             row("native.idle", self.cfg.idle_binary.display().to_string(), idle_status.map(|_| true)),
         ]

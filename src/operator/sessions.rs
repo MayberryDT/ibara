@@ -98,7 +98,7 @@ impl OperatorRequest {
     /// The argv checks of ibara-operator.mjs:158-163.
     pub fn check_shape(&self) -> Result<()> {
         let op = self.op.as_str();
-        let supported = ["status", "task_status", "observe", "session", "access", "attention"].contains(&op) || PAUSE_OPS.contains(&op) || takes_action(op);
+        let supported = ["status", "task_status", "observe", "session", "access", "attention", "warm"].contains(&op) || PAUSE_OPS.contains(&op) || takes_action(op);
         let epoch = self.epoch.as_deref().unwrap_or("");
         let epoch_bad = if op == "session" { !epoch.is_empty() } else { !pattern::id(epoch) };
         if self.computer.is_empty() || !supported || epoch_bad {

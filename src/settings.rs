@@ -65,6 +65,7 @@ const SECTIONS: &[Section] = &[
     Section { id: "agents", title: "Agents", scope: Scope::Computer },
     Section { id: "approvals", title: "Approvals", scope: Scope::Console },
     Section { id: "notifications", title: "Notifications", scope: Scope::Console },
+    Section { id: "updates", title: "Updates", scope: Scope::Console },
     Section { id: "files", title: "Files", scope: Scope::Console },
     Section { id: "fleet", title: "Fleet", scope: Scope::Console },
 ];
@@ -80,6 +81,7 @@ pub const DISPLAY_SIZES: &[(&str, &str)] = &[
 
 /// This computer's own choice for Ask before agents send, spend or delete.
 const ASK_FIRST: &[(&str, &str)] = &[("same", "Same as in Settings"), ("on", "On"), ("off", "Off")];
+const INPUT_BACKENDS: &[(&str, &str)] = &[("auto", "Automatic"), ("plugin", "Cua Plugin"), ("dispatchers", "Compositor Dispatchers")];
 
 /// Kept in this computer's file but not listed with its settings: what ibara's
 /// Settings chose for every computer (`fleet_ask_first`), which the console
@@ -92,6 +94,18 @@ fn listed(def: &Def) -> bool {
 }
 
 const DEFS: &[Def] = &[
+    Def {
+        section: "updates", key: "check_for_updates", title: "Check for ibara updates",
+        help: "Check the signed release channel at start and every six hours. Updates install only when you choose Update.",
+        kind: Kind::Bool(true),
+    },
+    Def {
+        section: "agents",
+        key: "input_backend",
+        title: "Input Backend",
+        help: "Automatic uses dispatchers on Hypoland and the Cua plugin on Hyprland. Dispatchers provide reduced input safety when the plugin is unavailable.",
+        kind: Kind::Choice(INPUT_BACKENDS, "auto"),
+    },
     Def {
         section: "general",
         key: "name",
@@ -575,7 +589,8 @@ mod tests {
         let section = SECTIONS.iter().find(|s| s.id == "agents").unwrap();
         let listed = section_json(section, &values("[agents]\nfleet_ask_first = false\n"), &Defaults::default());
         let keys: Vec<&str> = listed["settings"].as_array().unwrap().iter().map(|s| s["key"].as_str().unwrap()).collect();
-        assert_eq!(keys, ["ask_first"]);
-        assert_eq!(listed["settings"][0]["choices"][0], json!({"value": "same", "label": "Same as in Settings (off)"}));
+        assert!(!keys.contains(&"fleet_ask_first"));
+        let ask = listed["settings"].as_array().unwrap().iter().find(|s| s["key"] == "ask_first").unwrap();
+        assert_eq!(ask["choices"][0], json!({"value": "same", "label": "Same as in Settings (off)"}));
     }
 }

@@ -274,8 +274,10 @@ fn with(data: &Value, extra: &[(&str, Value)]) -> Value {
 pub async fn selected_control(ctx: &Ctx) -> Handled {
     let computer = validated_id(option(&ctx.args, "--computer"), "computer_id")?;
     let epoch = validated_id(option(&ctx.args, "--epoch"), "controller_epoch")?;
-    let op = option(&ctx.args, "--op").unwrap_or("");
-    let pausing = ["pause", "resume"].contains(&op);
+    let requested_op = option(&ctx.args, "--op").unwrap_or("");
+    let close_after = requested_op == "viewer_handback";
+    let op = if close_after { "handback" } else { requested_op };
+    let pausing = ["pause", "resume", "warm"].contains(&op);
     if !pausing && !["take_control", "handback"].contains(&op) {
         return Err(Fault::plain("Unknown selected control operation."));
     }
@@ -290,11 +292,22 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         json!({"expected_owner": owner, "expected_ownership_revision": revision})
     };
     let view = if op == "take_control" { ibara_view() } else { None };
+    if view.is_some() {
+        // Viewer setup overlaps registration, stream startup and agent settlement.
+        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 90).await;
+    }
     if let Some(bin) = &view
         && let Err(refusal) = register_viewer(ctx, &computer, &epoch, bin).await
     {
         return Ok(refusal);
     }
+    let closed_first = if op == "handback" && !close_after {
+        let closed = close_viewer(&ctx.console, &computer);
+        clipboard::stop(&ctx.console, &computer);
+        closed
+    } else {
+        false
+    };
     let call = ctx.console.sessions.call(&computer, Some(&epoch), op, fields);
     let data = match tokio::time::timeout(CONTROL_DEADLINE, call).await {
         Err(_) => return Err(Fault::Timeout(TRANSPORT_TIMED_OUT.into())),
@@ -307,6 +320,18 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
         Ok(Ok(data)) => data,
     };
+    if op == "warm" {
+        if !binds(&data, &computer, &epoch) {
+            return Ok(ctx.failure(
+                "IDENTITY_MISMATCH",
+                "Warm reply changed target binding.",
+                "unauthorized",
+                false,
+            ));
+        }
+        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 90).await;
+        return Ok(ctx.ready(data));
+    }
     let reply = data.get("result").cloned().unwrap_or(Value::Null);
     let bound = binds(&data, &computer, &epoch)
         && reply.get("endpoint_id") == data.get("endpoint_id")
@@ -340,7 +365,8 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
         clipboard::stop(&ctx.console, &computer);
         // The stream has ended; a viewer left running would block the next one.
-        let closed = close_viewer(&ctx.console, &computer);
+        let closed = if close_after { close_viewer(&ctx.console, &computer) } else { closed_first };
+        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 60).await;
         return Ok(ctx.ready(with(&data, &[("viewer_started", json!(false)), ("viewer_closed", json!(closed))])));
     }
     let ready = reply.get("viewer_ready") == Some(&json!(true))
@@ -435,11 +461,14 @@ fn viewer_bundle(computer: &str, epoch: &str, row: &ListedComputer, stream: &Val
 /// Open ibara-view on the computer's stream with its ticket and share the
 /// clipboard. The ticket never leaves this process except on the viewer's stdin.
 async fn open_stream(ctx: &Ctx, computer: &str, epoch: &str, row: &ListedComputer, bin: &Path, stream: &Value, data: &Value) -> Handled {
-    let Some(bundle) = viewer_bundle(computer, epoch, row, stream) else {
+    let Some(mut bundle) = viewer_bundle(computer, epoch, row, stream) else {
         return Ok(ctx.failure("CONTROL_UNCERTAIN", "The computer's viewer ticket was incomplete; choose Open Viewer.", "failed", false));
     };
-    let pid = launch_ibara_view(bin, &bundle).await?;
+    bundle["expected_owner"] = data["result"]["owner"].clone();
+    bundle["expected_ownership_revision"] = data["result"]["ownership_revision"].clone();
+    let pid = launch_ibara_view(&ctx.console, bin, &bundle).await?;
     remember_viewer(ctx, computer, pid);
+    super::viewer::watch_viewer(&ctx.console, computer, epoch, pid);
     clipboard::start(&ctx.console, computer, epoch);
     let mut data = data.clone();
     if let Some(stream) = data.get_mut("result").and_then(|r| r.get_mut("stream")).and_then(Value::as_object_mut) {

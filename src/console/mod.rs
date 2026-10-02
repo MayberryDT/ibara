@@ -36,6 +36,7 @@ mod selected;
 pub mod video;
 mod viewer;
 mod logins;
+mod updates;
 
 use crate::operator::directory::{OperatorDirectory, directory_path};
 use crate::operator::sessions::OperatorSessions;
@@ -83,6 +84,8 @@ pub struct Console {
     logins: logins::Logins,
     /// The viewer this console started for each computer, ended on hand back.
     viewers: Mutex<HashMap<String, u32>>,
+    standby: Mutex<Option<viewer::Standby>>,
+    warmed_attention: Mutex<std::collections::HashSet<String>>,
     /// The clipboard shared with each computer this console controls, and the
     /// controller epoch it was started for.
     clipboards: Mutex<HashMap<String, (String, tokio::task::JoinHandle<()>)>>,
@@ -104,6 +107,8 @@ impl Console {
             fleet: fleet::Fleet::default(),
             logins: logins::Logins::default(),
             viewers: Mutex::new(HashMap::new()),
+            standby: Mutex::new(None),
+            warmed_attention: Mutex::new(std::collections::HashSet::new()),
             clipboards: Mutex::new(HashMap::new()),
         }
     }
@@ -112,6 +117,7 @@ impl Console {
     /// directory or now answers as a new computer: its session, what the fleet
     /// kept, its video, its shared clipboard and its viewer.
     fn forget_computer(&self, computer: &str) {
+        viewer::forget_standby(self, computer);
         self.sessions.forget(computer);
         self.fleet.forget(computer);
         self.logins.forget(computer);
@@ -313,6 +319,11 @@ async fn dispatch(ctx: &Ctx) -> Handled {
         "wake" => fleet::wake(ctx).await,
         "settings" => fleet::console_settings(ctx),
         "whats-new" => Ok(ctx.ready(crate::install::update::whats_new())),
+        "update-check" => {
+            if ctx.args.iter().any(|a| a == "--refresh") {
+                updates::refresh().await.map(|v| ctx.ready(v)).map_err(Fault::Plain)
+            } else { Ok(ctx.ready(updates::cached())) }
+        }
         "whats-new-seen" => crate::install::update::whats_new_seen().map(|data| ctx.ready(data)).map_err(Fault::Plain),
         "unattended-boot" => Ok(ctx.ready(crate::install::unattended_boot::status_json())),
         "unattended-boot-lock" => crate::install::unattended_boot::console_lock(&ctx.args).map(|data| ctx.ready(data)).map_err(Fault::Plain),
@@ -528,6 +539,8 @@ pub fn main() -> i32 {
         let console = Arc::new(Console::new(database, frames.clone()));
         *console.chrome.lock().unwrap_or_else(|e| e.into_inner()) = Some(chrome.clone());
         logins::start(&console);
+        updates::start();
+        if crate::install::system::station_owner().is_none() { crate::install::user::start_shell_retry(); }
         eprintln!("ibarad: operator console serving {}", path.display());
         serve(listener, console).await;
         chrome.close().await;

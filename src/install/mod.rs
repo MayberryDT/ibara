@@ -128,7 +128,15 @@ pub fn uninstall_main(args: Vec<OsString>) -> ExitCode {
 
 /// `ibara update [--check]`.
 pub fn update_main(args: Vec<OsString>) -> ExitCode {
-    finish(update::update(&strings(args)))
+    let args = strings(args);
+    if args.iter().any(|a| a == "--check") {
+        return match update::check(&args) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(1),
+            Err(e) => { eprintln!("{e}"); ExitCode::from(2) }
+        };
+    }
+    finish(update::update(&args))
 }
 
 /// `ibara rollback`.

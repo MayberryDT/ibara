@@ -159,7 +159,7 @@ pub async fn launch_with_input<S: AsRef<OsStr>>(argv: &[S], input: &[u8]) -> Res
     Ok(pid)
 }
 
-fn spawn_detached<S: AsRef<OsStr>>(argv: &[S], piped: bool) -> Result<(u32, Option<tokio::process::ChildStdin>), Fault> {
+pub(super) fn spawn_detached<S: AsRef<OsStr>>(argv: &[S], piped: bool) -> Result<(u32, Option<tokio::process::ChildStdin>), Fault> {
     let (program, rest) = argv.split_first().ok_or_else(|| Fault::plain("Nothing to launch."))?;
     let mut command = match which("systemd-run") {
         Some(systemd_run) => {

@@ -13,13 +13,13 @@
 
 use super::{
     AGENT_ACCOUNT, Account, BACKUPS, CONFIG_DIR, INSTALL_ROOT, LIB, OPERATOR_PUBLIC, OPERATOR_SHELL, RUNTIME_GROUP, STATION, create_root,
-    getent, installed_version, is_root, output, random_hex, relink, root_dir, run, sha256_hex, write_root,
+    getent, is_root, output, random_hex, relink, root_dir, run, sha256_hex, write_root,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | update-latest | omarchy-update | omarchy-update-end | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
+const USAGE: &str = "Usage: ibara system setup USER | refresh | rebuild-cua | uninstall USER [--delete-data] | update USER (PACKAGE SHA256)… | update-latest | update-end | omarchy-update | omarchy-update-end | rollback USER | unattended-boot enable [--dry-run] | disable | boot-check";
 
 /// System units the package ships; setup enables them for the desktop user.
 const SYSTEM_UNITS: [&str; 3] = ["ibara-agent-sshd.service", "ibara-access.socket", "ibara-power.socket"];
@@ -58,6 +58,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
         }
         ["update", user, pairs @ ..] if !pairs.is_empty() => super::update::system_update(&Account::desktop(user)?, pairs),
         ["update-latest"] => super::update::system_update_latest(),
+        ["update-end"] => super::update::system_update_end(),
         ["omarchy-update"] => super::omarchy_update::system_omarchy_update(),
         ["omarchy-update-end"] => super::omarchy_update::system_omarchy_update_end(),
         ["rollback", user] => super::update::system_rollback(&Account::desktop(user)?),
@@ -98,7 +99,7 @@ fn set_up(desktop: &Account, by_person: bool) -> Result<(), String> {
         step("Tailscale", || tailscale(desktop))?;
     }
     step("Browser page reader", || browser(desktop))?;
-    step("Cua's Hyprland plugin", || cua_plugin(desktop))?;
+    step("Desktop input and virtual screen", || cua_plugin(desktop))?;
     Ok(())
 }
 
@@ -120,7 +121,7 @@ fn refresh() -> Result<(), String> {
 fn rebuild_cua() -> Result<(), String> {
     let Some(owner) = station_owner() else { return Ok(()) };
     let desktop = Account::desktop(&owner)?;
-    step("Cua's Hyprland plugin", || cua_plugin(&desktop))
+    step("Desktop input and virtual screen", || cua_plugin(&desktop))
 }
 
 fn preconditions(desktop: &Account) -> Result<(), String> {
@@ -514,19 +515,54 @@ fn browser(desktop: &Account) -> Result<(), String> {
 fn cua_inputs() -> Option<Value> {
     let versions = run("pacman", &["-Q", "hyprland", "gcc"]).ok()?;
     let version = |name: &str| versions.lines().find_map(|l| l.strip_prefix(&format!("{name} ")).map(str::to_string));
-    Some(json!({"hyprland": version("hyprland")?, "gcc": version("gcc")?, "ibara": installed_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into())}))
+    Some(json!({"hyprland": version("hyprland")?, "gcc": version("gcc")?}))
+}
+
+fn cua_source_digest(dir: &Path) -> Result<String, String> {
+    fn walk(dir: &Path, base: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() { walk(&path, base, files)?; }
+            else { files.push((path.strip_prefix(base).unwrap().to_path_buf(), std::fs::read(&path)?)); }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files).map_err(|e| format!("Could not read Cua's source: {e}"))?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut bytes = Vec::new();
+    for (name, content) in files {
+        bytes.extend(name.as_os_str().as_encoded_bytes());
+        bytes.push(0);
+        bytes.extend(sha256_hex(&content).as_bytes());
+    }
+    Ok(sha256_hex(&bytes))
 }
 
 /// Cua's Hyprland plugin, built on this computer for its exact Hyprland and
-/// GCC, again whenever either (or ibara) changed since the last build.
+/// GCC, again whenever either or the vendored Cua source changed.
 fn cua_plugin(desktop: &Account) -> Result<(), String> {
-    let Some(inputs) = cua_inputs() else {
-        println!("    Hyprland is not installed; the plugin is built once it is.");
+    output(Command::new("bash").arg(Path::new(LIB).join("ops/desktop-config.sh")).arg(&desktop.name))?;
+    if let Ok(version) = run("pacman", &["-Q", "hypoland"]) {
+        println!("    {} has no plugin support. Agent input uses compositor dispatchers with reduced safety; the virtual screen is configured.", version.trim());
+        return Ok(());
+    }
+    // Also recognize a source-installed binary, without requiring a live session.
+    if let Ok(raw) = output(Command::new("hypoland").arg("--version-json").env("XDG_RUNTIME_DIR", format!("/run/user/{}", desktop.uid)))
+        && let Ok(version) = serde_json::from_str::<Value>(&raw)
+        && let Some(version) = version["hypolandVersion"].as_str()
+    {
+        println!("    Hypoland {version} has no plugin support. Agent input uses compositor dispatchers with reduced safety; the virtual screen is configured.");
+        return Ok(());
+    }
+    let Some(mut inputs) = cua_inputs() else {
+        println!("    The virtual screen is configured. The Cua plugin needs the stock Hyprland and GCC packages; check those packages before building it.");
         return Ok(());
     };
+    inputs["source"] = json!(cua_source_digest(&Path::new(LIB).join("cua-hyprland-plugin"))?);
     let dir = Path::new(INSTALL_ROOT).join("cua");
     let built: Value = std::fs::read(dir.join("build.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-    let same = ["hyprland", "gcc", "ibara"].iter().all(|k| built.get(*k) == inputs.get(*k));
+    let same = ["hyprland", "gcc", "source"].iter().all(|k| built.get(*k) == inputs.get(*k));
     if same && dir.join("cua-hyprland-plugin.so").is_file() {
         println!("    Already built for Hyprland {}.", inputs["hyprland"].as_str().unwrap_or(""));
         return Ok(());
@@ -537,7 +573,7 @@ fn cua_plugin(desktop: &Account) -> Result<(), String> {
             .arg(&script)
             .arg(Path::new(LIB).join("cua-hyprland-plugin"))
             .arg(&desktop.name)
-            .env("IBARA_VERSION", inputs["ibara"].as_str().unwrap_or("")),
+            .env("IBARA_CUA_SOURCE", inputs["source"].as_str().unwrap_or("")),
     )?;
     if let Some(last) = out.lines().rev().find(|l| !l.trim().is_empty()) {
         println!("    {}", last.trim());

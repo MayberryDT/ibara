@@ -170,7 +170,7 @@ fn a_person_takes_control_from_an_agent_whose_input_stopped_cleanly() {
 }
 
 #[test]
-fn closing_the_viewer_stops_the_stream_but_keeps_control_and_the_pause() {
+fn closing_the_viewer_keeps_control_and_warms_the_stream_until_its_deadline() {
     run(async {
         let rig = rig(true);
         let c = &rig.controller;
@@ -182,6 +182,16 @@ fn closing_the_viewer_stops_the_stream_but_keeps_control_and_the_pause() {
 
         rig.stream.0.viewing.set(false);
         c.stop_idle_stream().await;
+        assert!(
+            rig.stream.0.running.get(),
+            "the idle stream stays warm after close"
+        );
+        rig.clock.fetch_add(60_001, Ordering::SeqCst);
+        c.stop_idle_stream().await;
+        assert!(
+            !rig.stream.0.running.get(),
+            "the warm deadline always reclaims it"
+        );
         assert_eq!(rig.stream.calls().last().map(String::as_str), Some("stop"));
         let status = c.operator_call("vesper", operator_action(c, "status")).await.unwrap();
         assert_eq!((status["owner"].clone(), status["holds_control"].clone()), (json!("operator:vesper"), json!(true)));
@@ -204,7 +214,7 @@ fn closing_the_viewer_stops_the_stream_but_keeps_control_and_the_pause() {
 }
 
 #[test]
-fn handing_back_releases_keys_and_ends_the_stream_without_resuming_an_agent() {
+fn handing_back_releases_keys_and_keeps_the_stream_warm_without_resuming_an_agent() {
     run(async {
         let rig = rig(true);
         let c = &rig.controller;
@@ -212,7 +222,8 @@ fn handing_back_releases_keys_and_ends_the_stream_without_resuming_an_agent() {
         rig.stream.connect(&ticket(&taken), CERT);
         let before = rig.stream.calls().len();
         let back = transition(c, "vesper", "handback").await.unwrap();
-        assert_eq!(rig.stream.calls()[before..], ["revoke", "stop"]);
+        assert_eq!(rig.stream.calls()[before..], ["revoke"]);
+        assert!(rig.stream.0.running.get());
         assert_eq!((back["owner"].clone(), back["agent_resumed"].clone()), (json!("none"), json!(false)));
 
         // Keys not proven released: the hand back fails and the computer stays fenced.

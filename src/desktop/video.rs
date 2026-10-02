@@ -285,6 +285,15 @@ impl Video {
         }))
     }
 
+    /// A render node proven to encode H.264, after the background probe.
+    pub fn encoder_node(&self) -> Option<PathBuf> {
+        self.0
+            .probed
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .cloned()
+    }
+
     /// The cached probe, if it has finished.
     pub fn capability(&self) -> Option<VideoCapability> {
         self.0.probed.get().map(|probed| match probed {

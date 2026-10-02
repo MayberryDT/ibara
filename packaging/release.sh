@@ -134,7 +134,7 @@ build_package ibara "$core/packaging" IBARA_CORE_DIR="$core" IBARA_PLUGIN_DIR="$
 build_package ibara-stream "$stream/packaging/ibara" IBARA_STREAM_DIR="$stream" IBARA_VERSION="$pkgver"
 build_package ibara-view "$view/packaging/ibara" IBARA_VIEW_DIR="$view" IBARA_VERSION="$pkgver"
 
-# The sources the packages were built from: core (GPL-3.0), the plugin (MIT)
+# The sources the packages were built from: core (MIT), the plugin (MIT)
 # and both forks (GPL-3.0) with their submodules. Two submodules hold only
 # prebuilt binaries and are named by commit instead: ibara-stream's
 # third-party/build-deps (the FFmpeg it links comes from its release of that
@@ -180,13 +180,22 @@ for name in ibara ibara-stream ibara-view; do
   packages=$(jq --arg name "$name" --arg file "$file" --arg sha "$(sha256sum "$out/$file" | cut -d' ' -f1)" \
     --argjson size "$(stat -c %s "$out/$file")" '. + [{name: $name, file: $file, sha256: $sha, size: $size}]' <<<"$packages")
 done
-jq -n --arg version "$version" --argjson packages "$packages" --arg at "$(date -u +%FT%TZ)" \
+# Carry only notes from the previously verified channel into the new signed
+# manifest. An offline build can still produce a release with its own notes.
+history='[]'
+printf 'ibara-release namespaces="ibara-release" %s\n' "$IBARA_RELEASE_KEY" >"$build/allowed_signers"
+if curl -fsSL --proto '=https' --proto-redir '=https' --max-time 12 --max-filesize 262144 "$IBARA_BASE_URL/stable.json" -o "$build/previous.json" &&
+   curl -fsSL --proto '=https' --proto-redir '=https' --max-time 12 --max-filesize 262144 "$IBARA_BASE_URL/stable.json.sig" -o "$build/previous.json.sig" &&
+   ssh-keygen -Y verify -f "$build/allowed_signers" -I ibara-release -n ibara-release -s "$build/previous.json.sig" <"$build/previous.json" >/dev/null 2>&1; then
+  history=$(jq --arg version "$version" '([{version, released_at, notes}] + (.history // [])) | map(select(.version != $version)) | reduce .[] as $r ([]; if any(.[]; .version == $r.version) then . else . + [$r] end) | .[:9]' "$build/previous.json")
+fi
+jq -n --arg version "$version" --argjson packages "$packages" --argjson history "$history" --arg at "$(date -u +%FT%TZ)" \
   --arg core "$(git -C "$core" rev-parse HEAD)" --arg plugin "$(git -C "$plugin" rev-parse HEAD)" \
   --arg stream "$(git -C "$stream" rev-parse HEAD)" --arg view "$(git -C "$view" rev-parse HEAD)" \
   --rawfile notes "$notes" \
   '{schema_version: 2, name: "ibara", version: $version, released_at: $at, packages: $packages,
     source: {core: $core, plugin: $plugin, stream: $stream, view: $view, file: ("ibara-" + $version + "-source.tar.gz")},
-    notes: ($notes | split("\n") | map(select(length > 0)))}' >"$out/stable.json"
+    notes: ($notes | split("\n") | map(select(length > 0))), history: $history}' >"$out/stable.json"
 rm -f "$out/stable.json.sig"
 if [[ -n $in_agent ]]; then
   # With a public key, ssh-keygen signs through ssh-agent.

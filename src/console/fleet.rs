@@ -297,12 +297,43 @@ pub async fn fleet_attention(ctx: &Ctx) -> Handled {
         Ok::<_, IbaraError>(items_of(&row, &data["result"]))
     })
     .await;
-    let mut state = lock();
-    for (row, outcome) in fetched {
-        state.record(&row.computer_id, began, outcome.ok());
+    let (items, unreachable) = {
+        let mut state = lock();
+        for (row, outcome) in fetched {
+            state.record(&row.computer_id, began, outcome.ok());
+        }
+        state.items(&ids)
+    };
+    for item in &items {
+        if !matches!(item["kind"].as_str(), Some("question" | "login"))
+            || item["unreachable"] == json!(true)
+        {
+            continue;
+        }
+        let (Some(computer), Some(att)) = (item["computer_id"].as_str(), item["ref"].as_str())
+        else {
+            continue;
+        };
+        if ctx
+            .console
+            .warmed_attention
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(format!("{computer}:{att}"))
+        {
+            let epoch = ctx
+                .console
+                .fleet
+                .epochs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(computer)
+                .cloned();
+            if let Some(epoch) = epoch {
+                super::viewer::warm_viewer(&ctx.console, computer, &epoch, 90).await;
+            }
+        }
     }
-    let (items, unreachable) = state.items(&ids);
-    drop(state);
     let count = items.len();
     Ok(ctx.ready(json!({"items": items, "count": count, "unreachable": unreachable})))
 }

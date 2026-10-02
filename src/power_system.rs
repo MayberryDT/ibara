@@ -97,7 +97,7 @@ const IBARA_UPDATE: Job = Job {
     unit: crate::install::update::UPDATE_UNIT,
     command: "update-latest",
     description: "ibara update, asked for from another computer",
-    stop_post: None,
+    stop_post: Some("update-end"),
     started: "ibara is updating to the latest release. It may restart its bar when it finishes.",
 };
 
@@ -245,7 +245,7 @@ fn running(roots: &Roots, job: &Job) -> Option<Value> {
     } else {
         format!("{} is updating on this computer. Update {} once it has finished.", busy.name, job.name)
     };
-    Some(json!({"ok": true, "action": job.action, "state": "running", "message": message}))
+    Some(json!({"ok": true, "action": job.action, "state": if busy.unit == job.unit { "running" } else { "busy" }, "message": message}))
 }
 
 /// Start an update apart from this helper, which it outlives; one update at a time.
@@ -253,9 +253,20 @@ fn update(roots: &Roots, job: &Job) -> Value {
     if let Some(reply) = running(roots, job) {
         return reply;
     }
+    // Test roots exercise dispatch without touching a live installation.
+    if job.action == "update_ibara" && roots.bin == Path::new("/usr/bin") {
+        match crate::install::update::preflight() {
+            Ok(Some(reply)) => return reply,
+            Ok(None) => {}
+            Err(message) => return json!({"ok": false, "error": {"code": "INTERNAL_ERROR", "message": message}}),
+        }
+    }
     let ibara = Path::new(crate::install::LIB).join("bin/ibara");
     let mut command = roots.program("systemd-run");
     command.args(["--quiet", "--collect", "--property=Type=exec", "--unit", job.unit]);
+    if job.action == "update_ibara" && let Ok(url) = std::env::var("IBARA_UPDATE_BASE_URL") {
+        command.arg(format!("--setenv=IBARA_UPDATE_BASE_URL={url}"));
+    }
     if let Some(end) = job.stop_post {
         command.arg(format!("--property=ExecStopPost=+{} system {end}", ibara.display()));
     }

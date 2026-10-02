@@ -45,7 +45,7 @@ You are welcome to use an agent. Point it at this file and at [docs/development.
 
 ## License
 
-ibara's core is licensed under the [GNU General Public License version 3 only](LICENSE). By contributing, you agree that your contribution is licensed under the same terms.
+ibara's core is licensed under the [MIT License](LICENSE). By contributing, you agree that your contribution is licensed under the same terms. The separate `ibara-stream` and `ibara-view` forks remain GPL-3.0; contributions to those programs follow their own license terms.
 
 ## Code of conduct
 

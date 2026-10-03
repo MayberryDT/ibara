@@ -214,6 +214,7 @@ pub trait DesktopPort {
     fn subscribe(&self) -> Option<broadcast::Receiver<DesktopEvent>>;
     /// Start the event watcher (once, from `Controller::start`).
     fn start_watch(&self) {}
+    fn person_turn(&self, _person: bool) -> LocalFuture<'_, ()> { Box::pin(async {}) }
     fn release_input(&self) -> LocalFuture<'_, Result<()>>;
     fn reset_input(&self) -> LocalFuture<'_, Result<()>>;
     fn set_idle_inhibited(&self, on: bool) -> LocalFuture<'_, Result<()>>;

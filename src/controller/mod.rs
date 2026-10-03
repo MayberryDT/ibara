@@ -36,6 +36,8 @@ mod reader;
 mod replay;
 mod situation;
 pub mod stream;
+mod screen;
+mod turns;
 mod watchdog;
 mod windows;
 mod logins;
@@ -157,6 +159,7 @@ pub struct ControllerOptions {
     pub desktop: Rc<dyn DesktopPort>,
     /// `ibara-stream` for Take Control; `None` where nobody may take control.
     pub stream: Option<Rc<dyn StreamPort>>,
+    pub screen: Option<Rc<screen::ScreenStream>>,
     pub operator_grants: GrantSource,
     pub computer: ComputerIdentity,
     pub effect_rules: EffectRules,
@@ -180,6 +183,7 @@ impl ControllerOptions {
             storage,
             desktop,
             stream: None,
+            screen: None,
             operator_grants: Rc::new(Map::new),
             computer: ComputerIdentity { name: "this computer".into(), ..Default::default() },
             effect_rules: EffectRules::default(),
@@ -264,6 +268,12 @@ pub struct Controller {
     storage: StorageService,
     desktop: Rc<dyn DesktopPort>,
     stream: Option<Rc<dyn StreamPort>>,
+    screen: Option<Rc<screen::ScreenStream>>,
+    turns: RefCell<turns::Turns>,
+    fallback_reason: RefCell<Option<String>>,
+    fallback_until: Cell<i64>,
+    screen_generation: Cell<u64>,
+    screen_admissions: RefCell<HashMap<String, (String, Value)>>,
     /// The highest stream generation used, so every new one is above it.
     stream_generation: Cell<u64>,
     stream_warm_until: Cell<i64>,
@@ -376,6 +386,12 @@ impl Controller {
             storage: options.storage,
             desktop: options.desktop,
             stream: options.stream,
+            screen: options.screen,
+            turns: RefCell::new(turns::Turns::default()),
+            fallback_reason: RefCell::new(None),
+            fallback_until: Cell::new(0),
+            screen_generation: Cell::new(0),
+            screen_admissions: RefCell::new(HashMap::new()),
             stream_generation: Cell::new(0),
             stream_warm_until: Cell::new(0),
             stream_was_busy: Cell::new(false),
@@ -466,6 +482,7 @@ impl Controller {
             tokio::task::spawn_local(control::sweep_viewer(Rc::downgrade(self)));
             tokio::task::spawn_local(control::stream_watch(Rc::downgrade(self)));
         }
+        tokio::task::spawn_local(turns::screen_watch(Rc::downgrade(self)));
         tokio::task::spawn_local(control::lease_ticks(Rc::downgrade(self)));
         tokio::task::spawn_local(watchdog::watchdog_loop(Rc::downgrade(self)));
         Ok(())
@@ -492,6 +509,11 @@ impl Controller {
             let _ = stream.revoke().await;
             let _ = stream.stop().await;
         }
+        if let Some(screen) = &self.screen {
+            let _ = screen.settle().await;
+            screen.stop().await;
+        }
+        self.desktop.person_turn(false).await;
         self.clipboard_stop();
         // The person's pointer again before this process (and Cua's cursor with it) ends.
         self.desktop.set_agent(None);

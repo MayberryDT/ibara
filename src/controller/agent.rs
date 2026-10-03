@@ -2239,6 +2239,7 @@ impl Controller {
     /// takeover, a revoke): a step stops before its next input, never after.
     async fn send_input(&self, effect: &Effect, cancel: &Cancel) -> Result<Done> {
         crate::desktop::cua::unless_cancelled(Some(cancel)).map_err(|e| e.with("no_input_held", true))?;
+        self.turns.borrow_mut().before_action()?;
         self.desktop.act(effect, cancel).await
     }
 
@@ -2307,12 +2308,14 @@ impl Controller {
     }
 
     async fn dispatch_planned(&self, ctx: &CallCtx<'_>, resolved: &Resolved) -> Result<Done> {
+        if !matches!(resolved.plan, Planned::Observe) { self.turns.borrow_mut().before_action()?; }
         self.assert_authority(ctx.lease).map_err(|e| e.with("execution_not_started", true))?;
         match &resolved.plan {
             Planned::Observe => Ok(Done::default()),
             Planned::Desktop(effect) => {
                 let (cancel, _) = self.abort_handles();
                 self.mark_effect(Some(ctx.task_ref));
+                self.turns.borrow_mut().before_action()?;
                 let done = self.desktop.act(effect, &cancel).await;
                 self.mark_effect(None);
                 let done = match effect.as_ref() {
@@ -3276,7 +3279,8 @@ impl Controller {
                 cleanup.left.push(LeftOpen { surface: name, reason: "it has unsaved changes".into() });
             } else {
                 self.mark_effect(Some(task_ref));
-                let closed = self.desktop.act(&Effect::Close(live.key()), &cancel).await;
+                let allowed = self.turns.borrow_mut().before_action();
+                let closed = match allowed { Ok(()) => self.desktop.act(&Effect::Close(live.key()), &cancel).await, Err(error) => Err(error) };
                 self.mark_effect(None);
                 match closed {
                     Ok(_) => asked.push((live.key(), name)),

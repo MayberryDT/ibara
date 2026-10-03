@@ -441,3 +441,217 @@ signal.pause()
     assert_eq!(clipboard(&world, "vesper"), Some((TEXT.into(), b"on Vesper after Hand Back".to_vec())));
     assert_eq!((copies(&world, "tulip1"), copies(&world, "vesper")), (4, 4), "nothing travels after Hand Back");
 }
+
+
+/// Core and console run as real processes; only screen capture/input is a fixture.
+/// Keep the control exchange in IBARA_E2E_EVIDENCE, as for the fallback test above.
+#[test]
+fn join_watches_and_person_turns_settle_without_pausing_the_mcp_task() {
+    own_stream_scenario(false, false);
+}
+
+#[test]
+fn automatic_software_uses_sunshine_but_explicit_ibara_still_joins() {
+    own_stream_scenario(true, false);
+}
+
+#[test]
+fn automatic_nvenc_uses_sunshine_but_explicit_ibara_turns_settle() {
+    own_stream_scenario(false, true);
+}
+
+fn own_stream_scenario(software: bool, nvenc: bool) {
+    let world = World::new(if software { "automatic-software" } else if nvenc { "nvenc-person-turns" } else { "person-turns" });
+    let desk = world.root.join("desk-tulip1");
+    fs::create_dir_all(&desk).unwrap();
+    let screen = desk.join("ibara-screen");
+    write_executable(&screen, r#"#!/usr/bin/python3
+import json, os, pathlib, signal, sys, threading, time
+root=pathlib.Path(os.environ['IBARA_SCREEN_FIXTURE'])
+lock=threading.Lock()
+def emit(v):
+    with lock: print(json.dumps(dict(v=1, **v)),flush=True)
+if sys.argv[1]=='send':
+    (root/'events').touch()
+    def events():
+        with (root/'events').open() as f:
+            pending=''
+            while True:
+                pending += f.readline()
+                if pending.endswith('\n'):
+                    emit(json.loads(pending)); pending=''
+                else: time.sleep(.005)
+    threading.Thread(target=events,daemon=True).start()
+    emit(dict(t='ready',port=47910,cert_sha256='5e7a'*16,encoder=(root/'encoder').read_text(),capture='fixture'))
+    for line in sys.stdin:
+        v=json.loads(line)
+        with (root/'commands').open('a') as f: f.write(json.dumps(v)+'\n')
+        if v['t']=='settle': emit(dict(t='settled',ok=not (root/'fail-settle').exists()))
+        if v['t']=='status': emit(dict(t='status',generation=1,viewers=2,held=0,target_idle=True,last_frame_age_ms=1))
+        if v['t']=='stop': break
+elif '--identity' in sys.argv: print('ab12'*16)
+else:
+    bundle=sys.stdin.read()
+    if not bundle: sys.exit(0)
+    (root/'bundle').write_text(bundle)
+    import ctypes
+    ctypes.CDLL(None).prctl(15,b'ibara-screen',0,0,0)
+    signal.pause()
+"#);
+    fs::write(desk.join("encoder"), if software { "openh264" } else if nvenc { "nvenc" } else { "h264_vaapi" }).unwrap();
+    let stream_bin = desk.join("ibara-stream");
+    write_executable(&stream_bin, FAKE_STREAM);
+    let issued = serve_stream(&world.root.join("target-tulip1/state"), desk.join("stream.pid"));
+    let hyprctl = desk.join("hyprctl");
+    let idle = desk.join("idle");
+    write_executable(&hyprctl, FAKE_HYPRCTL);
+    write_executable(&idle, FAKE_TOGGLE_IDLE);
+    let env = [
+        ("IBARA_SCREEN_BIN", screen.as_os_str()),
+        ("IBARA_SCREEN_FIXTURE", desk.as_os_str()),
+        ("IBARA_TEST_HYPRCTL", hyprctl.as_os_str()),
+        ("IBARA_TEST_IDLE", idle.as_os_str()),
+        ("WAYLAND_DISPLAY", OsStr::new("wayland-e2e")),
+        ("IBARA_STREAM_BIN", stream_bin.as_os_str()),
+        ("IBARA_STREAM_BIND", OsStr::new("127.0.0.2")),
+    ];
+    let target = Target::start_with(&world, node("tulip1"), Some("Tulip1"), 300_000, &env);
+    let vesper_bin = world.machine_bin("vesper");
+    write_executable(&vesper_bin.join("systemd-run"), "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n");
+    write_executable(&vesper_bin.join("hyprctl"), "#!/bin/sh\nexit 1\n");
+    std::os::unix::fs::symlink("/usr/bin/env", vesper_bin.join("ibara-view")).unwrap();
+    write_executable(&vesper_bin.join("connect"), r#"#!/usr/bin/python3
+import ctypes, pathlib, signal, sys
+bundle=sys.stdin.buffer.read()
+if not bundle: sys.exit(0)
+(pathlib.Path(__file__).parent/'../fallback-bundle.json').write_bytes(bundle)
+ctypes.CDLL(None).prctl(15,b'ibara-view',0,0,0)
+signal.pause()
+"#);
+    let vesper_target = Target::start(&world, node("vesper"), None, 300_000);
+    let mut console = Console::start_with(&world, "vesper", node("vesper"), Some(&vesper_target), &env[..2]);
+    let id = add_own(&mut console, "tulip1");
+    let identity = console.home.join(".local/state/ibara/viewer");
+    fs::create_dir_all(&identity).unwrap();
+    fs::set_permissions(&identity, fs::Permissions::from_mode(0o700)).unwrap();
+    let der = b"fallback viewer identity";
+    fs::write(identity.join("cert.pem"), format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der))).unwrap();
+    fs::write(identity.join("key.pem"), "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n").unwrap();
+    let epoch = console.ok("operator-session", &["--computer", &id])["controller_epoch"].as_str().unwrap().to_string();
+    if software || nvenc {
+        let automatic = control(&mut console, &id, &epoch, "join");
+        assert_eq!(automatic["result"]["screen_engine"], "sunshine", "{automatic}");
+        if nvenc {
+            let reason = automatic["result"]["fallback_reason"].as_str().unwrap();
+            assert!(reason.contains("NVIDIA") && reason.contains("testing") && reason.contains("Choose ibara"), "{reason}");
+        }
+        assert!(!desk.join("commands").exists() || !fs::read_to_string(desk.join("commands")).unwrap().contains("\"ticket\""));
+        control(&mut console, &id, &epoch, "handback");
+        issued.lock().clear();
+        fs::remove_file(vesper_bin.join("../fallback-bundle.json")).unwrap();
+    }
+    for (key, value) in [("screen_stream", if software || nvenc { "ibara" } else { "auto" }), ("hand_back_seconds", "3")] {
+        let set = on(&mut console, &id, &epoch, "operator-settings", &["set", key, value]);
+        assert!(set["error"].is_null(), "{set}");
+    }
+    assert_eq!(target.admin(&["resume"]).0, Some(0));
+    let mut agent = Agent::start(&target);
+    let began = agent.call(&world, "computer_begin", json!({"request_id":"turn-begin","goal":"Keep working through person turns"}));
+    assert_eq!(began["status"], "ok", "{began}");
+    let task = began["result"]["task_ref"].as_str().unwrap().to_string();
+    let joined = control(&mut console, &id, &epoch, "join");
+    assert_eq!(joined["result"]["screen_engine"], "ibara", "{joined}");
+    assert_eq!(joined["viewer_started"], true, "{joined}");
+    let bundle: Value = wait_for("own viewer bundle", 10, || fs::read(desk.join("bundle")).ok().and_then(|b| serde_json::from_slice(&b).ok()));
+    assert_eq!(bundle["port"], 47910);
+    assert_eq!(bundle["input"], true);
+    let status = on(&mut console, &id, &epoch, "operator-status", &[]);
+    assert_eq!(status["data"]["result"]["paused"], false);
+    assert_eq!(status["data"]["result"]["turn"], "agent");
+    let working = agent.call(&world, "computer_exec", json!({"task_ref":task,"request_id":"watching-work","command":["/bin/true"]}));
+    assert_eq!(working["status"], "ok", "{working}");
+    let event = |value: Value| {
+        let mut f = fs::OpenOptions::new().append(true).open(desk.join("events")).unwrap();
+        writeln!(f, "{value}").unwrap();
+    };
+    event(json!({"t":"turn_request","operator_cert_sha256":"ab12".repeat(16)}));
+    wait_for("person turn", 5, || {
+        let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+        (s["data"]["result"]["turn"] == "person").then_some(())
+    });
+    let refused = agent.call(&world, "computer_act", json!({"task_ref":task,"request_id":"person-active-action","steps":[{"action":{"kind":"launch","app":"editor"}}]}));
+    assert_eq!(refused["error"]["reason"], "person_active", "{refused}");
+    assert!(refused["error"]["next"].as_str().unwrap().contains("Wait until"), "{refused}");
+    event(json!({"t":"person_input","held":1}));
+    std::thread::sleep(Duration::from_millis(3200));
+    let held = on(&mut console, &id, &epoch, "operator-status", &[]);
+    assert_eq!(held["data"]["result"]["turn"], "person");
+    assert_eq!(held["data"]["result"]["paused"], false);
+    // Run this second process scenario with IBARA_E2E_SWITCH_FAILURE=1.
+    if std::env::var_os("IBARA_E2E_SWITCH_FAILURE").is_some() {
+        fs::write(desk.join("fail-settle"), "fail settlement").unwrap();
+        let set = on(&mut console, &id, &epoch, "operator-settings", &["set", "screen_stream", "sunshine"]);
+        assert!(set["error"].is_null(), "{set}");
+        wait_for("failed settlement during engine switch ends the person turn", 5, || {
+            let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+            (s["data"]["result"]["turn"] == "agent" && s["data"]["result"]["fallback_reason"].is_string()).then_some(())
+        });
+        let finished = agent.call(&world, "computer_finish", json!({"task_ref":task,"request_id":"switch-finish","outcome":"complete","summary":"Failed sender stopped before the turn ended."}));
+        assert_eq!(finished["status"], "ok", "{finished}");
+        return;
+    }
+    control(&mut console, &id, &epoch, "handback");
+    let stale = agent.call(&world, "computer_act", json!({"task_ref":task,"request_id":"after-person-action","steps":[{"action":{"kind":"launch","app":"editor"}}]}));
+    assert_eq!(stale["error"]["reason"], "person_was_here", "{stale}");
+    assert!(stale["error"]["next"].as_str().unwrap().contains("computer_observe"), "{stale}");
+    assert_eq!(stale["error"]["execution_not_started"], true, "{stale}");
+    let commands = fs::read_to_string(desk.join("commands")).unwrap();
+    assert!(commands.lines().any(|line| serde_json::from_str::<Value>(line).unwrap()["t"] == "settle"));
+    // Closing the holder's last viewer ends even a manual turn; another viewer watches.
+    let set = on(&mut console, &id, &epoch, "operator-settings", &["set", "hand_back_seconds", "manual"]);
+    assert!(set["error"].is_null(), "{set}");
+    event(json!({"t":"turn_request","operator_cert_sha256":"ab12".repeat(16)}));
+    wait_for("second person turn", 5, || {
+        let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+        (s["data"]["result"]["turn"] == "person").then_some(())
+    });
+    event(json!({"t":"viewer","attached":false,"count":1,"operator_cert_sha256":"ab12".repeat(16),"operator_viewers":0}));
+    wait_for("holder disconnected while another viewer watches", 8, || {
+        let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+        (s["data"]["result"]["turn"] == "agent").then_some(())
+    });
+    let finished = agent.call(&world, "computer_finish", json!({"task_ref":task,"request_id":"turn-finish","outcome":"complete","summary":"Join did not pause the task; turns settled."}));
+    assert_eq!(finished["status"], "ok", "{finished}");
+    let revokes_before = fs::read_to_string(desk.join("commands")).unwrap().lines().filter(|line| serde_json::from_str::<Value>(line).unwrap()["t"] == "revoke").count();
+    let revision = target.admin(&["access"]).1["result"]["revision"].clone();
+    let denied_watch = json!({"subject":"vesper","capability":"watch","rule":"deny","expected_revision":revision}).to_string();
+    assert_eq!(target.admin(&["access_set", &denied_watch]).0, Some(0));
+    let denied = on(&mut console, &id, &epoch, "open-viewer", &[]);
+    assert!(!denied["error"].is_null(), "Open Viewer must enforce the same watch access as Join: {denied}");
+    wait_for("watch denial revokes admitted viewers", 5, || {
+        let revokes = fs::read_to_string(desk.join("commands")).unwrap().lines().filter(|line| serde_json::from_str::<Value>(line).unwrap()["t"] == "revoke").count();
+        (revokes > revokes_before).then_some(())
+    });
+    let revision = target.admin(&["access"]).1["result"]["revision"].clone();
+    let allow_watch = json!({"subject":"vesper","capability":"watch","rule":"allow","expected_revision":revision}).to_string();
+    assert_eq!(target.admin(&["access_set", &allow_watch]).0, Some(0));
+    control(&mut console, &id, &epoch, "join");
+    event(json!({"t":"failed","reason":"forced sender failure for E2E"}));
+    wait_for("automatic Sunshine fallback", 5, || {
+        let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+        (s["data"]["result"]["screen_engine"] == "sunshine" && s["data"]["result"]["fallback_reason"] == "forced sender failure for E2E").then_some(())
+    });
+    // The plugin asks this on the engine change; the console registers the other identity.
+    let fallback = control(&mut console, &id, &epoch, "screen_failed");
+    assert_eq!(fallback["result"]["screen_engine"], "sunshine", "{fallback}");
+    assert_eq!(fallback["result"]["fallback_reason"], "forced sender failure for E2E");
+    let bundle: Value = wait_for("fallback viewer bundle", 10, || fs::read(vesper_bin.join("../fallback-bundle.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()));
+    let tickets = issued.lock().clone();
+    assert_eq!(tickets.len(), 1);
+    assert_eq!(tickets[0]["client_cert_sha256"], ibara::server::policy::sha256_hex(der));
+    assert_eq!(bundle["ticket"], tickets[0]["ticket"]);
+    assert_eq!(bundle["expected_revision"], bundle["expected_ownership_revision"]);
+    let s = on(&mut console, &id, &epoch, "operator-status", &[]);
+    assert_eq!(s["data"]["result"]["paused"], true, "fallback retains today's Take Control");
+    control(&mut console, &id, &epoch, "handback");
+}

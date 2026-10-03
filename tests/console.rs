@@ -178,6 +178,24 @@ fn the_socket_is_private_and_a_second_service_refuses_to_start() {
 }
 
 #[test]
+fn an_operator_console_stops_cleanly_as_soon_as_its_socket_appears() {
+    for attempt in 0..8 {
+        let f = Fixture::new(&format!("early-stop-{attempt}"));
+        let mut daemon = f.start();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f.socket.exists() {
+            assert!(Instant::now() < deadline, "the socket never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // SAFETY: this is the daemon child owned by this E2E instance.
+        unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+        let status = daemon.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "startup stop {attempt}: {status}");
+        assert!(!f.socket.exists(), "a clean startup stop removes its socket");
+    }
+}
+
+#[test]
 fn failures_keep_the_bridge_codes() {
     let f = Fixture::new("failures");
     let daemon = f.start();

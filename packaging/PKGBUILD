@@ -28,7 +28,7 @@ arch=('x86_64')
 url=$(. "$_core/packaging/release.env" && printf '%s' "${IBARA_BASE_URL%/releases/latest/download}")
 license=('MIT')
 depends=(
-  'glibc' 'gcc-libs'
+  'glibc' 'gcc-libs' 'libva'
   'hyprland' 'grim' 'at-spi2-core'
   'cua-driver-bin>=0.28.2'
   'openssh' 'openssl' 'acl' 'sudo' 'curl' 'jq' 'pacman'
@@ -48,7 +48,7 @@ optdepends=(
   'ufw: firewall rules keeping the agent entry, pairing and streaming on the tailnet'
   'chromium: web pages agents can read and use'
 )
-makedepends=('cargo' 'git')
+makedepends=('cargo' 'git' 'clang')
 install=ibara.install
 options=('!lto' '!debug')
 
@@ -77,7 +77,7 @@ build() {
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$(realpath "$_core")=/ibara --remap-path-prefix=$(realpath -m "$CARGO_TARGET_DIR")=/target"
   # `ibara --version` prints pkgver-pkgrel.
   export IBARA_PKGREL=$pkgrel
-  cargo build --frozen --release --bins
+  cargo build --frozen --release --workspace --bins
 }
 
 package() {
@@ -87,9 +87,11 @@ package() {
 
   install -Dm755 "$built/ibara" "$lib/bin/ibara"
   install -Dm755 "$built/ibarad" "$lib/bin/ibarad"
+  install -Dm755 "$built/ibara-screen" "$lib/bin/ibara-screen"
   install -d "$pkgdir/usr/bin"
   ln -s ../lib/ibara/bin/ibara "$pkgdir/usr/bin/ibara"
   ln -s ../lib/ibara/bin/ibarad "$pkgdir/usr/bin/ibarad"
+  ln -s ../lib/ibara/bin/ibara-screen "$pkgdir/usr/bin/ibara-screen"
   install -Dm755 packaging/ops/computerctl "$pkgdir/usr/bin/computerctl"
   for script in entry.sh ibara-op-shell ibara-agent-sshd ibara-chrome-native ibara-editor cua-plugin.sh desktop-config.sh; do
     install -Dm755 "packaging/ops/$script" "$lib/ops/$script"
@@ -130,5 +132,10 @@ package() {
   printf '{"version":"%s-%s"}\n' "$pkgver" "$pkgrel" >"$plugin/build.json"
   install -Dm644 "$_plugin/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/omarchy-plugin-LICENSE"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 screen/vendor/cros-libva/LICENSE "$pkgdir/usr/share/licenses/$pkgname/cros-libva-LICENSE"
+  for notice in screen/licenses/*; do
+    install -Dm644 "$notice" "$pkgdir/usr/share/licenses/$pkgname/$(basename "$notice")"
+  done
+  install -Dm644 screen/vendor/cros-codecs/LICENSE "$pkgdir/usr/share/licenses/$pkgname/cros-codecs-LICENSE"
   install -Dm644 vendor/cua-hyprland-plugin/LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/cua-hyprland-plugin-LICENSE"
 }

@@ -604,6 +604,7 @@ impl Controller {
 
     /// Observe and store a frame for `task` (`lease` binds its choices).
     pub(crate) async fn build_frame(&self, task: &TaskRecord, lease: &LeaseRecord, spec: &FrameSpec) -> Result<(Rc<FrameState>, Option<Image>)> {
+        let observed_at = self.now_ms();
         let previous = self.frames.borrow().latest(&task.task_ref);
         let windows = self.desktop.windows().await?;
         let mut ordered: Vec<Win> = windows.clone();
@@ -786,6 +787,7 @@ impl Controller {
         });
         self.journal.put_observation(&task.task_ref, &lease.principal, &record, false)?;
         self.frames.borrow_mut().put(state.clone());
+        self.turns.borrow_mut().observed_since(observed_at);
         Ok((state, image))
     }
 

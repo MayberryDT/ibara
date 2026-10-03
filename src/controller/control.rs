@@ -823,9 +823,24 @@ impl Controller {
     /// and end it. The computer stays paused.
     pub async fn revoke_viewer_operator(&self, operator_id: &str) -> Result<()> {
         let _turn = self.viewer_lock.lock().await;
-        if self.viewer_state.borrow().owner.as_deref() != Some(operator_id) {
+        if self.screen_admissions.borrow().contains_key(operator_id) {
+            self.screen_admissions.borrow_mut().clear();
+            self.screen_generation.set(0);
+            self.stream_generation.set(self.stream_generation.get().saturating_add(1));
+            if let Some(screen) = &self.screen {
+                if let Err(error) = screen.command(json!({"t":"revoke"})).await {
+                    screen.stop().await;
+                    self.screen_fallback(&error.message).await;
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.end_person_turn().await {
+                self.screen_fallback(&error.message).await;
+                return Err(error);
+            }
             return Ok(());
         }
+        if self.viewer_state.borrow().owner.as_deref() != Some(operator_id) { return Ok(()); }
         self.pause_control(PauseOrigin::System, false)?;
         let outcome = self.end_stream().await;
         self.clear_viewer_owner();
@@ -838,6 +853,13 @@ impl Controller {
 
     /// `sweepViewerGrant` (`core.ts:485-490`).
     pub(crate) async fn sweep_viewer_grant(&self) -> Result<()> {
+        let admissions: Vec<_> = self.screen_admissions.borrow().iter().map(|(id, pair)| (id.clone(), pair.clone())).collect();
+        for (id, (cert, generation)) in admissions {
+            let active = self.operator_grant(&id).is_some_and(|g| g.active(self.now_ms()) && g.generation == generation
+                && self.viewer_identity(&id, &g).as_deref() == Some(&cert))
+                && self.watch_gate(&id).is_ok_and(|pending| pending.is_none());
+            if !active { self.revoke_viewer_operator(&id).await?; }
+        }
         let holder = self.viewer_state.borrow().owner.clone();
         let Some(holder) = holder else {
             return Ok(());
@@ -1121,6 +1143,16 @@ impl Controller {
     }
 
     pub(crate) async fn warm_stream(&self) -> Result<Value> {
+        if self.own_screen() {
+            let _lock = self.viewer_lock.lock().await;
+            self.request_stream_warm(90_000);
+            let started = match &self.screen { Some(screen) => screen.start().await, None => Err(fail("CAPABILITY_UNAVAILABLE", "ibara-screen is not installed.", true)) };
+            match started {
+                Ok(_) if self.own_screen() => return Ok(json!({"endpoint_id":self.endpoint_id,"controller_epoch":self.epoch,"screen_engine":"ibara","warm_until_ms":self.stream_warm_until.get()})),
+                Ok(_) => self.screen.as_ref().unwrap().stop().await,
+                Err(e) => self.screen_fallback(&e.message).await,
+            }
+        }
         let stream = self.usable_stream()?;
         if !self.desktop.session_available() {
             return Err(fail(

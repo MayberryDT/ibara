@@ -575,6 +575,8 @@ impl Desktop {
     /// Nothing starts once `cancel` has fired (control changed hands). The
     /// screen is the agent's first ([`handover`]): after a person took it,
     /// the agent's input takes it back.
+    pub async fn viewer_turn(&self, person: bool) { self.handover.viewer_turn(person); }
+
     async fn effect<T>(&self, cancel: Option<&Cancel>, work: impl Future<Output = Result<T>>) -> Result<T> {
         cua::unless_cancelled(cancel)?;
         if self.uses_dispatchers().await {

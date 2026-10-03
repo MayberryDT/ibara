@@ -61,6 +61,12 @@ hypr_built=$(pacman -Q hyprland | cut -d' ' -f2)
 if ! session hyprctl version >/dev/null 2>&1; then
   echo "Built for Hyprland $hypr_built; it loads when you next sign in."
 elif [[ $loaded == 0 ]]; then
+  # Loaded at runtime, as hyprland.lua does at each sign-in, so a config
+  # reload never unloads it. The marker tells hyprland.lua this session's
+  # plugin was not declared in the config.
+  signature=$(runuser -u "$desktop" -- env XDG_RUNTIME_DIR="/run/user/$uid" hyprctl -j instances 2>/dev/null | sed -n 's/.*"instance": *"\([^"]*\)".*/\1/p' | head -1)
+  session touch "/run/user/$uid/hypr/$signature/ibara-cua-runtime-load"
+  session hyprctl plugin load "$target/cua-hyprland-plugin.so" >/dev/null || true
   session hyprctl reload >/dev/null
   sleep 1
   # Loading is not enough: a session that already loaded and unloaded the

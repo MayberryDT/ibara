@@ -9,7 +9,7 @@
 # OUT receives:
 #   install                                 the one-line installer (curl -fsSL URL/install | sh)
 #   stable.json, stable.json.sig            the release manifest and its signature
-#   ibara-VERSION-x86_64.pkg.tar.zst        the ibara package
+#   ibara-VERSION-x86_64.pkg.tar.zst        ibara, ibarad and workspace ibara-screen
 #   ibara-stream-VERSION-x86_64.pkg.tar.zst Take Control of this computer (the ibara-stream fork, branch ibara)
 #   ibara-view-VERSION-x86_64.pkg.tar.zst   the viewer (the ibara-view fork, branch ibara)
 #   ibara-VERSION-source.tar.gz             the sources all three were built from
@@ -131,6 +131,11 @@ build_package() {
   [[ -z $found ]] || fail "The built $name package holds strings from $markers, so it must not be published. Files:"$'\n'"$found"
 }
 build_package ibara "$core/packaging" IBARA_CORE_DIR="$core" IBARA_PLUGIN_DIR="$plugin"
+# The own-screen workspace binary must ship with core; retain both fallback packages.
+mkdir -p "$build/verify-core"
+bsdtar -xf "$build/ibara-$version-x86_64.pkg.tar.zst" -C "$build/verify-core" usr/lib/ibara/bin/ibara-screen
+[[ -x $build/verify-core/usr/lib/ibara/bin/ibara-screen ]] || fail 'The ibara package is missing ibara-screen.'
+rm -rf "$build/verify-core"
 build_package ibara-stream "$stream/packaging/ibara" IBARA_STREAM_DIR="$stream" IBARA_VERSION="$pkgver"
 build_package ibara-view "$view/packaging/ibara" IBARA_VIEW_DIR="$view" IBARA_VERSION="$pkgver"
 

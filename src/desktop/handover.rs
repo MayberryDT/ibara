@@ -164,6 +164,7 @@ struct State {
     /// The named cursor is drawn and Hyprland's pointer hidden (by ibara, or
     /// by the person's own `cursor:invisible`).
     agent_holds: bool,
+    viewer_person: bool,
     /// When the person was last seen moving the mouse.
     person_at: Option<Instant>,
     /// The pointer's last reading while no agent call could move it, with
@@ -178,7 +179,7 @@ struct State {
 
 impl State {
     fn person_active(&self) -> bool {
-        self.person_at.is_some_and(|t| t.elapsed() < PERSON_STILL)
+        self.viewer_person || self.person_at.is_some_and(|t| t.elapsed() < PERSON_STILL)
     }
 }
 
@@ -242,7 +243,20 @@ impl Handover {
     /// and after [`PERSON_WAIT`] it is refused, nothing sent; it is refused
     /// too when the named cursor or the pointer cannot be handed over. With
     /// no agent set, the person's pointer stays.
+    pub fn viewer_turn(&self, person: bool) {
+        self.state().viewer_person = person;
+        if person {
+            self.inner.cua.yield_to_person();
+            let me = self.clone();
+            tokio::spawn(async move {
+                let _turn = me.inner.turn.lock().await;
+                if me.state().viewer_person { me.back(Why::Person).await; }
+            });
+        }
+    }
+
     pub async fn to_agent(&self) -> Result<()> {
+        if self.state().viewer_person { return Err(person_busy()); }
         if !self.inner.cua.has_agent() {
             return Ok(());
         }

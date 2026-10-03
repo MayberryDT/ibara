@@ -99,7 +99,21 @@ fn set_up(desktop: &Account, by_person: bool) -> Result<(), String> {
         step("Tailscale", || tailscale(desktop))?;
     }
     step("Browser page reader", || browser(desktop))?;
+    step("Take Control input", uinput)?;
     step("Desktop input and virtual screen", || cua_plugin(desktop))?;
+    Ok(())
+}
+
+/// The package's udev rule gives the signed-in person `/dev/uinput`, but udev
+/// applies a new rule to the static node only when it next sees the device:
+/// until a reboot, Take Control could show the screen and send no input
+/// ("Unable to create virtual keyboard: Permission denied"). Load the module
+/// and replay the device so logind grants the seat's person access now.
+/// Not fatal: a container or a kernel without the module still sets up.
+fn uinput() -> Result<(), String> {
+    let _ = run("modprobe", &["uinput"])
+        .and_then(|_| run("udevadm", &["trigger", "--action=add", "--sysname-match=uinput"]))
+        .and_then(|_| run("udevadm", &["settle", "--timeout=5"]));
     Ok(())
 }
 

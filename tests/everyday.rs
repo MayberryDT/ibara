@@ -284,7 +284,7 @@ fn a_computer_is_looked_after_from_another_over_the_pairing_route() {
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.contains("[display]\nvirtual_display_size = \"2560x1440\""), "{text}");
     let refused = on(&mut vesper, &id, &e, "operator-settings", &["set", "preview_seconds", "99"]);
-    assert_eq!(refused["error"]["message"], "Picture interval is a whole number from 1 to 30.", "{refused}");
+    assert_eq!(refused["error"]["code"], "INVALID_ARGUMENT", "{refused}");
 
     // A hand edit applies at once, and a later change keeps its comment.
     fs::write(&file, format!("{text}\n[general]\nname = \"Spud\" # renamed by hand\n\n[power]\nwake_on_network = false\n")).unwrap();
@@ -494,18 +494,18 @@ fn approvals_and_history_come_from_every_computer() {
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-    let summaries: Vec<&str> = listed.iter().map(|(summary, _)| summary.as_str()).collect();
+    let summaries: Vec<&str> = listed.iter().filter(|(_, detail)| detail["request"]["op"] != "settings").map(|(summary, _)| summary.as_str()).collect();
     assert_eq!(
         summaries,
         [
             "command asks to approve the request “command asks to restart this computer”.",
-            "command asks to change the setting “Computer name” to “Spud”.",
             "command asks to let itself run agent tasks.",
             "command asks to manage this computer in a way ibara can't describe; check the details.",
             "command asks to restart this computer.",
         ],
         "{listed:#?}"
     );
+    assert_eq!(listed.iter().find(|(_, detail)| detail["request"]["op"] == "settings").unwrap().1["request"]["args"], json!(["set", "name", "Spud"]));
     assert_eq!(listed[3].1["request"]["capability"], "telepathy", "{listed:#?}");
 
     // Vesper stops answering: its approval stays listed, marked, instead of

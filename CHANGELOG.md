@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-29 — 2026-10-03
+
+- NVIDIA screen encoding is available when you choose ibara in Screen Stream. It is still in testing; Automatic uses Sunshine for NVIDIA and ibara for VA-API. VA-API on the capture GPU stays preferred, followed by NVENC and OpenH264.
+
+## Unreleased — Watching and Person Turns
+
+- Join watches through the own-screen viewer without pausing an agent. Click, scroll, or press a key to start a person’s turn; Hand Back or idle with nothing held lets the same task continue after a fresh observation.
+- Add Screen Stream and Hand Back After I Stop For settings, turn status, and automatic Sunshine fallback with its reason. Public releases retain Sunshine by default until own-screen acceptance passes.
+- Scale fallback frames with VA VPP before readback, retain the turn across output changes, and release dead viewers after one second without a ping.
+- Tie turn answers and viewer counts to their certificates, restore the escape chord after reload, and remove stale bindings on viewer startup.
+- Keep sender lifetime under core control; fence revocations before settlement, acknowledge command refusals, and retry fallback after a cooldown. Send video with a bounded set of outstanding streams rather than waiting inline for acknowledgement.
+- Build and ship the workspace’s ibara-screen binary alongside the existing fallback programs; retain the uinput rule.
+- Install console stop handlers before its socket appears, so a prompt service stop cleans up normally.
+
 ## Unreleased — Viewer Hand Back
 
 - Carry expected owner/revision in viewer bundles and accept viewer Hand Back without closing the viewer before the target confirms.

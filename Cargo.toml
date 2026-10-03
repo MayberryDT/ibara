@@ -41,3 +41,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[workspace]
+members = ["screen"]
+exclude = ["screen/vendor/cros-codecs", "screen/vendor/cros-libva"]
+resolver = "3"
+
+[patch.crates-io]
+cros-libva = { path = "screen/vendor/cros-libva" }

@@ -12,16 +12,41 @@ cat >"$target/hyprland.lua.new" <<'LUA'
 -- includes this file.
 --
 -- Cua's Hyprland plugin, built on this computer for its exact Hyprland and
--- GCC, is loaded and its input transport opened. Replacing a loaded plugin
--- needs a new desktop session.
+-- GCC, is loaded once per desktop session at hyprland.start, at runtime, and
+-- its input transport opened. Hyprland unloads a plugin declared with
+-- hl.plugin.load whenever one config reload misses the declaration (a
+-- config folder replaced non-atomically, a module missing for a moment);
+-- loading it again then fails for the rest of the session ("input seat
+-- lifetime unavailable"). A runtime-loaded plugin is never unloaded by a
+-- reload. A session that loaded the plugin the old way (its seat marker
+-- exists but not ours) keeps declaring it until the next sign-in, or the
+-- next reload would unload it.
 local plugin = "/opt/agent-computer/cua/cua-hyprland-plugin.so"
 local present = io.open(plugin, "rb")
 if present then
   present:close()
-  if hl.plugin and hl.plugin.load then
-    pcall(hl.plugin.load, plugin)
-    pcall(hl.config, { plugin = { cua = { enabled = true } } })
+  local runtime, signature = os.getenv("XDG_RUNTIME_DIR"), os.getenv("HYPRLAND_INSTANCE_SIGNATURE")
+  local dir = runtime and signature and (runtime .. "/hypr/" .. signature) or nil
+  local function exists(path)
+    local f = path and io.open(path, "r")
+    if f then f:close() end
+    return f ~= nil
   end
+  local ours = dir and dir .. "/ibara-cua-runtime-load"
+  if dir and exists(dir .. "/cua-input-seat-lifetime") and not exists(ours) then
+    if hl.plugin and hl.plugin.load then
+      pcall(hl.plugin.load, plugin)
+    end
+  else
+    hl.on("hyprland.start", function()
+      if ours then
+        local f = io.open(ours, "w")
+        if f then f:close() end
+      end
+      hl.exec_cmd("hyprctl plugin load " .. plugin)
+    end)
+  end
+  pcall(hl.config, { plugin = { cua = { enabled = true } } })
 end
 
 -- A computer without a display gets its headless output, IbaraVirtual, as

@@ -454,12 +454,12 @@ async fn serve_connection(console: Arc<Console>, stream: UnixStream) {
 }
 
 /// Accept connections until SIGTERM or SIGINT, then close every operator session.
-pub async fn serve(listener: UnixListener, console: Arc<Console>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
-        eprintln!("ibarad: cannot install signal handlers");
-        return;
-    };
+pub async fn serve(
+    listener: UnixListener,
+    console: Arc<Console>,
+    mut term: tokio::signal::unix::Signal,
+    mut interrupt: tokio::signal::unix::Signal,
+) {
     let connections = Arc::new(Semaphore::new(CONNECTIONS));
     loop {
         tokio::select! {
@@ -518,6 +518,12 @@ pub fn main() -> i32 {
         }
     };
     runtime.block_on(async {
+        // A visible socket can be stopped immediately, even while startup continues.
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(term), Ok(interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            eprintln!("ibarad: cannot install signal handlers");
+            return 1;
+        };
         let listener = match bind(&path) {
             Ok(listener) => listener,
             Err(message) => {
@@ -542,7 +548,7 @@ pub fn main() -> i32 {
         updates::start();
         if crate::install::system::station_owner().is_none() { crate::install::user::start_shell_retry(); }
         eprintln!("ibarad: operator console serving {}", path.display());
-        serve(listener, console).await;
+        serve(listener, console, term, interrupt).await;
         chrome.close().await;
         let _ = frames::reset(&frames);
         // Only the service that bound the socket removes it.

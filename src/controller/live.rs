@@ -62,6 +62,7 @@ impl ControllerOptions {
             metadata_retention_ms: limit("metadata_retention_ms").map(|v| v as i64),
             ..Default::default()
         };
+        options.screen = Some(Rc::new(super::screen::ScreenStream::new(&cfg.state_dir)));
         options.stream = Some(Rc::new(LiveStream::new(&cfg.state_dir, port)));
         options.operator_grants = cfg.operator_grants;
         options.effect_rules = EffectRules::from_policy(&cfg.policy);
@@ -314,6 +315,8 @@ impl DesktopPort for LiveDesktop {
             *watching = Some(self.desktop.start_watch());
         }
     }
+
+    fn person_turn(&self, person: bool) -> LocalFuture<'_, ()> { Box::pin(self.desktop.viewer_turn(person)) }
 
     fn release_input(&self) -> LocalFuture<'_, Result<()>> {
         Box::pin(self.desktop.release_input())

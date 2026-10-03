@@ -278,7 +278,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
     let close_after = requested_op == "viewer_handback";
     let op = if close_after { "handback" } else { requested_op };
     let pausing = ["pause", "resume", "warm"].contains(&op);
-    if !pausing && !["take_control", "handback"].contains(&op) {
+    if !pausing && !["join", "screen_failed", "take_control", "handback"].contains(&op) {
         return Err(Fault::plain("Unknown selected control operation."));
     }
     let fields = if pausing {
@@ -291,10 +291,18 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
         json!({"expected_owner": owner, "expected_ownership_revision": revision})
     };
-    let view = if op == "take_control" { ibara_view() } else { None };
+    let mut engine = "sunshine".to_string();
+    if op == "join" || op == "warm" {
+        if let Ok(Ok(status)) = tokio::time::timeout(ctx.timeout, ctx.console.sessions.call(&computer, Some(&epoch), "status", json!({"stream_only":true}))).await {
+            engine = status["result"]["screen_engine"].as_str().unwrap_or("sunshine").into();
+        }
+    }
+    let mut view = if ["join", "take_control", "screen_failed"].contains(&op) {
+        if engine == "ibara" { super::viewer::ibara_screen() } else { ibara_view() }
+    } else { None };
     if view.is_some() {
         // Viewer setup overlaps registration, stream startup and agent settlement.
-        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 90).await;
+        super::viewer::warm_viewer_for(&ctx.console, &computer, &epoch, 90, view.as_ref().unwrap()).await;
     }
     if let Some(bin) = &view
         && let Err(refusal) = register_viewer(ctx, &computer, &epoch, bin).await
@@ -308,8 +316,14 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
     } else {
         false
     };
-    let call = ctx.console.sessions.call(&computer, Some(&epoch), op, fields);
-    let data = match tokio::time::timeout(CONTROL_DEADLINE, call).await {
+    let call = async {
+        if op == "join" && engine == "ibara" {
+            ctx.console.sessions.join_observation(&computer, Some(&epoch), fields).await
+        } else {
+            ctx.console.sessions.call(&computer, Some(&epoch), op, fields).await
+        }
+    };
+    let mut data = match tokio::time::timeout(CONTROL_DEADLINE, call).await {
         Err(_) => return Err(Fault::Timeout(TRANSPORT_TIMED_OUT.into())),
         Ok(Err(error)) if op == "take_control" && view.is_none() && error.message.contains("does not know your viewer") => {
             return Ok(ctx.failure("MISSING_DEPENDENCY", VIEWER_MISSING, "missing-dependency", false));
@@ -320,6 +334,22 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
         Ok(Ok(data)) => data,
     };
+    if ["join", "screen_failed"].contains(&op) && data["result"]["fallback_required"] == true {
+        close_viewer(&ctx.console, &computer);
+        super::viewer::forget_standby(&ctx.console, &computer);
+        let Some(bin) = ibara_view() else { return Ok(ctx.failure("MISSING_DEPENDENCY", VIEWER_MISSING, "missing-dependency", false)); };
+        if let Err(refusal) = register_viewer(ctx, &computer, &epoch, &bin).await { return Ok(refusal); }
+        let reason = data["result"]["fallback_reason"].clone();
+        data = match tokio::time::timeout(CONTROL_DEADLINE, ctx.console.sessions.call(&computer, Some(&epoch), "take_control", json!({
+            "expected_owner":data["result"]["owner"], "expected_ownership_revision":data["result"]["ownership_revision"]}))).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(error)) => return Ok(ctx.failure("CONTROL_UNCERTAIN", &error.message, "failed", false)),
+            Err(_) => return Err(Fault::Timeout(TRANSPORT_TIMED_OUT.into())),
+        };
+        data["result"]["screen_engine"] = json!("sunshine");
+        data["result"]["fallback_reason"] = reason;
+        view = Some(bin);
+    }
     if op == "warm" {
         if !binds(&data, &computer, &epoch) {
             return Ok(ctx.failure(
@@ -329,7 +359,8 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
                 false,
             ));
         }
-        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 90).await;
+        let bin = if data["result"]["screen_engine"] == "ibara" { super::viewer::ibara_screen() } else { ibara_view() };
+        if let Some(bin) = bin { super::viewer::warm_viewer_for(&ctx.console, &computer, &epoch, 90, &bin).await; }
         return Ok(ctx.ready(data));
     }
     let reply = data.get("result").cloned().unwrap_or(Value::Null);
@@ -358,7 +389,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
     if op == "handback" {
         let owner = reply.get("owner").and_then(Value::as_str).unwrap_or("");
         let settled = expected_owner(owner) && !owner.starts_with("operator:")
-            && reply.get("agent_resumed").and_then(Value::as_bool).is_some_and(|resumed| !resumed || owner.starts_with("agent:"))
+            && (reply["screen_engine"] == "ibara" || reply.get("agent_resumed").and_then(Value::as_bool).is_some_and(|resumed| !resumed || owner.starts_with("agent:")))
             && js::truthy(reply.get("ownership_revision"));
         if !settled {
             return uncertain("Handback did not prove settled ownership; inspect the target.");
@@ -366,11 +397,12 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         clipboard::stop(&ctx.console, &computer);
         // The stream has ended; a viewer left running would block the next one.
         let closed = if close_after { close_viewer(&ctx.console, &computer) } else { closed_first };
-        super::viewer::warm_viewer(&ctx.console, &computer, &epoch, 60).await;
+        let bin = if reply["screen_engine"] == "ibara" { super::viewer::ibara_screen() } else { ibara_view() };
+        if let Some(bin) = bin { super::viewer::warm_viewer_for(&ctx.console, &computer, &epoch, 60, &bin).await; }
         return Ok(ctx.ready(with(&data, &[("viewer_started", json!(false)), ("viewer_closed", json!(closed))])));
     }
     let ready = reply.get("viewer_ready") == Some(&json!(true))
-        && js::string_or(reply.get("owner").filter(|o| js::truthy(Some(o))), "").starts_with("operator:")
+        && (reply["screen_engine"] == "ibara" || js::string_or(reply.get("owner").filter(|o| js::truthy(Some(o))), "").starts_with("operator:"))
         && js::truthy(reply.get("control_generation"))
         && js::truthy(reply.get("ownership_revision"));
     if !ready {
@@ -442,8 +474,12 @@ fn viewer_bundle(computer: &str, epoch: &str, row: &ListedComputer, stream: &Val
         "computer_id": computer,
         "computer_name": row.label,
         "host": row.host,
-        "http_port": port("http_port")?,
-        "https_port": port("https_port")?,
+        "http_port": if stream["engine"] == "ibara" { 47910 } else { port("http_port")? },
+        "address": row.host,
+        "port": stream.get("port").and_then(Value::as_u64).unwrap_or(47910),
+        "input": stream.get("input").and_then(Value::as_bool).unwrap_or(false),
+        "engine": stream.get("engine").and_then(Value::as_str).unwrap_or("sunshine"),
+        "https_port": if stream["engine"] == "ibara" { 47910 } else { port("https_port")? },
         "server_cert_sha256": cert,
         "ticket": ticket,
         "identity_dir": identity_dir(),
@@ -466,9 +502,13 @@ async fn open_stream(ctx: &Ctx, computer: &str, epoch: &str, row: &ListedCompute
     };
     bundle["expected_owner"] = data["result"]["owner"].clone();
     bundle["expected_ownership_revision"] = data["result"]["ownership_revision"].clone();
+    bundle["expected_revision"] = data["result"]["ownership_revision"].clone();
+    // The screen viewer accepts the old name as a serde alias, so sending
+    // both names is a duplicate field. Sunshine keeps its existing bundle.
+    if stream["engine"] == "ibara" { bundle.as_object_mut().unwrap().remove("expected_ownership_revision"); }
     let pid = launch_ibara_view(&ctx.console, bin, &bundle).await?;
     remember_viewer(ctx, computer, pid);
-    super::viewer::watch_viewer(&ctx.console, computer, epoch, pid);
+    super::viewer::watch_viewer(&ctx.console, computer, epoch, pid, bin);
     clipboard::start(&ctx.console, computer, epoch);
     let mut data = data.clone();
     if let Some(stream) = data.get_mut("result").and_then(|r| r.get_mut("stream")).and_then(Value::as_object_mut) {
@@ -496,7 +536,9 @@ pub async fn open_viewer(ctx: &Ctx) -> Handled {
     let Some(row) = verified_row(ctx, &computer) else {
         return Ok(ctx.failure("IDENTITY_MISMATCH", "The selected viewer endpoint could not be revalidated.", "failed", false));
     };
-    let view = ibara_view();
+    let status = tokio::time::timeout(ctx.timeout, ctx.console.sessions.call(&computer, Some(&epoch), "status", Value::Null)).await;
+    let own = matches!(status, Ok(Ok(ref data)) if data["result"]["screen_engine"] == "ibara");
+    let view = if own { super::viewer::ibara_screen() } else { ibara_view() };
     if let Some(bin) = &view
         && let Err(refusal) = register_viewer(ctx, &computer, &epoch, bin).await
     {
@@ -545,7 +587,7 @@ pub(super) fn close_viewer(console: &Console, computer: &str) -> bool {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let Ok(pid) = i32::try_from(pid) else { return false };
     // SAFETY: signals a process this console started, checked by name first.
-    matches!(comm.trim(), "ibara-view" | "moonlight") && unsafe { libc::kill(pid, libc::SIGTERM) } == 0
+    matches!(comm.trim(), "ibara-screen" | "ibara-view" | "moonlight") && unsafe { libc::kill(pid, libc::SIGTERM) } == 0
 }
 
 #[cfg(test)]

@@ -41,6 +41,13 @@ pub fn ibara_view() -> Option<PathBuf> {
         .find(|p| which(&p.to_string_lossy()).is_some() && elf(p))
 }
 
+pub fn ibara_screen() -> Option<PathBuf> {
+    std::env::var_os("IBARA_SCREEN_BIN").and_then(|p| which(&p.to_string_lossy())).or_else(|| which("ibara-screen"))
+}
+
+fn is_screen(bin: &Path) -> bool { bin.file_name().is_some_and(|n| n == "ibara-screen") || std::env::var_os("IBARA_SCREEN_BIN").is_some_and(|p| Path::new(&p) == bin) }
+fn viewer_command(bin: &Path) -> String { if is_screen(bin) { "view" } else { "connect" }.into() }
+
 /// `$XDG_STATE_HOME/ibara/viewer`, else `~/.local/state/ibara/viewer`.
 pub fn identity_dir() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
@@ -61,6 +68,12 @@ fn cert_sha256(pem: &Path) -> Option<String> {
 /// This console's viewer certificate fingerprint, making the identity the
 /// first time.
 pub async fn viewer_identity(ibara_view: &Path) -> Result<String, Fault> {
+    if is_screen(ibara_view) {
+        let out = process::run(ibara_view, &["view", "--identity"], Run::timeout(Duration::from_secs(20))).await?;
+        let pin = out.stdout_text().trim().to_string();
+        if out.success() && pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { return Ok(pin); }
+        return Err(Fault::plain("The screen viewer could not make its identity."));
+    }
     let dir = identity_dir();
     let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
     if key.is_file()
@@ -83,11 +96,12 @@ pub async fn launch_ibara_view(
     console: &super::Console,
     ibara_view: &Path, bundle: &Value,
 ) -> Result<u32, Fault> {
-    let argv = [ibara_view.display().to_string(), "connect".to_string()];
+    let started = std::time::Instant::now();
+    let argv = [ibara_view.display().to_string(), viewer_command(ibara_view)];
     let standby = {
         let mut slot = console.standby.lock().unwrap_or_else(|p| p.into_inner());
         if slot.as_ref().is_some_and(|s| {
-            s.computer == bundle["computer_id"].as_str().unwrap_or("")
+            s.program == ibara_view && s.computer == bundle["computer_id"].as_str().unwrap_or("")
                 && s.epoch == bundle["controller_epoch"].as_str().unwrap_or("")
                 && s.until > std::time::Instant::now()
         }) {
@@ -115,6 +129,7 @@ pub async fn launch_ibara_view(
     } else {
         launch_with_input(&argv, bundle.to_string().as_bytes()).await?
     };
+    if std::env::var_os("IBARA_SCREEN_TRACE").is_some() { eprintln!("join_stage viewer_spawned elapsed_us={}", started.elapsed().as_micros()); }
     if pid != 0 {
         place(pid).await;
     }
@@ -195,6 +210,7 @@ async fn place(pid: u32) {
 
 /// Exactly one ticketless viewer. Dropping it closes stdin and ends our child.
 pub(super) struct Standby {
+    program: PathBuf,
     computer: String,
     epoch: String,
     pid: u32,
@@ -228,6 +244,10 @@ pub(super) async fn warm_viewer(
     seconds: u64,
 ) {
     let Some(bin) = ibara_view() else { return };
+    warm_viewer_for(console, computer, epoch, seconds, &bin).await;
+}
+
+pub(super) async fn warm_viewer_for(console: &std::sync::Arc<super::Console>, computer: &str, epoch: &str, seconds: u64, bin: &Path) {
     if viewer_identity(&bin).await.is_err() {
         return;
     }
@@ -235,7 +255,7 @@ pub(super) async fn warm_viewer(
     let pid = {
         let mut slot = console.standby.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = slot.as_mut() {
-            if s.computer == computer
+            if s.program == bin && s.computer == computer
                 && s.epoch == epoch
                 && Path::new(&format!("/proc/{}", s.pid)).exists()
             {
@@ -246,11 +266,12 @@ pub(super) async fn warm_viewer(
             }
         }
         slot.take();
-        let argv = [bin.display().to_string(), "connect".into()];
+        let argv = [bin.display().to_string(), viewer_command(bin)];
         let Ok((pid, Some(stdin))) = process::spawn_detached(&argv, true) else {
             return;
         };
         *slot = Some(Standby {
+            program: bin.into(),
             computer: computer.into(),
             epoch: epoch.into(),
             pid,
@@ -286,7 +307,9 @@ pub(super) fn watch_viewer(
     computer: &str,
     epoch: &str,
     pid: u32,
+    bin: &Path,
 ) {
+    let bin = bin.to_path_buf();
     let weak = std::sync::Arc::downgrade(console);
     let (computer, epoch) = (computer.to_string(), epoch.to_string());
     tokio::spawn(async move {
@@ -310,7 +333,7 @@ pub(super) fn watch_viewer(
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(&computer);
                     super::clipboard::stop(&console, &computer);
-                    warm_viewer(&console, &computer, &epoch, 60).await;
+                    warm_viewer_for(&console, &computer, &epoch, 60, &bin).await;
                 }
                 return;
             }

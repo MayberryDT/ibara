@@ -1028,6 +1028,18 @@ fn settings_reply(console: &Console) -> Result<Value> {
         }
         computers.insert(row.computer_id, entry);
     }
+    // Presentation-only rule summary, limited to computers this console administers.
+    let mut rule_rows = Vec::new();
+    for (site, layers) in &settings.logins.rules {
+        for (id, rule) in layers {
+            if id == "all" || computers.contains_key(id) {
+                let effective = if id == "all" { *rule } else { settings.logins.rule(site, id) };
+                rule_rows.push(json!({"site": site, "computer": id, "rule": effective}));
+            }
+        }
+    }
+    let site_count = rule_rows.iter().filter_map(|row| row["site"].as_str())
+        .collect::<std::collections::BTreeSet<_>>().len();
     Ok(json!({
         "enabled": settings.enabled,
         "decided": settings.decided,
@@ -1038,6 +1050,8 @@ fn settings_reply(console: &Console) -> Result<Value> {
         "installable": crate::controller::power_socket_exists(),
         "browsers": browsers(),
         "all_rules": all_rules,
+        "rule_rows": rule_rows,
+        "site_count": site_count,
         "computers": computers,
         "target_role": target_role(),
         "rejected": settings.rejected,

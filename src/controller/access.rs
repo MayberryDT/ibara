@@ -571,6 +571,15 @@ impl Controller {
                     .await?;
             }
         }
+        let watching: Vec<_> = self.screen_admissions.borrow().keys().cloned().collect();
+        for operator in watching {
+            let allowed = match a.rule(&operator, "watch", self.now_ms()) {
+                Rule::Allow => true,
+                Rule::Ask => self.sitting(&operator, &a) == Some(true),
+                Rule::Deny => false,
+            };
+            if !allowed { self.revoke_viewer_operator(&operator).await?; }
+        }
         let owner = self.viewer_state.borrow().owner.clone();
         if let Some(owner) = owner
             && a.rule(&owner, "control", self.now_ms()) == Rule::Deny

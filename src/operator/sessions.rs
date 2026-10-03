@@ -41,7 +41,7 @@ const FILE_OPS: [&str; 9] = [
     "files_roots", "files_list", "files_begin_upload", "files_resume_upload", "files_upload_chunk", "files_publish",
     "files_begin_download", "files_download_chunk", "files_status",
 ];
-const CONTROL_OPS: [&str; 2] = ["take_control", "handback"];
+const CONTROL_OPS: [&str; 4] = ["join", "screen_failed", "take_control", "handback"];
 /// Pause and resume take no action body but, like control transitions, may
 /// wait on settlement.
 const PAUSE_OPS: [&str; 2] = ["pause", "resume"];
@@ -167,8 +167,8 @@ impl OperatorRequest {
 
     /// A request from library fields: `observe` takes `display_id`, `quality` and
     /// optional `display_revision`, `format` and `previous`; `task_status` takes
-    /// `task_ref`; action operations take their action body; `status` and
-    /// `session` take nothing.
+    /// `task_ref`; action operations take their action body; `status` accepts
+    /// the internal boolean `stream_only`; `session` takes nothing.
     pub fn from_fields(computer: &str, epoch: Option<&str>, op: &str, fields: Value) -> Result<Self> {
         let mut fields = match fields {
             Value::Null => Map::new(),
@@ -181,6 +181,12 @@ impl OperatorRequest {
             op: op.to_string(),
             ..OperatorRequest::default()
         };
+        if op == "status" {
+            if let Some(value) = fields.shift_remove("stream_only") {
+                if !value.is_boolean() { return Err(fail("stream_only must be a boolean.")); }
+                request.action = Some(Map::from_iter([("stream_only".into(), value)]));
+            }
+        }
         let mut take = |name: &str| fields.shift_remove(name).map(|v| js::string(&v));
         if takes_action(op) {
             request.check_shape()?;
@@ -461,11 +467,22 @@ impl OperatorSessions {
         self.run(&request).await
     }
 
+    /// Own-stream Join is a short observation admission, so it can use the
+    /// already-bound route. Authorization and reply binding remain per-call.
+    pub async fn join_observation(&self, computer: &str, epoch: Option<&str>, fields: Value) -> Result<Value> {
+        let request = OperatorRequest::from_fields(computer, epoch, "join", fields)?;
+        self.on_session(&request).await
+    }
+
     /// Run a validated request.
     pub async fn run(&self, request: &OperatorRequest) -> Result<Value> {
         if is_transition(&request.op) {
             return call_once(&self.inner.database, request).await;
         }
+        self.on_session(request).await
+    }
+
+    async fn on_session(&self, request: &OperatorRequest) -> Result<Value> {
         let envelope = match bind_fresh(&self.inner.database, &request.computer, request.record_id()) {
             Ok(envelope) => envelope,
             Err(error) => {

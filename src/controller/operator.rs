@@ -105,7 +105,7 @@ impl Controller {
             op.as_str(),
             "session" | "status" | "task_status" | "observe" | "observe_video" | "take_control" | "handback" | "pause" | "resume" | "access" | "access_set"
                 | "access_remove" | "access_unpair" | "attention" | "answer_attention" | "viewer_register" | "viewer_ticket"
-                | "warm"
+                | "warm" | "join" | "screen_failed"
                 | "clipboard_get" | "clipboard_set" | "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer"
                 | "login_remove" | "login_probe"
         )
@@ -154,6 +154,8 @@ impl Controller {
         // only to one that may answer them (see `attention` below).
         let capability = match op.as_str() {
             "access_set"|"access_remove"|"access_unpair"|"answer_attention"=>Some("administer"),
+            "join" | "viewer_ticket" if self.own_screen() => Some("watch"),
+            "join" => Some("control"),
             "observe"|"observe_video"|"task_status"=>Some("watch"), "take_control"|"pause"|"resume"=>Some("control"),
             op if FILE_OPS.contains(&op)=>Some("files"),
             op if super::EVERYDAY_OPS.contains(&op)=>Some(super::everyday::capability(op)),
@@ -238,6 +240,13 @@ impl Controller {
                 Ok(Value::Object(v))
             }
             "session" => Ok(Value::Object(identity(&grant.generation))),
+            "status" if action["stream_only"] == true => {
+                let current = authorize()?;
+                let mut out = identity(&current.generation);
+                out.insert("screen_engine".into(), json!(self.screen_engine()));
+                out.insert("fallback_reason".into(), json!(self.screen_fallback_reason()));
+                Ok(Value::Object(out))
+            }
             "status" => self.operator_status(operator_id, &grant, &authorize, &identity).await,
             "task_status" => {
                 if !grant.observe {
@@ -272,6 +281,26 @@ impl Controller {
                 out.insert("updated_at".into(), json!(task.updated_at));
                 Ok(Value::Object(out))
             }
+            "join" => self.join_screen(operator_id, &action, &authorize).await,
+            "screen_failed" => {
+                let _lock = self.viewer_lock.lock().await;
+                self.require_access(operator_id, "watch")?;
+                let reason = self.fallback_reason.borrow().clone().unwrap_or_else(|| action["reason"].as_str().unwrap_or("No first frame within 3 seconds.").into());
+                self.screen_fallback(&reason).await;
+                Ok(json!({"endpoint_id":self.endpoint_id,"controller_epoch":self.epoch,"authorization_generation":grant.generation,
+                    "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
+                    "screen_engine":"sunshine","fallback_reason":self.fallback_reason.borrow().clone(),"fallback_required":true}))
+            }
+            "handback" if self.own_screen() => {
+                let _lock = self.viewer_lock.lock().await;
+                if self.turns.borrow().person.as_ref().is_some_and(|p| p.operator != operator_id) {
+                    return Err(denied("Only the person whose turn it is can hand back."));
+                }
+                self.end_person_turn().await?;
+                Ok(json!({"endpoint_id":self.endpoint_id,"controller_epoch":self.epoch,"authorization_generation":grant.generation,
+                    "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
+                    "screen_engine":"ibara","turn":"agent","agent_resumed":self.journal.get_active_lease()?.is_some()}))
+            }
             "take_control" | "handback" => self.operator_control(operator_id, op == "take_control", &action, &authorize).await,
             // Only the holder, who was allowed control when taking it.
             "warm" => {
@@ -280,6 +309,7 @@ impl Controller {
                 value.as_object_mut().unwrap().extend(identity(&grant.generation));
                 Ok(value)
             },
+            "viewer_ticket" if self.own_screen() => self.join_screen(operator_id, &action, &authorize).await,
             "viewer_ticket" => self.viewer_ticket(operator_id, &authorize).await,
             // The server saves the certificate once this has authorized it.
             "viewer_register" => {
@@ -418,8 +448,8 @@ impl Controller {
             (viewer.fault, !viewer.fault && viewer.owner.as_deref() == Some(operator_id))
         };
         let control_allowed=crate::access::Access::load(&self.journal)?.is_none_or(|a|a.rule(operator_id,"control",self.now_ms())!=super::Rule::Deny);
-        let stream = self.stream.as_ref().is_some_and(|s| s.available());
-        let interactive = if control_allowed && stream && !fault {
+        let stream = self.stream.as_ref().is_some_and(|s| s.available()) || self.screen.as_ref().is_some_and(|s| s.available());
+        let interactive = if (control_allowed || (self.own_screen() && current.observe)) && stream && !fault {
             "available_if_exclusive"
         } else {
             "unsupported_without_verified_viewer_adapter"
@@ -435,6 +465,13 @@ impl Controller {
         out.insert("interactive_control".into(), json!(interactive));
         out.insert("owner".into(), json!(self.viewer_owner_name()?));
         out.insert("ownership_revision".into(), json!(self.viewer_revision_name()?));
+        let turns = self.turns.borrow();
+        out.insert("turn".into(), json!(if turns.person.is_some() || self.viewer_state.borrow().owner.is_some() { "person" } else { "agent" }));
+        out.insert("turn_holder".into(), json!(turns.person.as_ref().map(|p| p.operator.clone()).or_else(|| self.viewer_state.borrow().owner.clone())));
+        out.insert("turn_since_ms".into(), json!(turns.person.as_ref().map(|p| p.since_ms)));
+        drop(turns);
+        out.insert("screen_engine".into(), json!(self.screen_engine()));
+        out.insert("fallback_reason".into(), json!(self.screen_fallback_reason()));
         out.insert("holds_control".into(), json!(holds));
         out.insert("video".into(), json!(self.desktop.video_capability()));
         out.insert("repair".into(), self.repair_status());

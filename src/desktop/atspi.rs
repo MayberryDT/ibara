@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Most elements one page returns.
-pub const MAX_LIMIT: u32 = 60;
+pub const MAX_LIMIT: u32 = 100;
 
 /// One element before compaction.
 #[derive(Debug, Clone, Default, Deserialize)]

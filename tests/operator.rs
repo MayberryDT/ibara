@@ -20,6 +20,60 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 const ENDPOINT: &str = "ibara_9ac2387e000000000000000000000000";
+
+// Work CLI failure cases (before implementation): invalid commands acquire a
+// machine; shell quoting mutates argv; run starts a job on a different target;
+// reconnection starts a second task; CLI completion silently finishes background
+// work. Real CLI/relay, fixture SSH peer; controller/process proof is separate.
+#[test]
+fn work_cli_runs_and_reconnects_through_the_same_agent_transport() {
+    let f=Fixture::fleet("work-cli");
+    let db=f.db.to_str().unwrap();
+    let (code,out,err)=f.run(&["work","--directory-db",db,"--computer","Tulip1","run","--goal","Build a plugin","--request-id","run-one","--","printf","%s","literal $(not-a-shell) argument"]);
+    assert_eq!(code,0,"{out} {err}");
+    let rows=f.route_lines();
+    let calls:Vec<Value>=rows.iter().filter_map(|s| s.split_once(' ').and_then(|(_,j)|serde_json::from_str::<Value>(j).ok())).filter(|v|v["method"]=="tools/call").collect();
+    let begin=calls.iter().find(|v|v["params"]["name"]=="computer_begin").unwrap();
+    assert_eq!(begin["params"]["arguments"]["goal"],"Build a plugin");
+    let exec=calls.iter().find(|v|v["params"]["name"]=="computer_exec").unwrap();
+    assert_eq!(exec["params"]["arguments"]["task_ref"],"task_tulip1_1");
+    assert_eq!(exec["params"]["arguments"]["command"],json!(["printf","%s","literal $(not-a-shell) argument"]));
+    assert_eq!(exec["params"]["arguments"]["background"],true);
+    assert!(!calls.iter().any(|v|v["params"]["name"]=="computer_finish"));
+    let before=rows.len();
+    let (code,out,err)=f.run(&["work","--directory-db",db,"--computer","Tulip1","exec","--task","task_tulip1_1","--request-id","step-two","--","pwd"]);
+    assert_eq!(code,0,"{out} {err}");
+    assert!(!f.route_lines()[before..].iter().any(|s|s.contains("\"name\":\"computer_begin\"")));
+}
+
+#[test]
+fn work_cli_rejects_invalid_arguments_before_opening_a_route() {
+    let f=Fixture::fleet("work-invalid");
+    for args in [vec!["work","run","--goal","build"],vec!["work","exec","--","pwd"],vec!["work","cancel"]] {
+        let (code,_,_)=f.run(&args); assert_ne!(code,0);
+    }
+    assert!(f.invocations().is_empty());
+}
+
+// Real CLI and relay lose the launch response after the fixture accepts it.
+// The saved identity must allow inspection without acquiring/launching again.
+#[test]
+fn work_cli_lost_reply_exposes_the_original_identity_and_does_not_relaunch() {
+    let peer=FLEET_SSH.replace("    *'\"name\":\"computer_begin\"'*)", "    *'\"name\":\"computer_exec\"'*) printf 'accepted\\n' >> \"$FAKE_SSH_LOG.accepted\"; exit 0 ;;\n    *'\"name\":\"computer_begin\"'*)");
+    let f=Fixture::with("work-lost",&peer,&[(COMPUTER,ENDPOINT,"Tulip1","tulip1")]);
+    let db=f.db.to_str().unwrap();
+    let (code,_,err)=f.run(&["work","--directory-db",db,"--computer","Tulip1","run","--goal","Build once","--","true"]);
+    assert_ne!(code,0,"lost response must not claim success");
+    let identities:Vec<Value>=err.lines().filter_map(|line|serde_json::from_str(line).ok()).collect();
+    let saved=identities.iter().find(|v|v["work"]["task_ref"]=="task_tulip1_1").expect(&err);
+    let request=saved["request_id"].as_str().unwrap();
+    let receipt:Value=serde_json::from_slice(&fs::read(saved["receipt"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(receipt["work"]["task_ref"],"task_tulip1_1");
+    let (code,out,err)=f.run(&["work","--directory-db",db,"--computer","Tulip1","run","--goal","Build once","--request-id",request,"--","true"]);
+    assert_eq!(code,0,"{out} {err}");
+    assert_eq!(f.route_lines().iter().filter(|s|s.contains("\"name\":\"computer_begin\"")).count(),1);
+    assert_eq!(fs::read_to_string(f.log.with_extension("log.accepted")).unwrap(),"accepted\n");
+}
 const COMPUTER: &str = "computer_7c3b2a19e8d4f6015b9a2c4d";
 const ENDPOINT0: &str = "ibara_b61b2fbb000000000000000000000000";
 const COMPUTER0: &str = "computer_5a1e0c7b9d2f4e6a8b3c1d0e";
@@ -188,7 +242,7 @@ impl Fixture {
             .env_remove("IBARA_OPERATOR_DIRECTORY_DB")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -348,9 +402,6 @@ fn fleet_begin_picks_the_named_computer_and_later_calls_follow_the_task() {
     let f = Fixture::fleet("begin");
     let mut relay = f.spawn(&["mcp", "--directory-db", f.db.to_str().unwrap()], "serve");
     initialize(&mut relay);
-    let unnamed = tool(&mut relay, json!(1), "computer_begin", json!({"goal": "g", "request_id": "r1"}));
-    let message = envelope(&unnamed)["error"]["message"].as_str().unwrap_or_default().to_string();
-    assert!(message.starts_with("computer: name one of your computers") && message.contains("Tulip0") && message.contains("Tulip1"), "{unnamed}");
     let unknown = tool(&mut relay, json!(2), "computer_begin", json!({"computer": "hazel", "goal": "g", "request_id": "r1"}));
     assert_eq!(envelope(&unknown)["error"]["code"], "INVALID_ARGUMENT", "{unknown}");
     assert!(f.invocations().is_empty(), "a refused begin reaches no computer");
@@ -511,4 +562,67 @@ fn preview_service_keeps_a_route_through_refusals_and_drops_it_on_a_wrong_epoch(
     assert_eq!(invocations.len(), 2, "a wrong-identity reply closes the route: {invocations:?}");
     assert!(invocations[1].ends_with("-l ibara-op-vesper tulip1 operator-v1"), "{}", invocations[1]);
     assert_eq!(serve.finish(), 0);
+}
+
+// Failure cases written before auto-routing: omitted computer rejected; all clients
+// select first; busy race strands caller; uncertain send acquires twice; request
+// replay changes target after restart; changed args silently reuse a binding;
+// explicit targets migrate; one session cannot work on two separate computers.
+#[test]
+fn fleet_auto_begin_uses_free_targets_and_retains_request_route() {
+    let f = Fixture::fleet("auto");
+    let db=f.db.to_str().unwrap();
+    let mut relay=f.spawn_with(&["mcp","--directory-db",db],"serve","tulip0");
+    initialize(&mut relay);
+    let args=json!({"goal":"any free computer","request_id":"auto-free"});
+    let begun=tool(&mut relay,json!(2),"computer_begin",args.clone());
+    assert_eq!(envelope(&begun)["result"]["task_ref"],"task_tulip1_1","{begun}");
+    let second=tool(&mut relay,json!(3),"computer_begin",json!({"computer":"tulip1","goal":"explicit","request_id":"explicit-other"}));
+    assert_eq!(envelope(&second)["result"]["task_ref"],"task_tulip1_1");
+    assert_eq!(relay.finish(),0);
+    // A new relay sees both ready; original request must stay on Tulip1.
+    let mut relay=f.spawn(&["mcp","--directory-db",db],"serve"); initialize(&mut relay);
+    let replay=tool(&mut relay,json!(2),"computer_begin",args.clone());
+    assert_eq!(envelope(&replay)["result"]["task_ref"],"task_tulip1_1","{replay}");
+    let mut upgraded=f.spawn(&["mcp","--directory-db",db],"serve");
+    upgraded.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex","version":"2.0"}}}));
+    upgraded.reply(); upgraded.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let replay2=tool(&mut upgraded,json!(2),"computer_begin",serde_json::from_str(r#"{"request_id":"auto-free","goal":"any free computer"}"#).unwrap());
+    assert_eq!(envelope(&replay2)["result"]["task_ref"],"task_tulip1_1","client upgrade/reordered args changed route: {replay2}");
+    assert_eq!(upgraded.finish(),0);
+    let conflict=tool(&mut relay,json!(3),"computer_begin",json!({"goal":"different","request_id":"auto-free"}));
+    assert_eq!(envelope(&conflict)["error"]["code"],"REQUEST_CONFLICT","{conflict}");
+    assert_eq!(relay.finish(),0);
+}
+
+#[test]
+fn fleet_auto_begin_falls_back_only_after_definite_refusal() {
+    // Every target advertises ready; Tulip0 loses the acquisition race.
+    for (tag,code,want) in [("busy","BUSY","ok"),("uncertain","OUTCOME_UNKNOWN","error")] {
+        let mut script=FLEET_SSH.to_string();
+        let needle="  printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\"";
+        let at=script.find(needle).unwrap();
+        script.insert_str(at,&format!(r#"  case "$line" in
+    *'"name":"computer_begin"'*) if [ "$host" = tulip0 ]; then env='{{"status":"error","error":{{"code":"{code}","message":"fixture refusal"}},"result":null}}'; fi ;;
+  esac
+"#));
+        let f=Fixture::with(tag,&script,&[(COMPUTER0,ENDPOINT0,"Tulip0","tulip0"),(COMPUTER,ENDPOINT,"Tulip1","tulip1")]);
+        let mut relay=f.spawn(&["mcp","--directory-db",f.db.to_str().unwrap()],"serve"); initialize(&mut relay);
+        // Keep trying fresh request identities until the fair selector chooses Tulip0.
+        let mut saw=false;
+        for n in 0..32 {
+            let reply=tool(&mut relay,json!(n+2),"computer_begin",json!({"goal":"race","request_id":format!("race-{n}")}));
+            let lines=f.route_lines();
+            if lines.iter().any(|l|l.starts_with("tulip0 ") && l.contains("computer_begin")) {
+                assert_eq!(envelope(&reply)["status"],want,"{reply}");
+                if code=="OUTCOME_UNKNOWN" {
+                    let id=format!("race-{n}");
+                    assert!(!lines.iter().any(|l|l.starts_with("tulip1 ") && l.contains("computer_begin") && l.contains(&id)),"uncertain request moved");
+                }
+                saw=true; break;
+            }
+        }
+        assert!(saw,"selection never used Tulip0");
+        assert_eq!(relay.finish(),0);
+    }
 }

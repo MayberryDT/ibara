@@ -18,6 +18,7 @@ pub mod handover;
 pub mod hyprland;
 pub mod idle;
 pub mod input;
+pub mod native_field;
 pub mod run;
 pub mod selection;
 pub mod video;
@@ -634,10 +635,11 @@ impl Desktop {
     pub async fn close(&self, surface: &SurfaceId, cancel: Option<&Cancel>) -> Result<()> {
         self.effect(cancel, async {
             self.live(surface).await?.ok_or_else(|| stale("Surface is gone."))?;
+            cua::unless_cancelled(cancel)?;
             // Hyprland may move the pointer onto the window focused next.
             let motion = self.cua.motion();
             let _moving = motion.begin();
-            self.hypr.close_window(&surface.address, surface.pid).await
+            self.hypr.close_surface(surface).await
         })
         .await
     }
@@ -649,7 +651,7 @@ impl Desktop {
         // Hyprland may move the pointer onto the window focused next.
         let motion = self.cua.motion();
         let _moving = motion.begin();
-        self.hypr.close_window(&surface.address, surface.pid).await
+        self.hypr.close_surface(surface).await
     }
 
     /// Move a window to `workspace` for a person, leaving the workspace shown
@@ -658,7 +660,7 @@ impl Desktop {
         // Hyprland may move the pointer onto the window focused next.
         let motion = self.cua.motion();
         let _moving = motion.begin();
-        self.hypr.move_window(&surface.address, surface.pid, workspace).await
+        self.hypr.move_surface(surface, workspace).await
     }
 
     /// Click, double-click or right-click. A point is clicked through Cua's
@@ -818,7 +820,7 @@ impl Desktop {
     pub async fn scroll(&self, at: Option<Point>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
         self.effect(cancel, async {
             if !(-50..=50).contains(&dx) || !(-50..=50).contains(&dy) {
-                return Err(invalid("Scroll notches must be between -50 and 50.").with("field", "dx/dy"));
+                return Err(invalid("Scroll dx/dy are wheel notches from -50 to 50, not pixels; for example dy: 3 scrolls down three notches.").with("field", "dx/dy"));
             }
             let window = match at {
                 Some(at) => self.window_at(at.x, at.y, None).await?.0,
@@ -922,8 +924,8 @@ impl Desktop {
     /// Type text into the focused surface. ASCII goes through Cua's
     /// exact-target keyboard in short pieces that are never cancelled once
     /// started, each only while the surface still has the keyboard focus;
-    /// other text is inserted through accessibility into the window's only
-    /// editable element. With [`TypingCursor::ToField`] the agent's named
+    /// other text uses a guarded native clipboard paste into the window's only
+    /// editable element, followed by observed insertion. With [`TypingCursor::ToField`] the agent's named
     /// cursor first glides to the field when Cua proves its box
     /// ([`cua::Cua::to_field`]); otherwise it stays. Cua shows its typing
     /// animation on the named cursor while the text goes in.
@@ -951,7 +953,45 @@ impl Desktop {
                         self.cua.to_field(field, live.geometry(), &self.screens().await).await;
                         cua::unless_cancelled(cancel)?;
                     }
-                    self.cua.type_semantic(live.pid, window, field.as_ref(), text).await
+                    let before = native_field::read(&live, &self.env, cancel).await?;
+                    let display = selection::display()?;
+                    let mut saved = tokio::task::spawn_blocking(move || selection::set_aside(&display)).await
+                        .map_err(|e| crate::error::internal(format!("clipboard: {e}")))??;
+                    let offered = text.to_string();
+                    let (saved_back, offered) = tokio::task::spawn_blocking(move || {
+                        let result = saved.offer_text(&offered); (saved, result)
+                    }).await.map_err(|e| crate::error::internal(format!("clipboard: {e}")))?;
+                    let inserted = async {
+                        offered?;
+                        cua::unless_cancelled(cancel)?;
+                        self.ensure_focused(surface).await?;
+                        let fresh = native_field::read(&live, &self.env, cancel).await?;
+                        if fresh != before {
+                            return Err(crate::error::IbaraError::new("STALE_TARGET", "The editable field changed before paste; observe again.", true).with("execution_not_started", true));
+                        }
+                        cua::unless_cancelled(cancel)?;
+                        let keys = input::cua_keys("ctrl+v")?;
+                        if dispatchers {
+                            self.compositor_input.key(surface, &keys, cancel).await?;
+                        } else {
+                            self.cua.key(live.pid, window, &keys).await?;
+                        }
+                        async {
+                            let after = native_field::read(&live, &self.env, cancel).await?;
+                            if after.path == before.path && after.role == before.role && after.frame == before.frame && after.value != before.value && after.value.contains(text) { Ok(()) }
+                            else { Err(IbaraError::new("ACTION_UNCONFIRMED", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
+                        }.await
+                            .map_err(|mut e| { e.retry_safe = false; e.with("execution_not_started", false).requires_reconciliation() })
+                    }.await;
+                    let restored = tokio::task::spawn_blocking(move || saved_back.put_back()).await
+                        .map_err(|e| crate::error::internal(format!("clipboard: {e}")))?;
+                    // Restoration respects newer clipboard owners. Never retry the paste.
+                    match (inserted, restored) {
+                        (Err(e), Err(restore)) => Err(e.with("clipboard_restore_error", restore.message)),
+                        (Err(e), Ok(_)) => Err(e),
+                        (Ok(()), Err(e)) => Err(e.with("execution_not_started", false)),
+                        (Ok(()), Ok(_)) => Ok(()),
+                    }
                 }
                 .await
             };

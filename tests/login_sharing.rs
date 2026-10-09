@@ -496,6 +496,8 @@ fn settled(agent: &mut Agent, task: &str, request_id: &str, sites: &[&str]) -> V
 /// A desktop session with one unlocked screen, as other tests give one.
 const DESKTOP_HYPRCTL: &str = r#"#!/bin/sh
 case "$*" in
+  *instances*) echo '[{"instance":"login-e2e-session","pid":1}]' ;;
+  *activewindow*) echo '{}' ;;
   *monitors*) echo '[{"id":0,"name":"IbaraVirtual","width":1920,"height":1080,"x":0,"y":0,"scale":1.0,"focused":true,"solitaryBlockedBy":[],"activeWorkspace":{"id":1,"name":"1"}}]' ;;
   *) echo '[]' ;;
 esac
@@ -827,7 +829,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     );
     assert_eq!(
         asked[0]["details"]["sites"],
-        json!([{"site": "idp.test", "via": null}, {"site": "mail.test", "via": null}]),
+        json!([{"site": "idp.test", "via": null,"state":"asking","method":"legacy_copy_available"}, {"site": "mail.test", "via": null,"state":"asking","method":"legacy_copy_available"}]),
         "{asked:?}"
     );
     wait_for("the Allowed site delivered without asking", 15, || {
@@ -901,6 +903,16 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(open_logins(&tulip1).len(), 1, "still open");
+
+    // A stale displayed revision cannot share, and sharing once must not save Allow.
+    let before_once=ops(&agents_computer);
+    let stale=vesper.ask("login-answer", &["--computer",&tulip1_id,"--att",&att,"--revision","99","--decisions",r#"{"idp.test":"share_once"}"#]);
+    assert!(!stale["error"].is_null(),"stale sharing must fail: {stale}");
+    assert_eq!(ops(&agents_computer),before_once);
+    let once=vesper.ok("login-answer", &["--computer",&tulip1_id,"--att",&att,"--revision","0","--decisions",r#"{"idp.test":"share_once"}"#]);
+    assert_eq!(once["sites"][0]["outcome"],"shared","{once}");
+    let rows=vesper.ok("login-rows", &["--computer",&tulip1_id]);
+    assert!(rows["rows"].as_array().unwrap().iter().filter(|r|r["site"]=="idp.test").all(|r|r["rule"]!="allow"),"share once saved Allow: {rows}");
 
     // J4: Share one, Don't Share the other.
     let answered = vesper.ok(
@@ -1641,4 +1653,172 @@ fn command_receipts_keep_commands_and_project_live_and_historical_job_states() {
     world.record(json!({"legacy_command_receipt": projected}));
     drop(journal);
 
+}
+
+
+/// Failure-first: a real console and target daemon exchange new responses over
+/// paired routes while an MCP client releases/reacquires the desktop. Browser
+/// stand-ins witness that assistance does not deliver cookies or register users.
+#[test]
+fn login_assistance_preserves_intent_and_safe_continuation() {
+    use support::*;
+    let world = World::new("login-assistance");
+    let desk = world.root.join("assistance-desktop");
+    fs::create_dir_all(&desk).unwrap();
+    write_executable(&desk.join("hyprctl"), DESKTOP_HYPRCTL);
+    write_executable(&desk.join("omarchy-toggle-idle"), DESKTOP_IDLE);
+    let (hypr, idle) = (desk.join("hyprctl"), desk.join("omarchy-toggle-idle"));
+    let env = [("IBARA_TEST_HYPRCTL", hypr.as_os_str()), ("IBARA_TEST_IDLE", idle.as_os_str()),
+        ("WAYLAND_DISPLAY", std::ffi::OsStr::new("wayland-e2e"))];
+    let mut target = Target::start_with(&world, node("tulip1"), Some("Tulip1"), 300_000, &env);
+    let operator_target = Target::start(&world, node("vesper"), None, 300_000);
+    let mut console = Console::start(&world, "vesper", node("vesper"), Some(&operator_target));
+    let computer = add_own(&mut console, "tulip1");
+    let jar = Shared::default();
+    jar.lock().url = "https://accounts.test/login".into();
+    let browser_connection = browser(&target.root.join("run/chrome.sock"), jar.clone());
+    let mut agent = Agent::start(&target, "vesper", "assistance-e2e");
+    wait_for("assistance target ready", 40, || agent.call("computer_status", json!({}))["situation"]
+        .as_str().is_some_and(|s| s.contains("nobody controls")).then_some(()));
+    let mut receipts = Vec::new();
+    let began = agent.begin("assist-begin", &["accounts.test", "public.test"]);
+    let task = began["result"]["task_ref"].as_str().unwrap().to_string();
+    let att = began["result"]["logins"][0]["attention"].as_str().unwrap().to_string();
+    let answer = |c: &mut Console, revision: u64, choices: Value| -> Value {
+        c.ask("login-assist", &["--computer", &computer, "--att", &att,
+            "--revision", &revision.to_string(), "--decisions", &choices.to_string()])
+    };
+    let no_account = answer(&mut console, 0, json!({"accounts.test":"no_account"}));
+    assert!(no_account["error"].is_null(), "{no_account}");
+    assert_eq!(no_account["data"]["revision"], 1);
+    assert_eq!(no_account["data"]["sites"][1]["state"], "asking", "omitted is unanswered");
+    receipts.push(no_account);
+    let outcome = agent.sign_in(&task, "assist-no-account", &["accounts.test"]);
+    assert_eq!(states(&outcome)["accounts.test"], "no_account", "{outcome}");
+    assert!(outcome["result"]["next"].as_str().unwrap().contains("signup"));
+    receipts.push(outcome);
+    let deferred = answer(&mut console, 1, json!({"public.test":"defer"}));
+    assert!(deferred["error"].is_null(), "{deferred}");
+    receipts.push(deferred);
+    let stale = answer(&mut console, 0, json!({"accounts.test":"decline"}));
+    assert!(!stale["error"].is_null(), "stale answer must not overwrite: {stale}");
+    assert!(ops(&jar).is_empty(), "no cookie delivery for assistance: {:?}", ops(&jar));
+    assert!(console.ok("login-rows", &["--computer", &computer])["rows"].as_array().unwrap().is_empty());
+    agent.finish(&task, "assist-release");
+    let late = answer(&mut console, 2, json!({"public.test":"without_account"}));
+    assert!(late["error"].is_null(), "answer survives release: {late}");
+    assert_eq!(late["data"]["continuation"], "ready_to_resume");
+    receipts.push(late);
+    // A fresh connection reads the durable answer and explicitly adopts it.
+    drop(agent);
+    drop(browser_connection);
+    target.restart();
+    let _browser=browser(&target.root.join("run/chrome.sock"), jar.clone());
+    let mut agent = Agent::start(&target, "vesper", "assistance-e2e");
+    wait_for("restarted assistance target ready", 40, || agent.call("computer_status", json!({}))["situation"]
+        .as_str().is_some_and(|s|s.contains("nobody controls")).then_some(()));
+    let next = agent.begin("assist-resume", &[]);
+    let resumed = next["result"]["task_ref"].as_str().unwrap().to_string();
+    let adopted = agent.call("computer_checkpoint", json!({"task_ref": resumed,
+        "login": {"attention": att, "action": "continue"}}));
+    assert_eq!(adopted["status"], "ok", "{adopted}");
+    receipts.push(adopted);
+    let no_account = agent.sign_in(&resumed, "assist-after-resume", &["accounts.test"]);
+    assert_eq!(states(&no_account)["accounts.test"], "no_account", "{no_account}");
+    // Proposal is concrete and approval/claim is distinct from availability.
+    let proposal = json!({"site":"accounts.test", "identity":"Animas test identity",
+        "credential_store":"Synthetic vault", "cost":"free", "summary":"Create the account needed for the test report"});
+    let proposed = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"propose_signup","proposal":proposal}}));
+    assert_eq!(proposed["status"], "ok", "{proposed}");
+    let revision = proposed["result"]["login"]["revision"].as_u64().unwrap();
+    let claim = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"claim_signup","site":"accounts.test"}}));
+    assert_eq!(claim["status"], "error", "no claim before approval: {claim}");
+    let approved = answer(&mut console, revision, json!({"accounts.test":"approve_signup"}));
+    assert!(approved["error"].is_null(), "{approved}");
+    receipts.push(approved);
+    let claim = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"claim_signup","site":"accounts.test"}}));
+    assert_eq!(claim["status"], "ok", "{claim}");
+    assert_eq!(claim["result"]["login"]["signup"]["state"], "in_progress");
+    receipts.push(claim);
+    let duplicate = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"claim_signup","site":"accounts.test"}}));
+    assert_eq!(duplicate["status"], "error", "must reconcile, not submit again: {duplicate}");
+    let changed = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"propose_signup","proposal":{
+            "site":"accounts.test","identity":"Someone else","credential_store":"Synthetic vault",
+            "cost":"free","summary":"Different identity"}}}));
+    assert_eq!(changed["status"], "error", "in-progress identity cannot change: {changed}");
+    let created = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"record_created","site":"accounts.test"}}));
+    assert_eq!(created["status"], "ok", "{created}");
+    assert_eq!(created["result"]["login"]["signup"]["state"], "needs_verification");
+    let rev = created["result"]["login"]["revision"].as_u64().unwrap();
+    receipts.push(created);
+    let stopped = answer(&mut console, rev, json!({"accounts.test":"cancel"}));
+    assert_eq!(stopped["data"]["sites"][0]["state"], "needs_reconciliation", "{stopped}");
+    let denied_downgrade = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"record_not_created","site":"accounts.test","evidence_ref":"fixture:conflicting-negative"}}));
+    assert_eq!(denied_downgrade["status"], "error", "known creation cannot become no-effect after cancel: {denied_downgrade}");
+    let created = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"record_created","site":"accounts.test"}}));
+    assert_eq!(created["status"], "ok", "cancel must preserve recovery: {created}");
+    let resolved = agent.call("computer_checkpoint", json!({"task_ref":resumed,
+        "login":{"attention":att,"action":"resolve","site":"accounts.test","evidence_ref":"fixture:account-1"}}));
+    assert_eq!(resolved["status"], "ok", "{resolved}");
+    let rev = resolved["result"]["login"]["revision"].as_u64().unwrap();
+    let revive = answer(&mut console, rev, json!({"accounts.test":"no_account"}));
+    assert!(!revive["error"].is_null(), "resolved site cannot be overwritten: {revive}");
+    let stopped = answer(&mut console, rev, json!({"public.test":"cancel"}));
+    assert!(stopped["error"].is_null(), "{stopped}");
+    let retry = agent.sign_in(&resumed,"assist-stopped-retry",&["public.test"]);
+    assert_eq!(states(&retry)["public.test"], "cancelled", "{retry}");
+    // Cancelled work cannot be resumed or answered from a stale card.
+    let cancelled = agent.call("computer_finish", json!({"task_ref":resumed,"request_id":"assist-cancel",
+        "outcome":"cancelled","summary":"Synthetic fixture complete; no real account was created."}));
+    assert_eq!(cancelled["status"], "ok", "{cancelled}");
+    let after = answer(&mut console, 99, json!({"accounts.test":"no_account"}));
+    assert!(!after["error"].is_null(), "cancelled request cannot be revived");
+    let began=agent.begin("recovery-new-task", &["accounts.test","guest.test","retry.test"]);
+    let next_task=began["result"]["task_ref"].as_str().unwrap().to_string();
+    let next_att=began["result"]["logins"][0]["attention"].as_str().unwrap().to_string();
+    let checkpoint=|agent:&mut Agent,action:&str,extra:Value|->Value {
+        let mut login=extra;login["attention"]=json!(next_att);login["action"]=json!(action);
+        agent.call("computer_checkpoint",json!({"task_ref":next_task,"login":login}))
+    };
+    let decide=|console:&mut Console,revision:u64,choices:Value|->Value {
+        console.ask("login-assist", &["--computer",&computer,"--att",&next_att,"--revision",&revision.to_string(),"--decisions",&choices.to_string()])
+    };
+    let proposed=checkpoint(&mut agent,"propose_signup",json!({"proposal":{"site":"guest.test","identity":"Animas fixture","credential_store":"Synthetic vault","cost":"free","summary":"Read report"}}));
+    let rev=proposed["result"]["login"]["revision"].as_u64().unwrap();
+    let guest=decide(&mut console,rev,json!({"guest.test":"without_account"}));
+    assert!(guest["error"].is_null(),"{guest}");
+    let resolved=checkpoint(&mut agent,"resolve",json!({"site":"guest.test","evidence_ref":"fixture:public-report"}));
+    assert_eq!(resolved["status"],"ok","unclaimed proposal must not prevent guest resolution: {resolved}");
+    let proposal=json!({"site":"retry.test","identity":"Animas fixture","credential_store":"Synthetic vault","cost":"free","summary":"Read report"});
+    let proposed=checkpoint(&mut agent,"propose_signup",json!({"proposal":proposal}));
+    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"retry.test":"approve_signup"}));
+    assert!(approved["error"].is_null(),"{approved}");
+    let claim=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    assert_eq!(claim["status"],"ok","{claim}");
+    let no_effect=checkpoint(&mut agent,"record_not_created",json!({"site":"retry.test","evidence_ref":"fixture:registration-rejected-zero-effects"}));
+    assert_eq!(no_effect["status"],"ok","{no_effect}");
+    let repeat=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    assert_eq!(repeat["status"],"error","reconciled no-effect still needs a new concrete grant: {repeat}");
+    let proposed=checkpoint(&mut agent,"propose_signup",json!({"proposal":proposal}));
+    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"retry.test":"approve_signup"}));
+    assert!(approved["error"].is_null(),"{approved}");
+    let retry=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    assert_eq!(retry["status"],"ok","confirmed no effect permits newly authorized retry: {retry}");
+    assert_ne!(retry["result"]["login"]["signup"]["claim_ref"],claim["result"]["login"]["signup"]["claim_ref"]);
+    receipts.extend([guest,resolved,no_effect,retry]);
+    agent.finish(&next_task,"recovery-finish");
+    assert!(ops(&jar).is_empty());
+    if let Some(destination) = std::env::var_os("IBARA_ASSISTANCE_RECEIPT") {
+        fs::write(destination, serde_json::to_vec_pretty(&json!({"kind":"real_daemon_mcp_operator_integration",
+            "browser":"synthetic transport", "native_ui_proven":false,"receipts":receipts,
+            "cookie_effects":ops(&jar),"real_accounts_created":0})).unwrap()).unwrap();
+    }
 }

@@ -71,6 +71,24 @@ ibara's changes are `ibara.patch`:
   surface it pressed on. A grab by another client or another window, a
   window drag and a panel with exclusive input still refuse.
 
+- **Multiple primary bindings (6 October 2026, validation candidate).** Music's
+  winit and clipboard code bind the same primary seat independently. Native
+  bindings are learned from Hyprland's typed seat event, with its public
+  first-binding lookup for clients already running at plugin load. All verified
+  bindings receive input, as Hyprland does; the exact seat, pointer and keyboard
+  set must remain unchanged during an action. Independent agent seats remain
+  excluded by identity. Unknown pre-load duplicate bindings fail closed: preserve
+  work and reopen the task-owned app after loading the plugin.
+- **Owned pointer lock (6 October 2026, validation candidate).** Keys and clicks
+  work under a lock only when its exact root owns keyboard focus, pointer focus
+  and the active window. Clicks deliver buttons without absolute motion or warps.
+  Lock identity is checked after focus and before every dispatch; foreign locks,
+  confinement, locked drags and scrolling still refuse. Physical takeover,
+  grants, leases and stale-resource checks are unchanged. Plain keys under an
+  owned lock have a bounded 100 ms down/up interval so frame-polled movement
+  sees the press. Escape and chords remain immediate. Cancellation during the
+  interval releases captured keys and reports partial input, never no-dispatch.
+
 Build and load it with `deploy/cua-plugin.sh` on each computer. The module must
 match the running Hyprland's ABI and GCC, so rebuild after every Hyprland
 update; replacing a loaded module needs a new desktop session.

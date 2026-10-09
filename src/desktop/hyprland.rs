@@ -50,9 +50,16 @@ pub struct Monitor {
     pub focused: bool,
     pub disabled: bool,
     pub reserved: Vec<i64>,
+    #[serde(default, deserialize_with = "explicit_solitary_blockers")]
     pub solitary_blocked_by: Option<Vec<String>>,
     pub active_workspace: WorkspaceRef,
     pub special_workspace: WorkspaceRef,
+}
+
+// Hyprland emits JSON null when its blocker bitmask is zero. Serde's ordinary
+// Option conflates that explicit evidence with an absent/unsupported field.
+fn explicit_solitary_blockers<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    Option::<Vec<String>>::deserialize(d).map(|value| Some(value.unwrap_or_default()))
 }
 
 impl Monitor {
@@ -92,16 +99,23 @@ pub struct Window {
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i64,
     pub stable_id: Option<String>,
+    /// Local /proc and compositor provenance, never accepted from client JSON.
+    #[serde(skip_deserializing)]
+    pub process_start_ticks: Option<u64>,
+    #[serde(skip_deserializing)]
+    pub compositor_instance: String,
 }
 
 impl Window {
     /// The identity a surface keeps while it lives: a change of
     /// class or PID at the same address is a different surface.
     pub fn id(&self) -> SurfaceId {
-        SurfaceId { address: self.address.clone(), pid: self.pid, class: self.class.clone() }
+        SurfaceId { address: self.address.clone(), pid: self.pid, class: self.class.clone(), process_start_ticks: self.process_start_ticks, compositor_instance: self.compositor_instance.clone() }
     }
     pub fn is(&self, id: &SurfaceId) -> bool {
-        self.address == id.address && self.pid == id.pid && self.class == id.class
+        id.process_start_ticks.is_some() && !id.compositor_instance.is_empty()
+            && self.address == id.address && self.pid == id.pid && self.class == id.class
+            && self.process_start_ticks == id.process_start_ticks && self.compositor_instance == id.compositor_instance
     }
     pub fn geometry(&self) -> Rect {
         Rect { x: self.at[0], y: self.at[1], width: self.size[0], height: self.size[1] }
@@ -125,6 +139,10 @@ pub struct SurfaceId {
     pub address: String,
     pub pid: i64,
     pub class: String,
+    #[serde(default)]
+    pub process_start_ticks: Option<u64>,
+    #[serde(default)]
+    pub compositor_instance: String,
 }
 
 /// A rectangle in logical layout coordinates (or pixels, where stated).
@@ -255,6 +273,13 @@ fn ctl_failure(out: &Output) -> IbaraError {
     internal(format!("hyprctl failed: {}", clip(&err, 240)))
 }
 
+/// Linux stat field 22; comm may itself contain spaces or parentheses.
+fn process_start_ticks(pid: i64) -> Option<u64> {
+    if pid <= 0 { return None; }
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// The `hyprctl` client.
 #[derive(Clone, Debug)]
 pub struct Hyprland {
@@ -313,7 +338,14 @@ impl Hyprland {
     }
 
     pub async fn clients(&self) -> Result<Vec<Window>> {
-        self.json(self.cmd(&["-j", "clients"]), "clients").await
+        let instance = self.instance_signature().await?;
+        let bound = Self { instance: instance.clone(), ..self.clone() };
+        let mut windows: Vec<Window> = bound.json(bound.cmd(&["-j", "clients"]), "clients").await?;
+        for window in &mut windows {
+            window.process_start_ticks = process_start_ticks(window.pid);
+            window.compositor_instance = instance.clone();
+        }
+        Ok(windows)
     }
 
     pub async fn devices(&self) -> Result<serde_json::Value> {
@@ -327,13 +359,17 @@ impl Hyprland {
 
     /// The focused window, or `None` when nothing is focused.
     pub async fn active_window(&self) -> Result<Option<Window>> {
-        let value: serde_json::Value = self.json(self.cmd(&["-j", "activewindow"]), "activewindow").await?;
+        let instance = self.instance_signature().await?;
+        let bound = Self { instance: instance.clone(), ..self.clone() };
+        let value: serde_json::Value = bound.json(bound.cmd(&["-j", "activewindow"]), "activewindow").await?;
         if value.get("address").and_then(|a| a.as_str()).is_none_or(str::is_empty) {
             return Ok(None);
         }
-        serde_json::from_value(value)
-            .map(Some)
-            .map_err(|_| IbaraError::new("SESSION_UNAVAILABLE", "Hyprland activewindow was not JSON.", true))
+        let mut window: Window = serde_json::from_value(value)
+            .map_err(|_| IbaraError::new("SESSION_UNAVAILABLE", "Hyprland activewindow was not JSON.", true))?;
+        window.process_start_ticks = process_start_ticks(window.pid);
+        window.compositor_instance = instance;
+        Ok(Some(window))
     }
 
     /// Cua's Hyprland plugin is loaded for this compositor's ABI and its input
@@ -433,34 +469,42 @@ impl Hyprland {
         self.window_dispatch(lua, address, "focus").await
     }
 
-    /// Ask a window to close, the way its close button does. The window must
-    /// still be the same process: address **and** PID must match.
-    pub async fn close_window(&self, address: &str, pid: i64) -> Result<()> {
-        if !valid_address(address) || pid <= 0 {
-            return Err(IbaraError::new("STALE_TARGET", "Window is no longer present for close.", true).with("address", address));
+    /// Refuse stale/unknown process identity and bind effects to the observed
+    /// compositor signature, never its replaceable numeric selection index.
+    async fn surface_session(&self, surface: &SurfaceId) -> Result<Self> {
+        if !valid_address(&surface.address) || surface.compositor_instance.is_empty()
+            || !self.instances().await?.iter().any(|i| i.instance == surface.compositor_instance)
+            || !surface.process_start_ticks.is_some_and(|start| Some(start) == process_start_ticks(surface.pid)) {
+            return Err(IbaraError::new("STALE_TARGET", "Window process or compositor identity changed or is unavailable.", true)
+                .with("execution_not_started", true));
         }
+        Ok(Self { instance: surface.compositor_instance.clone(), ..self.clone() })
+    }
+
+    /// Graceful close with process incarnation/session guard, then an atomic
+    /// compositor-side address/PID/class check. Never fall back to a new session.
+    pub async fn close_surface(&self, surface: &SurfaceId) -> Result<()> {
+        let bound = self.surface_session(surface).await?;
         let lua = format!(
-            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {pid} then target = w break end end; \
+            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {} and w.class == {} then target = w break end end; \
              if not target then error('window not found') end; hl.dispatch(hl.dsp.window.close({{ window = target }}))",
-            lua_string(address)
+            lua_string(&surface.address), surface.pid, lua_string(&surface.class)
         );
-        self.window_dispatch(lua, address, "close").await
+        bound.window_dispatch(lua, &surface.address, "close").await
     }
 
     /// Move a window to workspace `workspace` without following it (the
     /// `movetoworkspacesilent` of Hyprland's string dispatchers, in 0.56's Lua
     /// as `hl.dsp.window.move({ workspace, follow = false })`). The window
     /// must still be the same process: address **and** PID must match.
-    pub async fn move_window(&self, address: &str, pid: i64, workspace: i64) -> Result<()> {
-        if !valid_address(address) || pid <= 0 {
-            return Err(IbaraError::new("STALE_TARGET", "Window is no longer present for move.", true).with("address", address));
-        }
+    pub async fn move_surface(&self, surface: &SurfaceId, workspace: i64) -> Result<()> {
+        let bound = self.surface_session(surface).await?;
         let lua = format!(
-            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {pid} then target = w break end end; \
+            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {} and w.class == {} then target = w break end end; \
              if not target then error('window not found') end; hl.dispatch(hl.dsp.window.move({{ window = target, workspace = {workspace}, follow = false }}))",
-            lua_string(address)
+            lua_string(&surface.address), surface.pid, lua_string(&surface.class)
         );
-        self.window_dispatch(lua, address, "move").await
+        bound.window_dispatch(lua, &surface.address, "move").await
     }
 
     /// `count` presses of `key` (an xkb name such as `Down` or `Escape`)

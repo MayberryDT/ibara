@@ -1,5 +1,6 @@
 //! The person's clipboard, set aside while ibara pastes text into a web page
-//! and put back afterwards: every type it offered, byte for byte. Cua types
+//! and put back afterwards: every data type it offered, byte for byte. X11
+//! selection control targets exposed by GTK are operations, not payloads. Cua types
 //! only ASCII, so `browser_act` pastes the rest.
 //!
 //! A small client of the Wayland data-control protocol
@@ -414,6 +415,11 @@ impl Session {
         let mut saved: Vec<(String, Vec<u8>)> = Vec::with_capacity(mimes.len());
         let mut room = SAVE_MAX;
         for mime in mimes {
+            // GTK can expose X11 selection protocol targets on Wayland.
+            // They describe/manage the selection; requesting one as data can
+            // hang (SAVE_TARGETS) or cause effects (DELETE/INSERT_*). Preserve
+            // every actual payload type; an unreadable payload still refuses.
+            if matches!(mime.as_str(), "SAVE_TARGETS" | "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "DELETE" | "INSERT_SELECTION" | "INSERT_PROPERTY") { continue; }
             let data = match saved.iter().find(|(m, _)| *m == mime) {
                 Some((_, data)) if data.len() <= room => data.clone(),
                 Some(_) => return Err(too_large()),

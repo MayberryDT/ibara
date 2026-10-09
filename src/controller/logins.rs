@@ -14,6 +14,8 @@
 //! only inside a `login_deliver` action on its way to the browser: it is never
 //! saved, logged, put in an error or returned.
 
+mod assistance;
+
 use super::Controller;
 use super::agent::Reply;
 use super::checks::pause;
@@ -143,11 +145,21 @@ struct Entry {
     /// `waiting_for_browser`, `signed_out_there` or `sharing_off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    responded_at: Option<String>,
 }
 
 impl Entry {
+    fn deliverable(&self) -> bool {
+        self.open() || matches!(self.state.as_str(),"shared"|"worked"|"rejected"|"unknown")
+    }
+    fn terminal(&self) -> bool {
+        matches!(self.state.as_str(), "resolved" | "declined" | "denied" | "cancelled")
+    }
     fn open(&self) -> bool {
-        matches!(self.state.as_str(), "asking" | "deliver")
+        matches!(self.state.as_str(), "asking" | "deliver" | "deliver_once")
     }
 }
 
@@ -167,11 +179,19 @@ struct Request {
     page: Option<String>,
     created_ms: i64,
     sites: Vec<Entry>,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    signup: Option<assistance::Signup>,
+    #[serde(default)]
+    last_answer: Option<Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Book {
     requests: Vec<Request>,
+    #[serde(default)]
+    signup_attempts: Vec<assistance::SignupAttempt>,
     /// `{site, result, task_ref, at_ms}` for the sharing computer's site memory, sent once.
     results: Vec<Value>,
 }
@@ -186,10 +206,7 @@ impl Book {
     }
 
     fn save(&mut self, journal: &Journal) -> Result<()> {
-        if self.requests.len() > KEEP_REQUESTS {
-            let extra = self.requests.len() - KEEP_REQUESTS;
-            self.requests.drain(..extra);
-        }
+        self.remember_attempts();
         if self.results.len() > KEEP_RESULTS {
             let extra = self.results.len() - KEEP_RESULTS;
             self.results.drain(..extra);
@@ -199,6 +216,26 @@ impl Book {
             "login_requests",
             &serde_json::to_string(self).map_err(|_| invalid("Invalid login request records."))?,
         )
+    }
+
+    // Never discard an unresolved request or an account-effect record to make
+    // room. Refuse a new request if every retained slot still matters.
+    fn reserve_request(&mut self, journal: &Journal) -> Result<()> {
+        self.remember_attempts();
+        while self.requests.len() >= KEEP_REQUESTS {
+            let mut removable = None;
+            for (i, r) in self.requests.iter().enumerate() {
+                let task_ended = journal.get_task(&r.task_ref)?.is_none_or(|t| matches!(t.state.as_str(), "completed"|"cancelled"));
+                let attention_closed = match r.att_ref.as_deref() {
+                    Some(att) => journal.get_attention(att)?.is_none_or(|a|a.state!="open"),
+                    None => true,
+                };
+                if task_ended && attention_closed { removable=Some(i); break; }
+            }
+            if let Some(i)=removable { self.requests.remove(i); }
+            else { return Err(invalid("Too many unsettled login requests. Resolve existing requests before asking for another; none were discarded.")); }
+        }
+        Ok(())
     }
 
     fn find(&self, request_ref: &str) -> Option<usize> {
@@ -230,6 +267,19 @@ fn next_for(code: &str, site: &str, task_ref: &str, att: Option<&str>) -> String
         "waiting_for_sharing_computer" => format!("waiting_for_sharing_computer: the sharing computer is off or asleep. Do other work or wait, {again}; it completes when that computer is back."),
         "signed_out_there" => format!("signed_out_there: your person isn't signed in to {site} in their browser and was asked to sign in there and choose Retry. Wait, {again}."),
         "sharing_off" => format!("sharing_off: no computer shares logins with this one yet; your person was offered Turn On Login Sharing. Wait, {again}."),
+        "independent_session" => "independent_session: this site uses a separate browser session on this computer. Cookie sharing is disabled. Verify an existing session, or use the login assistance request for person sign-in or account setup.".into(),
+        "cancelled" => "cancelled: this sign-in was stopped. Do not ask again or create an account for it in this task.".into(),
+        "resolved" => "resolved: this request already has verified route evidence. Continue the task without opening another login request.".into(),
+        "needs_reconciliation" => "needs_reconciliation: setup was stopped after it may have begun. Do not submit registration again. Inspect the existing account outcome, record_created when confirmed, then verify recovery and identity before resolving.".into(),
+        "deferred" => "deferred: your person cannot help now. Continue independent work; checkpoint and finish partial when only this login blocks you. The request survives cleanup. Do not re-prompt or keep windows open. Resume with computer_checkpoint login action continue and this attention reference.".into(),
+        "no_account" => "no_account: your person reports no account. Check guest/public routes within the task; otherwise prepare a concrete signup proposal with computer_checkpoint login action propose_signup. No account creation is authorized yet. Do not ask to share again.".into(),
+        "without_account" => "without_account: continue through a guest/public route within the task. Do not sign up or use a different private account. If the task needs login, explain that limitation.".into(),
+        "person_sign_in" => "person_sign_in: your person will help. Respect human control and wait for handback; then verify the expected account. Release agent control while waiting.".into(),
+        "verify_session" => "verify_session: your person reports signing in. Verify the expected account and task access before proceeding; the report alone is not proof.".into(),
+        "signup_proposed" => "signup_proposed: the concrete account setup is awaiting your person. Do other work or checkpoint and release; do not register before authorization.".into(),
+        "signup_approved" => "signup_approved: the exact free signup proposal is approved. Call computer_checkpoint login action claim_signup before submitting. Use only the specified identity and credential store; a changed cost or scope needs a new decision.".into(),
+        "signup_in_progress" => "signup_in_progress: setup was claimed. Reconcile the existing attempt before any submission retry. Never create a duplicate account. Save credentials in the approved provider, not in tool text.".into(),
+        "needs_verification" => "needs_verification: an account was reported created. Verify its identity, recovery/credential storage and task access. Do not register again. Record the outcome with login action resolve and a non-secret evidence reference.".into(),
         "declined" => format!("declined: your person chose Don't Share for {site} this time. Don't ask again in this task; take another route or ask your person with computer_checkpoint."),
         "denied" => format!("denied: {site} is not shared with this computer. Don't ask for it."),
         "site_rejected" => format!("site_rejected: {site} still shows its sign-in page after the login was copied. Ask your person to sign in with Take Control (computer_checkpoint)."),
@@ -288,6 +338,9 @@ impl Controller {
         if !available {
             return (None, "not_available");
         }
+        if crate::logins::independent_site(name) {
+            return (Some("asking"), "independent_session");
+        }
         if !receiver.sharing() {
             return (Some("asking"), "sharing_off");
         }
@@ -302,9 +355,11 @@ impl Controller {
     fn open_request(
         &self,
         mut request: Request,
-        lease: &LeaseRecord,
-        op_ref: Option<&str>,
+        _lease: &LeaseRecord,
+        _op_ref: Option<&str>,
     ) -> Result<Request> {
+        let mut book = Book::load(&self.journal)?;
+        book.reserve_request(&self.journal)?;
         let asked: Vec<&Entry> = request
             .sites
             .iter()
@@ -326,19 +381,20 @@ impl Controller {
                 "agent": request.agent,
                 "principal": request.principal,
                 "task": { "task_ref": request.task_ref, "goal": request.goal },
-                "sites": asked.iter().map(|e| json!({ "site": e.site, "via": e.via })).collect::<Vec<_>>(),
+                "sites": asked.iter().map(|e| json!({ "site": e.site, "via": e.via, "state":e.state, "method":if crate::logins::independent_site(&e.site) {"independent_session"} else {"legacy_copy_available"} })).collect::<Vec<_>>(),
                 "page": request.page,
                 "own": request.own,
                 "source_label": if receiver.source.is_some() { Some(receiver.label.clone()) } else { None },
                 "request_ref": request.request_ref,
+                "assistance": {"version":1,"revision":0,"notification":"attention"},
             });
             let now = self.now_iso();
             let item = self.journal.raise_attention(NewAttention {
                 task_ref: &request.task_ref,
                 principal: &request.principal,
                 kind: "login",
-                operation_ref: op_ref,
-                generation: Some(&lease.generation),
+                operation_ref: None,
+                generation: None,
                 question: &question,
                 details: Some(&details),
                 options: &[],
@@ -359,7 +415,6 @@ impl Controller {
         for entry in request.sites.iter().filter(|e| e.state == "denied") {
             self.refused(&request.task_ref, &request.agent, &entry.site, "denied");
         }
-        let mut book = Book::load(&self.journal)?;
         book.requests.push(request.clone());
         book.save(&self.journal)?;
         Ok(request)
@@ -396,6 +451,9 @@ impl Controller {
             page,
             created_ms: self.now_ms(),
             sites,
+            revision: 0,
+            signup: None,
+            last_answer: None,
         }
     }
 
@@ -431,6 +489,8 @@ impl Controller {
                     via: None,
                     state: "denied".into(),
                     reason: None,
+                    person_response: None,
+                    responded_at: None,
                 });
             } else if let Some(entry) = entry {
                 entries.push(Entry {
@@ -438,6 +498,8 @@ impl Controller {
                     via: None,
                     state: entry.into(),
                     reason: None,
+                    person_response: None,
+                    responded_at: None,
                 });
             }
             standings.push(LoginStanding {
@@ -529,7 +591,7 @@ impl Controller {
                 .filter(|r| r.task_ref == task.task_ref)
                 .find_map(|r| r.sites.iter().find(|e| e.site == name).map(|e| (r, e)));
             match earlier {
-                Some((r, e)) if e.open() || matches!(e.state.as_str(), "declined" | "rejected") => {
+                Some((r, e)) if e.open() || e.terminal() || e.state=="rejected" || e.assistance_state().is_some() => {
                     plan.push(json!({ "site": name, "request_ref": r.request_ref }));
                 }
                 _ => {
@@ -547,6 +609,8 @@ impl Controller {
                         via,
                         state: state.into(),
                         reason: None,
+                        person_response: None,
+                        responded_at: None,
                     });
                     plan.push(json!({ "site": name }));
                 }
@@ -594,10 +658,15 @@ impl Controller {
         let att = request.att_ref.clone();
         let seen = match entry.state.as_str() {
             "shared" | "worked" => Seen::Shared,
+            "deliver_once" => Seen::Delivering,
             "rejected" => Seen::Code("site_rejected"),
             "declined" => Seen::Code("declined"),
             "denied" => Seen::Code("denied"),
+            "cancelled" => Seen::Code("cancelled"),
+            "resolved" => Seen::Code("resolved"),
             "unknown" => Seen::Code("unknown"),
+            _ if entry.assistance_state().is_some() => Seen::Code(entry.assistance_state().unwrap()),
+            _ if crate::logins::independent_site(name) => Seen::Code("independent_session"),
             _ if !receiver.sharing() => Seen::Code("sharing_off"),
             _ if receiver.rule(name) == Rule::Deny => Seen::Code("denied"),
             _ if !self.sharing_computer_here() => Seen::Code("waiting_for_sharing_computer"),
@@ -802,7 +871,7 @@ impl Controller {
                 page,
             },
             frame,
-            attention: None,
+            attention: codes.iter().find_map(|(_,_,att)|att.clone()),
             next,
         };
         Ok(Reply {
@@ -890,6 +959,8 @@ impl Controller {
             "login_deliver" => self.login_deliver(operator, action).await,
             "login_report" => self.login_report(operator, action),
             "login_answer" => self.login_answer(operator, action),
+            "login_assist" => self.login_assist(operator, action),
+            "login_authorize_once" => self.login_authorize_once(operator, action),
             "login_remove" => self.login_remove(operator, action).await,
             "login_probe" => self.login_probe(operator, action).await,
             _ => Err(invalid("Unknown operator operation.")),
@@ -988,7 +1059,7 @@ impl Controller {
                 .collect();
             let mut row = json!({
                 "request_ref": request.request_ref, "task_ref": request.task_ref, "goal": request.goal,
-                "agent": request.agent, "own": request.own, "sites": sites,
+                "agent": request.agent, "own": request.own, "sites": sites, "revision":request.revision,
             });
             if let Some(att) = &request.att_ref {
                 row["att_ref"] = json!(att);
@@ -1010,10 +1081,8 @@ impl Controller {
             return Err(denied("Login sharing is off for this computer."));
         }
         let name = site(action["site"].as_str().unwrap_or(""))?;
-        if receiver.rule(&name) != Rule::Allow {
-            return Err(denied(
-                "This site has not been allowed by the sharing computer.",
-            ));
+        if crate::logins::independent_site(&name) {
+            return Err(denied("This site requires an independent session; cookie import is disabled."));
         }
         let request_ref = action["request_ref"].as_str();
         let request = match request_ref {
@@ -1030,12 +1099,17 @@ impl Controller {
                 if !active {
                     return Err(denied("The task that asked for this login has ended."));
                 }
-                if !request.sites.iter().any(|e| e.site == name) {
-                    return Err(invalid("That site is not part of the login request."));
+                if !request.sites.iter().any(|e| e.site == name && e.deliverable()) {
+                    return Err(invalid("That site is not waiting for delivery in the login request."));
                 }
+                if action.get("revision").is_some() && action["revision"].as_u64()!=Some(request.revision) {return Err(invalid("The sharing answer changed; refresh it."));}
                 Some(request)
             }
         };
+        let once = request.as_ref().is_some_and(|r| r.sites.iter().any(|e|e.site==name && e.state=="deliver_once"));
+        if receiver.rule(&name)==Rule::Deny || (receiver.rule(&name)!=Rule::Allow && !once) {
+            return Err(denied("This site has no current sharing permission."));
+        }
         let cookies = action["cookies"]
             .as_array()
             .ok_or_else(|| invalid("Invalid login cookie bundle."))?;
@@ -1070,6 +1144,18 @@ impl Controller {
         let mut failed: Vec<Value> = Vec::new();
         for (batch, chunk) in cookies.chunks(BATCH).enumerate() {
             let offset = batch * BATCH;
+            let current=Receiver::load(&self.journal)?;
+            let still_granted=current.source.as_deref()==Some(operator) && current.enabled && current.rule(&name)!=Rule::Deny
+                && if let Some(request)=request.as_ref() {
+                    let book=Book::load(&self.journal)?;
+                    book.find(&request.request_ref).is_some_and(|i|book.requests[i].revision==request.revision
+                        && book.requests[i].sites.iter().any(|e|e.site==name && e.deliverable()))
+                        && self.journal.get_active_lease()?.is_some_and(|l|l.task_ref==request.task_ref)
+                } else {current.rule(&name)==Rule::Allow};
+            if !still_granted {
+                failed.extend((offset..cookies.len()).map(|index|json!({"index":index,"field":"permission_changed"})));
+                break;
+            }
             match self
                 .desktop
                 .browser_call(
@@ -1136,7 +1222,7 @@ impl Controller {
         }
         if let Some(request) = request {
             let mut book = Book::load(&self.journal)?;
-            if let Some(i) = book.find(&request.request_ref) {
+            if let Some(i) = book.find(&request.request_ref).filter(|i|book.requests[*i].revision==request.revision) {
                 if let Some(entry) = book.requests[i].sites.iter_mut().find(|e| e.site == name) {
                     entry.state = if failed.is_empty() {
                         "shared"
@@ -1156,7 +1242,7 @@ impl Controller {
     /// Close a request's attention item once none of its sites waits for the person.
     fn close_if_settled(&self, book: &mut Book, index: usize, operator: &str) -> Result<bool> {
         let request = &book.requests[index];
-        if request.sites.iter().any(|e| e.state == "asking") {
+        if request.sites.iter().any(|e| matches!(e.state.as_str(),"asking"|"deliver_once") || e.assistance_state().is_some()) {
             return Ok(false);
         }
         let Some(att) = request.att_ref.clone() else {

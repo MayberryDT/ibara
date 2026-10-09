@@ -22,9 +22,17 @@ mod delivery;
 mod home;
 mod questions;
 mod reconnect;
+mod work;
+mod observation_pages;
 mod recovery;
 mod stream;
 mod waiting;
+mod zero_windows;
+mod interaction;
+mod interaction2;
+mod interaction3;
+mod interaction4;
+mod interaction5;
 
 /// The viewer certificate `vesper` registered.
 const CERT: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
@@ -68,6 +76,8 @@ struct FakeDesktop {
     extension: RefCell<HashMap<String, Value>>,
     /// The extension operations asked for, in order.
     extension_ops: RefCell<Vec<String>>,
+    /// Scripted reader replies for races across changing browser state.
+    reader_replies: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
     /// The next this many page reader requests (tabs included) are refused
     /// before dispatch, as Chrome refuses one it cannot take.
     reader_refusals: Cell<u32>,
@@ -289,6 +299,9 @@ impl DesktopPort for FakeDesktop {
             self.extension_ops.borrow_mut().push(op.to_string());
             self.hold(op).await;
             self.reader_refused()?;
+            if let Some(reply) = self.reader_replies.borrow_mut().get_mut(op).and_then(|replies| replies.pop_front()) {
+                return Ok(reply);
+            }
             let field = self.field.borrow();
             if op == "field" && field.present {
                 // Like the page reader: whether it holds the text, never its value.
@@ -1453,7 +1466,7 @@ fn a_person_cannot_close_or_move_the_window_of_the_agent_at_work() {
         let rig = rig(false);
         let c = &rig.controller;
         let task = begin(c).await;
-        c.journal.own_window(&task, "0x1", 100, "mousepad", "Untitled 1 - Mousepad").unwrap();
+        c.journal.own_window(&task, "0x1", 100, "mousepad", "Untitled 1 - Mousepad", None, "").unwrap();
         rig.desktop.windows.borrow_mut().push(win("0x3", 300, "foot", "a person's shell", false, false));
         let listed = c.operator_call("vesper", operator_action(c, "windows")).await.unwrap();
         let windows: Vec<&Value> = listed["workspaces"].as_array().unwrap().iter().flat_map(|w| w["windows"].as_array().unwrap()).collect();
@@ -2324,7 +2337,8 @@ fn a_pause_during_a_browser_step_sends_no_further_input() {
             ]);
             let mut extension = rig.desktop.extension.borrow_mut();
             extension.insert("observe".into(), json!({ "capture": "c1", "documentId": "d1", "url": "https://shop.example/", "title": "Shop", "count": 3, "nodes": nodes }));
-            extension.insert("locate".into(), json!({ "x": 100, "y": 50, "outer": [1000, 1000], "inner": [1000, 913], "zoom": 1, "label": "Blue" }));
+            extension.insert("locate".into(), json!({ "x": 100, "y": 50, "outer": [1000, 1000], "inner": [1000, 913], "zoom": 1, "label": "Blue", "selection": {"value":"Blue","index":0,"from":"Home","steps":0} }));
+            extension.insert("selected".into(), json!({"ready":true,"matches":true}));
             drop(extension);
             let task = observe_page(&rig.controller).await;
             let hold = Rc::new(Notify::new());

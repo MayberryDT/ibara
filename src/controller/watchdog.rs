@@ -84,7 +84,7 @@ impl Problem {
         let (message, fix) = match self {
             Problem::Display => ("This computer has no screen, and ibara could not add a virtual one.", "reconnect_display"),
             Problem::Viewer => ("Screen sharing on this computer stopped working, and restarting it did not help.", "restart_viewer"),
-            Problem::Unsettled => ("Earlier work on this computer did not finish stopping, so agents are held back.", "restart_ibara"),
+            Problem::Unsettled => ("This computer needs a cleanup retry. Other free computers can still be used.", "retry_cleanup"),
         };
         json!({ "code": self.code(), "message": message, "fix": fix, "at": since_ms.map(crate::ids::iso_from_millis) })
     }
@@ -196,6 +196,29 @@ impl Controller {
                     Err(e) => Ok(answer("still_broken", &format!("Screen sharing did not start again: {}", e.message))),
                 }
             }
+            "retry_cleanup" => {
+                let _turn = self.watchdog_turn.lock().await;
+                let control=self.journal.get_control()?;
+                if control.pause_origin==Some(PauseOrigin::Person) || self.viewer_state.borrow().owner.is_some()
+                    || self.viewer_state.borrow().fault || self.journal.get_active_lease()?.is_some()
+                    || self.settling.get() || self.queue_depth.get()>0 || self.storage.has_active_jobs(None) {
+                    return Ok(answer("still_broken","Active work or a person's control must finish before cleanup can be retried."));
+                }
+                // Explicit operator retry grants one fresh reconciliation, never
+                // an endless replay of uncertain native input or a forced kill.
+                self.journal.put_desktop_reset(&json!({"state":"unsettled","reason":"operator requested cleanup retry","at":self.now_iso()}))?;
+                self.release_lease(None,Release::Finished,false).await?;
+                if self.journal.get_control()?.unsettled {
+                    let reset=self.journal.desktop_reset()?;
+                    let reason=reset.pointer("/cleanup/left/0/reason").and_then(Value::as_str)
+                        .or_else(||reset["reason"].as_str()).unwrap_or("work is still stopping");
+                    Ok(answer("still_broken",&format!("Cleanup could not finish: {reason}. Join this computer to resolve it; other ready computers remain available.")))
+                } else {
+                    self.repaired(Problem::Unsettled);
+                    self.resume_if_healthy().await?;
+                    Ok(answer("fixed","Cleanup finished and the desktop is ready."))
+                }
+            }
             "restart_ibara" => {
                 self.record(REPAIR, "Restarting ibara at a person's request.", json!({ "problem": "restart_requested" }));
                 if let Some(me) = self.me.borrow().upgrade() {
@@ -209,7 +232,7 @@ impl Controller {
                 }
                 Ok(answer("restarting", "ibara is restarting on this computer and is back in a few seconds."))
             }
-            _ => Err(crate::error::invalid("Unknown repair. Use reconnect_display, restart_viewer or restart_ibara.")),
+            _ => Err(crate::error::invalid("Unknown repair. Use retry_cleanup, reconnect_display, restart_viewer or restart_ibara.")),
         }
     }
 

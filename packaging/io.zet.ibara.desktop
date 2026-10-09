@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ibara
+Comment=Your computers, their agents and what needs you
+Exec=omarchy-shell shell summon io.zet.ibara
+TryExec=omarchy-shell
+Icon=io.zet.ibara
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+Keywords=computers;agents;approvals;console;

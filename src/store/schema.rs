@@ -163,6 +163,11 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
     if !columns(&tx, "operations")?.iter().any(|c| c == "session") {
         tx.execute_batch("ALTER TABLE operations ADD COLUMN session TEXT")?;
     }
+    // Additive, old rows cannot authorize automatic discard without identity.
+    if !columns(&tx, "task_windows")?.iter().any(|c| c == "process_start_ticks") {
+        tx.execute_batch("ALTER TABLE task_windows ADD COLUMN process_start_ticks INTEGER;
+                          ALTER TABLE task_windows ADD COLUMN compositor_instance TEXT NOT NULL DEFAULT '';")?;
+    }
     let attention_sql: String =
         tx.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attention_items'", [], |r| r.get(0))?;
     if !attention_sql.contains("'login'") {

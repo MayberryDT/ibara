@@ -528,7 +528,7 @@ fn a_journal_from_before_task_windows_remembers_them_once_it_migrates() {
     drop(db);
     let (j, _) = open(&dir);
     assert_eq!(meta(j.db(), "core_schema_version").as_deref(), Some("6"));
-    j.own_window("task_1", "0x2", 200, "mousepad", "notes.txt - Mousepad").unwrap();
+    j.own_window("task_1", "0x2", 200, "mousepad", "notes.txt - Mousepad", None, "").unwrap();
     let owned: Vec<(String, i64)> = j.task_windows("task_1").unwrap().into_iter().map(|w| (w.address, w.pid)).collect();
     assert_eq!(owned, [("0x2".to_string(), 200)]);
 }

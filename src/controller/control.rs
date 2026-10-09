@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
+// The local MCP relay heartbeats every 30 s. Three missed heartbeats mean the
+// transport disappeared without a disconnect notice, not that its jobs ended.
+const CONNECTION_LOST_MS: i64 = 90_000;
+
 fn fail(code: &'static str, message: &str, retry_safe: bool) -> IbaraError {
     IbaraError::new(code, message, retry_safe)
 }
@@ -224,9 +228,9 @@ impl Controller {
     /// The connection went away (disconnected, in its grace), or its client
     /// stopped answering the session's pings: a network drop this computer
     /// has not noticed, the session still open and heartbeating.
-    fn connection_gone(&self, connection_id: &str) -> bool {
+    pub(super) fn connection_gone(&self, connection_id: &str) -> bool {
         self.silent.borrow().contains(connection_id)
-            || self.journal.get_connection(connection_id).ok().flatten().is_none_or(|c| c.disconnected_at_ms.is_some())
+            || self.journal.get_connection(connection_id).ok().flatten().is_none_or(|c| c.disconnected_at_ms.is_some() || self.now_ms()-c.last_heartbeat_ms>=CONNECTION_LOST_MS)
     }
 
     /// The agent holding `task_ref`'s control calls over another connection
@@ -245,7 +249,7 @@ impl Controller {
         if lease.connection_id == connection_id
             || lease.task_ref != task_ref
             || lease.epoch != self.epoch
-            || lease.idle_expires_at_ms <= now
+            || (lease.idle_expires_at_ms <= now && !self.storage.has_active_jobs(Some(task_ref)))
             || !self.holds_lease(&lease, principal, connection_id, agent)
         {
             return Ok(());
@@ -258,7 +262,9 @@ impl Controller {
         lease.last_heartbeat_at = self.now_iso();
         lease.last_heartbeat_ms = now;
         lease.idle_expires_at_ms = now + self.idle_expiry_ms;
-        self.journal.put_lease(&lease)
+        self.journal.put_lease(&lease)?;
+        self.timeline("work_reconnected", Some(task_ref), agent, "Work reconnected; existing jobs were not replayed", json!({"principal":principal}));
+        Ok(())
     }
 
     /// `context.assertAuthority()` (`core.ts:995-1003`), re-run before and after effects.
@@ -291,13 +297,42 @@ impl Controller {
             super::log_event("access_settle_failed", &e.to_string());
         }
         self.project_access_background().await;
+        self.storage.refresh_job_quiescence()?;
         let now = self.now_ms();
-        if let Some(lease) = self.journal.get_active_lease()?
-            && lease.idle_expires_at_ms <= now
-        {
-            self.release_lease(Some(lease), Release::IdleExpired, false).await?;
+        if let Some(mut lease) = self.journal.get_active_lease()? {
+            if self.journal.get_connection(&lease.connection_id)?.is_some_and(|c|c.disconnected_at_ms.is_none() && now-c.last_heartbeat_ms>=CONNECTION_LOST_MS) {
+                // A SIGKILL cannot deliver EOF/SIGTERM cleanup. Persist liveness
+                // loss once so completed jobs can eventually release occupancy.
+                self.disconnect(&lease.principal,&lease.connection_id).await?;
+            }
+            if self.storage.has_active_jobs(Some(&lease.task_ref)) {
+                // Process supervision, not client pings, proves occupancy. This
+                // includes unknown descendants whose termination is unconfirmed.
+                // Explicit cancel, takeover and revocation still settle them.
+                if lease.idle_expires_at_ms <= now + self.idle_expiry_ms / 2 {
+                    lease.idle_expires_at_ms = now + self.idle_expiry_ms;
+                    self.journal.put_lease(&lease)?;
+                }
+            } else if lease.idle_expires_at_ms <= now {
+                self.release_lease(Some(lease), Release::IdleExpired, false).await?;
+            }
         }
         let Some(active) = self.journal.get_active_lease()? else {
+            if (self.disposable_desktop)() && !self.settling.get() && self.queue_depth.get() == 0 {
+                let control = self.journal.get_control()?;
+                if control.pause_origin != Some(PauseOrigin::Person) && self.viewer_state.borrow().owner.is_none() {
+                    let inventory = self.desktop.all_windows().await.ok();
+                    let dirty = inventory.as_ref().is_none_or(|w| !w.is_empty());
+                    let reset = self.journal.desktop_reset()?;
+                    let unchanged_blocker = reset["state"] == "blocked"
+                        && reset["blocked_inventory"] == super::windows::reset_inventory(inventory.as_deref());
+                    // A failed effect is not permission to repeat it every tick. Reconcile again
+                    // only after client identity changes or an explicit operator handback.
+                    if !unchanged_blocker && (dirty || self.journal.browser_retirement_pending()? || reset["state"] != "verified") {
+                        self.release_lease(None, Release::Finished, false).await?;
+                    }
+                }
+            }
             return Ok(());
         };
         if let Some(task) = self.journal.get_task(&active.task_ref)?
@@ -308,6 +343,7 @@ impl Controller {
         if let Some(conn) = self.journal.get_connection(&active.connection_id)?
             && conn.disconnected_at_ms.is_some()
             && conn.grace_expires_at_ms.is_some_and(|at| at <= now)
+            && !self.storage.has_active_jobs(Some(&active.task_ref))
         {
             self.release_lease(Some(active), Release::DisconnectGrace, false).await?;
         }
@@ -318,6 +354,9 @@ impl Controller {
     /// settlement: cancel jobs, browser work, input and idle inhibition, then
     /// drain the effect queue; only a clean settlement clears `unsettled`.
     pub(crate) async fn release_lease(&self, lease: Option<LeaseRecord>, how: Release, inside_effect: bool) -> Result<()> {
+        if (self.disposable_desktop)() && lease.is_none() && self.journal.get_active_lease()?.is_some() {
+            return Ok(()); // A begin won the idle-reset race; never cancel its work.
+        }
         if self.settling.get() {
             let mut rx = self.settled.subscribe();
             while self.settling.get() {
@@ -376,7 +415,15 @@ impl Controller {
         self.abort_effects();
         let cancellation_failed = self.gather_cancellation(lease.as_ref().map(|l| l.task_ref.as_str())).await;
         let drained = self.drain_effects(inside_effect).await;
-        self.journal.complete_settlement(&generation, cancellation_failed || !drained)?;
+        let reset_failed = if (self.disposable_desktop)() && how != Release::OperatorPause {
+            if cancellation_failed || !drained { true } else { !self.reset_desktop_windows().await? }
+        } else { false };
+        self.journal.complete_settlement(&generation, cancellation_failed || !drained || reset_failed)?;
+        if let Some(lease)=&lease {
+            self.timeline("work_released",Some(&lease.task_ref),"ibara","Work settlement finished",
+                json!({"cause":how.reason(),"settled":!cancellation_failed && drained && !reset_failed,
+                    "active_jobs":self.storage.active_job_count(Some(&lease.task_ref)),"generation":generation}));
+        }
         Ok(())
     }
 
@@ -426,16 +473,16 @@ impl Controller {
             Charge::Image => task.images_used += 1,
             Charge::Control => {}
         }
-        let budget = |key: &str, default: i64| task.budgets.get(key).and_then(Value::as_i64).filter(|n| *n > 0).unwrap_or(default);
+        let budget = |key: &str| task.budgets.get(key).and_then(Value::as_i64).filter(|n| *n > 0);
         if control_limit_ms(task).is_some_and(|limit| task.active_control_used_ms as f64 >= limit) {
             self.journal.put_task(task)?;
             return Err(fail("BUDGET_EXCEEDED", "Active control budget exhausted.", false));
         }
-        if kind == Charge::Action && task.actions_used > budget("max_actions", 200) {
+        if kind == Charge::Action && budget("max_actions").is_some_and(|limit| task.actions_used > limit) {
             self.journal.put_task(task)?;
             return Err(fail("BUDGET_EXCEEDED", "Action budget exhausted.", false));
         }
-        if kind == Charge::Image && task.images_used > budget("image_count", 40) {
+        if kind == Charge::Image && budget("image_count").is_some_and(|limit| task.images_used > limit) {
             self.journal.put_task(task)?;
             return Err(fail("BUDGET_EXCEEDED", "Image budget exhausted.", false));
         }
@@ -471,17 +518,20 @@ impl Controller {
     }
 
     /// `heartbeat` (`core.ts:644-660`): extends this connection's lease by the
-    /// idle expiry. `answering: false` says the session's client stopped
-    /// answering; the lease stays, but the same agent may carry it on over a
-    /// new connection.
+    /// idle expiry. A relay whose client stopped answering is disconnected:
+    /// preserve registered jobs, but do not renew abandoned occupancy forever.
     pub async fn heartbeat(&self, principal: &str, connection_id: &str, answering: bool) -> Result<()> {
         self.ensure_open()?;
         self.assert_identity(principal, connection_id)?;
+        if !answering {
+            if self.journal.get_connection(connection_id)?.is_none_or(|c| c.disconnected_at_ms.is_none()) {
+                self.disconnect(principal, connection_id).await?;
+            }
+            // Repeated relay heartbeats must not reset the disconnect grace.
+            return self.reconcile().await;
+        }
         self.reconcile().await?;
         self.touch_connection(principal, connection_id)?;
-        if !answering {
-            self.silent.borrow_mut().insert(connection_id.to_string());
-        }
         if let Some(mut lease) = self.journal.get_active_lease()?
             && lease.principal == principal
             && lease.connection_id == connection_id
@@ -489,7 +539,9 @@ impl Controller {
             let now = self.now_ms();
             lease.last_heartbeat_at = self.now_iso();
             lease.last_heartbeat_ms = now;
-            lease.idle_expires_at_ms = now + self.idle_expiry_ms;
+            if !(self.disposable_desktop)() {
+                lease.idle_expires_at_ms = now + self.idle_expiry_ms;
+            }
             self.journal.put_lease(&lease)?;
         }
         Ok(())
@@ -510,6 +562,12 @@ impl Controller {
         self.grace_deadlines.borrow_mut().insert(connection_id.to_string(), at + self.disconnect_grace_ms);
         self.sessions.borrow_mut().remove(connection_id);
         self.silent.borrow_mut().remove(connection_id);
+        if let Some(lease) = self.journal.get_active_lease()?.filter(|l| l.connection_id == connection_id) {
+            self.timeline("work_disconnected", Some(&lease.task_ref), &self.task_subject(&lease.task_ref, principal),
+                "Client disconnected; cancellation intent is unknown", json!({"principal":principal,
+                    "active_jobs":self.storage.active_job_count(Some(&lease.task_ref)),
+                    "policy":"retain_while_jobs_active"}));
+        }
         Ok(())
     }
 
@@ -538,6 +596,12 @@ impl Controller {
         }
         if self.journal.get_active_lease()?.is_some() {
             return Ok("busy");
+        }
+        if self.storage.has_active_jobs(None) {
+            return Ok("control_unsettled");
+        }
+        if (self.disposable_desktop)() && self.journal.desktop_reset()?["state"] != "verified" {
+            return Ok("control_unsettled");
         }
         let degraded = self.capabilities.borrow().iter().any(|c| c.get("status").and_then(Value::as_str) == Some("degraded"));
         Ok(if degraded { "degraded" } else { "ready" })
@@ -654,6 +718,9 @@ impl Controller {
             pause_origin: Some(None),
             ..Default::default()
         })?;
+        if (self.disposable_desktop)() && self.journal.get_active_lease()?.is_none() {
+            self.journal.put_desktop_reset(&json!({"state":"unsettled","reason":"operator requested fresh reconciliation","at":self.now_iso()}))?;
+        }
         self.push_event(None, "the computer was resumed for agents");
         Ok(json!({
             "ok": true,
@@ -1229,7 +1296,7 @@ pub(crate) async fn lease_ticks(me: Weak<Controller>) {
         }
         let has_grace = !controller.grace_deadlines.borrow().is_empty();
         let lease = controller.journal.get_active_lease().ok().flatten();
-        if lease.is_some() || has_grace || crate::access::Access::load(&controller.journal).ok().flatten().is_some() {
+        if lease.is_some() || has_grace || (controller.disposable_desktop)() || crate::access::Access::load(&controller.journal).ok().flatten().is_some() {
             if let Err(e) = controller.reconcile().await {
                 log_event("reconcile_failed", &e.to_string());
             }

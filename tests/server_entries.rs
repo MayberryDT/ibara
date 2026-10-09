@@ -73,6 +73,7 @@ fn ibarad_refuses_an_unknown_role() {
 struct Daemon {
     child: Child,
     root: PathBuf,
+    command: Command,
 }
 
 impl Drop for Daemon {
@@ -131,7 +132,7 @@ impl Daemon {
                 let mut line=String::new();
                 if reader.read_line(&mut line).is_err() {continue;}
                 let request:Value=serde_json::from_str(&line).unwrap();
-                assert_eq!(request["peers"]["test"]["agent"],true);
+                assert!(request["peers"].is_object());
                 let _=writeln!(reader.get_mut(),"{{\"ok\":true}}");
             }
         });
@@ -190,7 +191,21 @@ impl Daemon {
                 Err(_) => panic!("ibarad did not become ready: {log:#?} (exit {:?})", child.try_wait()),
             }
         }
-        Daemon { child, root }
+        Daemon { child, root, command }
+    }
+
+    fn crash_and_restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child=self.command.spawn().unwrap();
+        let stderr=self.child.stderr.take().unwrap();
+        let (tx,rx)=mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if line.contains("\"controller_ready\"") {let _=tx.send(());}
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(30)).expect("restarted daemon ready");
     }
 
     fn admin(&self, args: &[&str], key: &str) -> (Option<i32>, Value) {
@@ -496,6 +511,200 @@ fn begin_when_ready(agent: &mut Agent) -> (String, PathBuf) {
     let began = agent.call("computer_begin", json!({ "goal": "Write a note", "request_id": "begin-1" }));
     assert_eq!(began["status"], "ok", "{began}");
     (began["result"]["task_ref"].as_str().unwrap().to_string(), PathBuf::from(began["result"]["workspace"].as_str().unwrap()))
+}
+
+/// Real daemon + independent MCP processes + real shell/process group. The
+/// desktop adapter is stubbed; this proves ownership, not native input.
+#[test]
+fn managed_work_survives_a_real_client_restart_and_is_never_double_launched() {
+    let daemon=Daemon::start_with("managed-work",true);
+    let mut first=Agent::start(&daemon,"codex");
+    let (task,workspace)=begin_when_ready(&mut first);
+    let args=json!({"task_ref":task,"request_id":"one-build","background":true,"timeout_ms":210000,
+        "command":["/bin/sh","-c","echo started >> starts; for i in $(seq 1 2000); do [ -f release ] && break; sleep 0.1; done; echo built > output; echo complete"]});
+    let launched=first.call("computer_exec",args.clone());
+    assert_eq!(launched["status"],"pending","{launched}");
+    let op=launched["result"]["op_ref"].as_str().unwrap().to_owned();
+    drop(first);
+    // SIGKILL cannot send disconnect. Cross the production missing-heartbeat
+    // threshold and grace; registered work must still exclude rivals.
+    std::thread::sleep(Duration::from_secs(123));
+    let mut rival=Agent::start(&daemon,"claude");
+    let refused=rival.call("computer_begin",json!({"goal":"conflicting task","request_id":"conflict"}));
+    assert_eq!(refused["error"]["code"],"BUSY","{refused}");
+    let mut back=Agent::start(&daemon,"codex");
+    let status=back.call("computer_status",json!({"ref":task}));
+    assert_eq!(status["result"]["details"]["active_jobs"],1,"{status}");
+    assert_eq!(status["result"]["details"]["connection"],"disconnected","{status}");
+    let replay=back.call("computer_exec",args);
+    assert_eq!(replay["result"]["op_ref"],op,"{replay}");
+    std::fs::write(workspace.join("release"),b"go").unwrap();
+    let waited=back.call("computer_wait",json!({"task_ref":task,"for":{"op":op},"deadline_ms":5000}));
+    assert_eq!(waited["status"],"ok","{waited}");
+    let saved=back.call("computer_status",json!({"ref":op}));
+    assert_eq!(saved["result"]["details"]["state"],"completed","{saved}");
+    assert_eq!(std::fs::read_to_string(workspace.join("starts")).unwrap(),"started\n");
+    assert_eq!(std::fs::read_to_string(workspace.join("output")).unwrap(),"built\n");
+    let no_deadline=back.call("computer_exec",json!({"task_ref":task,"request_id":"no-deadline","command":["true"]}));
+    assert!(no_deadline["result"]["job"]["runtime_limit_ms"].is_null(),"{no_deadline}");
+    let finished=back.call("computer_finish",json!({"task_ref":task,"request_id":"finish","outcome":"complete","summary":"One build persisted across MCP restart"}));
+    assert_eq!(finished["status"],"ok","{finished}");
+    if let Some(dir)=std::env::var_os("IBARA_E2E_ARTIFACTS") {
+        let dir=PathBuf::from(dir);std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("managed-work.json"),serde_json::to_vec_pretty(&json!({"schema_version":1,"kind":"daemon_process_e2e","native_input":false,
+            "launched":launched,"conflict":refused,"disconnected":status,"replay":replay,"saved":saved,"finished":finished,
+            "execution_count":1,"output":"built","disconnect_wait_seconds":123})).unwrap()).unwrap();
+    }
+}
+
+// A detached stdout does not mean the process group is settled. Once its final
+// child exits, unknown effects remain unknown but occupancy must be releasable.
+#[test]
+fn managed_work_detects_when_an_orphaned_descendant_exits() {
+    let daemon=Daemon::start_with("managed-orphan",true);
+    let mut agent=Agent::start(&daemon,"codex");
+    let (task,_)=begin_when_ready(&mut agent);
+    let launched=agent.call("computer_exec",json!({"task_ref":task,"request_id":"orphan","background":true,"timeout_ms":10000,
+        "command":["/bin/sh","-c","sleep 2 >/dev/null 2>&1 &"]}));
+    let op=launched["result"]["op_ref"].as_str().unwrap().to_owned();
+    std::thread::sleep(Duration::from_millis(300));
+    let occupied=agent.call("computer_status",json!({"ref":task}));
+    assert_eq!(occupied["result"]["details"]["active_jobs"],1,"{occupied}");
+    std::thread::sleep(Duration::from_secs(3));
+    let settled=agent.call("computer_status",json!({"ref":task}));
+    assert_eq!(settled["result"]["details"]["active_jobs"],0,"{settled}");
+    let historical=agent.call("computer_status",json!({"ref":op}));
+    assert_eq!(historical["result"]["details"]["state"],"unknown","{historical}");
+    assert_eq!(historical["result"]["details"]["termination_confirmed"],true,"{historical}");
+    agent.call("computer_finish",json!({"task_ref":task,"request_id":"finish-orphan","outcome":"partial","summary":"Parent result unknown; descendants settled"}));
+}
+
+// A service announces its port before exiting; agents must read that output
+// while it owns the machine. Inspecting output must not release or replay it.
+#[test]
+fn managed_work_exposes_live_output_before_completion() {
+    let daemon=Daemon::start_with("live-output",true);
+    let mut agent=Agent::start(&daemon,"codex");
+    let (task,workspace)=begin_when_ready(&mut agent);
+    let launched=agent.call("computer_exec",json!({"task_ref":task,"request_id":"live-output","background":true,"timeout_ms":10000,
+        "command":["/bin/sh","-c","printf 'ready\\001:4321\\n'; printf 'waiting\\n' >&2; while [ ! -f release ]; do sleep 0.1; done; echo completed"]}));
+    let op=launched["result"]["op_ref"].clone();
+    let deadline=std::time::Instant::now()+Duration::from_secs(3);
+    let live=loop {
+        let status=agent.call("computer_status",json!({"ref":op}));
+        if status["result"]["details"]["stdout"]=="ready:4321\n" && status["result"]["details"]["stderr"]=="waiting\n" {break status;}
+        assert!(std::time::Instant::now()<deadline,"live output unavailable: {status}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(live["result"]["details"]["state"],"running");
+    let mut rival=Agent::start(&daemon,"claude");
+    let conflict=rival.call("computer_begin",json!({"goal":"other work","request_id":"rival"}));
+    assert_eq!(conflict["error"]["code"],"BUSY");
+    std::fs::write(workspace.join("release"),b"go").unwrap();
+    agent.call("computer_wait",json!({"task_ref":task,"for":{"op":op},"deadline_ms":3000}));
+    let saved=agent.call("computer_status",json!({"ref":op}));
+    assert_eq!(saved["result"]["details"]["stdout"],"ready:4321\ncompleted\n");
+    agent.call("computer_finish",json!({"task_ref":task,"request_id":"finish","outcome":"complete","summary":"Live output and completed output verified"}));
+    if let Some(dir)=std::env::var_os("IBARA_E2E_ARTIFACTS") {
+        let dir=PathBuf::from(dir);std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("live-output.json"),serde_json::to_vec_pretty(&json!({"kind":"daemon_process_e2e","native_input":false,"live":live,"saved":saved,"conflict":conflict})).unwrap()).unwrap();
+    }
+}
+
+fn work_artifact(name: &str, value: Value) {
+    if let Some(dir)=std::env::var_os("IBARA_E2E_ARTIFACTS") {
+        let dir=PathBuf::from(dir);std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.json")),serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+}
+
+fn await_process_file(path: &Path) -> i64 {
+    let until=std::time::Instant::now()+Duration::from_secs(5);
+    loop {
+        if let Ok(text)=std::fs::read_to_string(path) && let Ok(pid)=text.trim().parse() {return pid;}
+        assert!(std::time::Instant::now()<until,"process did not start");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn process_running(pid: i64) -> bool {
+    ibara::storage::read_process_stat(pid).is_some_and(|s|s.state!="Z" && s.state!="X")
+}
+
+// Real disconnect grace, parent already exited but descendant still owns work.
+// No owner reconnect or finish is allowed to cause this release.
+#[test]
+fn managed_work_releases_disconnected_last_descendant_without_a_finish_call() {
+    let daemon=Daemon::start_with("orphan-auto-release",true);
+    let mut owner=Agent::start(&daemon,"codex");
+    let (task,workspace)=begin_when_ready(&mut owner);
+    let launched=owner.call("computer_exec",json!({"task_ref":task,"request_id":"descendant","background":true,"timeout_ms":50000,
+        "command":["/bin/sh","-c","(while [ ! -f release ]; do sleep 0.1; done; echo saved > output) >/dev/null 2>&1 & echo $! > descendant"]}));
+    let pid=await_process_file(&workspace.join("descendant"));
+    owner.drop_network();
+    std::thread::sleep(Duration::from_secs(33));
+    let mut other=Agent::start(&daemon,"claude");
+    let conflict=other.call("computer_begin",json!({"goal":"other","request_id":"too-early"}));
+    assert_eq!(conflict["error"]["code"],"BUSY","{conflict}");assert!(process_running(pid));
+    std::fs::write(workspace.join("release"),b"go").unwrap();
+    // The relay can take one 30-second upstream heartbeat interval to
+    // deliver disconnect, followed by the controller's 30-second grace.
+    let until=std::time::Instant::now()+Duration::from_secs(45);
+    loop {
+        let s=daemon.admin(&["status"],"admin.key").1;
+        if s["result"]["lease"].is_null() {break;}
+        assert!(std::time::Instant::now()<until,"automatic release missing: {s}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!process_running(pid));
+    let saved=other.call("computer_status",json!({"ref":launched["result"]["op_ref"]}));
+    assert_eq!(saved["result"]["details"]["state"],"unknown","{saved}");
+    assert_eq!(saved["result"]["details"]["termination_confirmed"],true,"{saved}");
+    assert_eq!(std::fs::read_to_string(workspace.join("output")).unwrap(),"saved\n");
+    let (next,_)=begin_when_ready(&mut other);
+    other.call("computer_finish",json!({"task_ref":next,"request_id":"finish-next","outcome":"partial","summary":"Fresh work acquired after automatic release"}));
+    work_artifact("disconnected-last-descendant",json!({"kind":"daemon_process_e2e","native_input":false,"conflict":conflict,"saved":saved,"new_task":next,"output":"saved","grace_wait_seconds":33}));
+}
+
+// Crash recovery must settle the old group before admission, retain unknown
+// effects, and avoid signalling an unrelated process. Then revoke agents while
+// a new managed group runs; a fresh transport must not restore that authority.
+#[test]
+fn managed_work_crash_recovery_and_access_revocation_settle_only_owned_processes() {
+    let mut daemon=Daemon::start_with("work-recovery",true);
+    let mut owner=Agent::start(&daemon,"codex");
+    let (task,workspace)=begin_when_ready(&mut owner);
+    let command=json!(["/bin/sh","-c","sleep 50 & echo $! > descendant; wait"]);
+    let launched=owner.call("computer_exec",json!({"task_ref":task,"request_id":"crash-group","background":true,"command":command}));
+    let pid=await_process_file(&workspace.join("descendant"));
+    let mut sentinel=Command::new("sleep").arg("50").spawn().unwrap();
+    daemon.crash_and_restart();drop(owner);
+    let mut back=Agent::start(&daemon,"codex");
+    let until=std::time::Instant::now()+Duration::from_secs(10);
+    while process_running(pid) {
+        let s=back.call("computer_status",json!({}));
+        assert!(!situation(&s).contains("nobody controls"),"ready while old process runs: {s}");
+        assert!(std::time::Instant::now()<until,"old group never settled");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let recovered=back.call("computer_status",json!({"ref":launched["result"]["op_ref"]}));
+    assert_eq!(recovered["result"]["details"]["state"],"unknown","{recovered}");
+    assert_eq!(recovered["result"]["details"]["termination_confirmed"],true,"{recovered}");
+    assert!(sentinel.try_wait().unwrap().is_none());
+    let (next,workspace)=begin_when_ready(&mut back);
+    let launched2=back.call("computer_exec",json!({"task_ref":next,"request_id":"revoked-group","background":true,"command":command}));
+    let pid2=await_process_file(&workspace.join("descendant"));
+    let access=daemon.admin(&["access"],"admin.key").1;
+    let fields=json!({"expected_revision":access["result"]["revision"],"subject":"test","capability":"agents","rule":"deny"}).to_string();
+    let (code,revoked)=daemon.admin(&["access_set",&fields],"admin.key");
+    assert_eq!(code,Some(0),"{revoked}");assert!(!process_running(pid2));
+    let refused=back.call("computer_exec",json!({"task_ref":next,"request_id":"after-revoke","command":["true"]}));
+    assert_ne!(refused["status"],"ok","{refused}");
+    let mut reconnect=Agent::start(&daemon,"codex");
+    let refused_again=reconnect.call("computer_begin",json!({"goal":"revoked reconnect","request_id":"revoked-begin"}));
+    assert_ne!(refused_again["status"],"ok","{refused_again}");
+    assert!(sentinel.try_wait().unwrap().is_none());sentinel.kill().unwrap();sentinel.wait().unwrap();
+    work_artifact("daemon-crash-and-revocation",json!({"kind":"daemon_process_e2e","native_input":false,"recovered":recovered,"revoked_op":launched2["result"]["op_ref"],"revoked":revoked,"refused":refused,"reconnect":refused_again,"unrelated_sentinel_survived":true}));
 }
 
 /// The network under an agent's connection drops. The computer keeps the old

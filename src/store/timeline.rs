@@ -386,11 +386,21 @@ impl Journal {
     /// Expire open items: one item, or every open item of a task (for example
     /// when control changes hands and approvals no longer apply). Returns how many expired.
     pub fn expire_attention(&self, att_ref: Option<&str>, task_ref: Option<&str>, actor: &str, now_iso: &str) -> Result<usize> {
-        let open: Vec<AttentionItem> = match (att_ref, task_ref) {
+        let mut open: Vec<AttentionItem> = match (att_ref, task_ref) {
             (Some(a), _) => self.get_attention(a)?.into_iter().filter(|i| i.state == "open").collect(),
             (None, Some(t)) => self.list_attention(Some("open"), Some(t), MAX_LIST)?,
             (None, None) => return Err(invalid("Name an attention item or a task.")),
         };
+        // Only non-secret login assistance survives a released/partial task.
+        // Explicit expiry, completed/cancelled work and all old effect approvals still expire.
+        if att_ref.is_none() {
+            if let Some(task_ref) = task_ref {
+                let keep_assistance = self.get_task(task_ref)?.is_some_and(|t| !matches!(t.state.as_str(), "completed" | "cancelled"));
+                if keep_assistance {
+                    open.retain(|item| !(item.kind == "login" && item.details.pointer("/assistance/version").and_then(Value::as_u64) == Some(1)));
+                }
+            }
+        }
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
         for item in &open {
             tx.execute(

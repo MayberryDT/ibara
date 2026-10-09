@@ -20,6 +20,8 @@ pub struct TaskWindow {
     pub pid: i64,
     pub class: String,
     pub title: String,
+    pub process_start_ticks: Option<u64>,
+    pub compositor_instance: String,
     /// A person used it: it took focus or changed its title while no agent
     /// step ran.
     pub touched: bool,
@@ -32,20 +34,64 @@ fn window_from_row(r: &Row<'_>) -> rusqlite::Result<TaskWindow> {
         pid: r.get("pid")?,
         class: r.get("class")?,
         title: r.get("title")?,
+        process_start_ticks: r.get("process_start_ticks")?,
+        compositor_instance: r.get("compositor_instance")?,
         touched: r.get::<_, i64>("touched")? != 0,
     })
 }
 
 impl Journal {
+    /// Durable across daemon/browser crashes; cleared only after native retirement and zero inventory.
+    pub fn browser_retirement_pending(&self) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self.db().query_row("SELECT value FROM meta WHERE key='browser_retirement_pending'", [], |r| r.get(0)).optional()?;
+        Ok(value.as_deref() == Some("true"))
+    }
+
+    pub fn browser_window_generation(&self) -> Result<i64> {
+        use rusqlite::OptionalExtension;
+        Ok(self.db().query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key='browser_window_generation'", [], |r| r.get(0)).optional()?.unwrap_or(0))
+    }
+
+    pub fn last_browser_window_opened(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self.db().query_row("SELECT value FROM meta WHERE key='last_browser_window_opened'", [], |r| r.get(0)).optional()?)
+    }
+
+    pub fn mark_browser_window_opened(&self, address: &str) -> Result<()> {
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('browser_window_generation','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [])?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('browser_retirement_pending','true') ON CONFLICT(key) DO UPDATE SET value='true'", [])?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('last_browser_window_opened',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [address])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_browser_retirement_pending(&self, pending: bool) -> Result<()> {
+        self.db().execute("INSERT INTO meta(key,value) VALUES('browser_retirement_pending',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [if pending { "true" } else { "false" }])?;
+        Ok(())
+    }
+
+    pub fn desktop_reset(&self) -> Result<serde_json::Value> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self.db().query_row("SELECT value FROM meta WHERE key='desktop_reset'", [], |r| r.get(0)).optional()?;
+        Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::Value::Null))
+    }
+
+    pub fn put_desktop_reset(&self, value: &serde_json::Value) -> Result<()> {
+        self.db().execute("INSERT INTO meta(key,value) VALUES('desktop_reset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value.to_string()])?;
+        Ok(())
+    }
     /// `task_ref` opened this window. A window already a task's stays that
     /// task's; an address now naming another process's window (Hyprland
     /// started again) is the new window's.
-    pub fn own_window(&self, task_ref: &str, address: &str, pid: i64, class: &str, title: &str) -> Result<()> {
+    pub fn own_window(&self, task_ref: &str, address: &str, pid: i64, class: &str, title: &str, process_start_ticks: Option<u64>, compositor_instance: &str) -> Result<()> {
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM task_windows WHERE address = ? AND pid != ?", params![address, pid])?;
+        tx.execute("DELETE FROM task_windows WHERE address = ? AND (pid != ? OR class != ? OR process_start_ticks IS NOT ? OR compositor_instance != ?)",
+            params![address, pid, class, process_start_ticks, compositor_instance])?;
         tx.execute(
-            "INSERT OR IGNORE INTO task_windows(address, task_ref, pid, class, title) VALUES (?, ?, ?, ?, ?)",
-            params![address, task_ref, pid, clip(class, MAX_TEXT_CHARS), clip(title, MAX_TEXT_CHARS)],
+            "INSERT OR IGNORE INTO task_windows(address, task_ref, pid, class, title, process_start_ticks, compositor_instance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![address, task_ref, pid, clip(class, MAX_TEXT_CHARS), clip(title, MAX_TEXT_CHARS), process_start_ticks, compositor_instance],
         )?;
         tx.execute("DELETE FROM task_windows WHERE id IN (SELECT id FROM task_windows ORDER BY id DESC LIMIT -1 OFFSET ?)", [MAX_TASK_WINDOWS])?;
         tx.commit()?;

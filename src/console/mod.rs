@@ -275,7 +275,7 @@ async fn dispatch(ctx: &Ctx) -> Handled {
     let command = ctx.head.command.as_str();
     match command {
         "login-settings" | "login-browser-status" | "login-on" | "login-not-now" | "login-off" | "login-rule" | "login-rows"
-        | "login-answer" | "login-share-with" | "login-sync" | "login-remove" | "login-probe" | "login-share" | "login-test-seed" => {
+        | "login-answer" | "login-assist" | "login-share-with" | "login-sync" | "login-remove" | "login-probe" | "login-share" | "login-test-seed" => {
             logins::command(ctx).await
         }
         "directory" => selected::directory(ctx),

@@ -8,7 +8,25 @@ An agent connects itself. You copy the prompt from Connect an Agent in the conso
 
 `ibara mcp` answers `initialize`, `ping` and `tools/list` itself. It contacts a computer only when the agent calls a tool for it.
 
-## How the tools are designed
+## Focused observations and action results
+
+`computer_observe` with `view: "elements"` and no surface follows the focused surface. A normal focused Chromium window returns its page controls; a native file chooser, editor or Save As dialog returns native controls. Explicit `surface: "tab"` asks for the page. Named-window `elements`/`situation` views inspect the native window; `image`/`screen` views also carry fresh page controls when the named window is the verified focused browser. A missing or unverified page reader is identified in the frame; use native elements or a fresh image instead. Browser controls include current bounded field values, visible selected-option labels, unchecked/required/invalid states and nearby record context. Consecutive controls in the same context share its displayed context; stored target identity is unchanged. Password and recognized credential fields (including verification-code autocomplete) hide values. Truncation is explicit. These observations describe the current page, not server persistence. A separately bounded `page text` excerpt includes simple visible static notices and table text from the active dialog or main surface. It contains the page’s wording as quoted data, never an instruction or verified business conclusion. Field values/editable content, hidden content and navigation are excluded; complex blocks may be omitted. Truncation is explicit; narrow an elements query or inspect an image for more. Controls keep their own budget. Native dialogs never include underlying page prose.
+
+Page references keep their element identity across filtered/full observations and never get reassigned to a different target. A changed record/name/context gets a new reference; only targets in the current observation can act. Default browser frames scope controls to an active modal dialog (`:modal` or declared `aria-modal=true`), explicitly count omitted background controls and offer an elements query to inspect the full page. A nonempty query retains broader inspection; native hit/focus guards still apply. Full-page target ambiguity is checked before default scoping. Ordinary nonmodal dialogs keep page coverage. Closing the modal restores the default dialog/main/navigation ranking. Other omitted controls are counted with query guidance. Closed HTML disclosures expose their collapsed opener, then their children after native expansion. Browser image observations include freshly read page controls; native dialogs keep their native surface. `computer_act` accepts page references for `click`, using exactly the guarded browser/native plan. Enabled text, search and numeric fields accept this native focus click; read-only fields remain unfillable, and disabled fields remain unavailable. A native popup covering a page target keeps its no-input refusal and directs the agent to inspect a fresh image, handle the visible obstruction and reobserve before retrying. Ibara never dismisses an unidentified overlay automatically.
+
+Both action tools return the same focused observation after a bounded desktop quiet check (100 ms quiet, at most 800 ms). Quiet means desktop focus/window activity settled, not network readiness or a saved transaction. Explicit `expect` remains the way to wait for a particular result. The action reply tells the agent when an expectation was unmet or an effect is uncertain; inspect saved state before another effect, and reuse the same request ID to recover its receipt. Successful input delivery is not proof that all task outcomes were saved. Verify requested results before finishing.
+
+## Managed work and disconnection
+
+The durable `task_ref` owns its workspace, managed processes and desktop reservation. Connections can be replaced without replacing the work. `computer_status({ref: task_ref})` exposes `details` with connection state, active jobs, resource ownership, workspace, policy and explicit budgets. `computer_status({ref: op_ref})` includes job state, bounded sanitized stdout/stderr, truncation and any runtime deadline; retained results remain readable after the task ends. Running output is a current snapshot, not a guarantee that every byte survives a daemon crash.
+
+Registered running jobs and unconfirmed descendants keep the computer occupied through client loss. The same authenticated agent can reconnect; a second live session cannot steal its task. Reconcile a lost response with the same request/operation identity, never a replacement launch. After the last job settles and disconnected-work grace expires, cleanup releases the computer. Three missed 30-second heartbeats detect a lost relay; this is not a job runtime limit. False heartbeats do not renew abandoned work indefinitely.
+
+Finish, cancel, human takeover and access revocation settle owned jobs and fence input. Human takeover currently cancels builds too: the machine is exclusively reserved, without an isolated concurrent build class. Daemon restart can interrupt work; uncertain effects stay unknown until reconciled. Arbitrary SSH jobs are unmanaged and do not gain a reservation by running beside an Ibara task.
+
+For shell-facing clients, `ibara work [--computer NAME] [--agent NAME] run --goal TEXT --request-id ID -- PROGRAM ARG...` uses the same managed transport. Preserve its printed request, task and receipt IDs. `exec --task TASK --request-id ID -- PROGRAM ARG...` adds work; `status REF` inspects it; `finish TASK` or `cancel TASK` settles it. Same-ID `run` inspects existing work without relaunching. Use the same stable agent name when mixing CLI and MCP. There is no implicit shell or interactive PTY attachment. Older targets without structured work details are unsupported for this workflow; do not fall back to untracked SSH execution.
+
+## Tool conventions
 
 - One task at a time per computer. `computer_begin` takes control of the computer for the agent, and `computer_finish` gives it back.
 - Every response says where things stand. Each one starts with a situation line, so an agent that reads one response on its own is still oriented.
@@ -73,7 +91,9 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 
 ### `computer_begin({computer?, goal, checks?, deliver?, logins?, request_id})`
 **Inputs:**
-- `computer` is a name, a host or a `cmp_` id. It is resolved once and echoed back as an id. It may be left out when only one computer is reachable. Every ibara command that names a computer takes the same names, so the collector takes them too: `ibara client --computer COMPUTER fetch ARTIFACT_REF NEW_LOCAL_PATH`, with COMPUTER as `computer_status` lists it (its name or `cmp_` id).
+- `computer` is an optional name, host or `cmp_` id. Omit it for ordinary work: the operator selects a ready permitted target, spreading independent requests across the fleet. A definite pre-acquisition BUSY, HUMAN_CONTROL or CONTROL_UNSETTLED refusal can try another target. Explicit names and `--computer` stay pinned. Verify the returned ID before effects.
+- The automatic route is durably bound to the stable client name, request ID and canonical arguments. Reconnects and client-version changes reuse it; changed arguments conflict. Unknown acquisition outcomes never move to another target. Distinct requests may hold independent tasks on separate machines; each task still has exactly one owner and must be finished promptly.
+- Every ibara command that names a computer accepts the same names, including `ibara client --computer COMPUTER fetch ARTIFACT_REF NEW_LOCAL_PATH`. Older clients may require an explicit target: inspect fleet status and use any eligible free machine for ordinary unstarted work.
 - `checks` is a list of `{id, description, check?}`. `check` is a typed check (see below), such as `{kind: "file_exists", path: "note.txt"}`.
 - `deliver` is an optional `{host, path}` obligation. `host` and `path` are checked as a send's `to` is (see `computer_files`), so a delivery no send could make is refused here, and the delivery is the one a later send to the same computer and path makes, under whichever of the computer's names.
   It is verified when the sent file is collected to exactly that path (after any change a person makes to it): by the agent's collector, or by a person saving it in the console. A copy saved anywhere else does not count.
@@ -104,6 +124,8 @@ While ibara itself holds the computer back, `computer_begin` returns `BUSY` with
 
 **Result:** `{frame: {frame_ref, revision, captured_at, covered, cost_bytes, lines[], choices[], next_richer}}`. Each `lines[]` entry is about 60 bytes. `choices[]` is at most 20: `{choice_id, label, action, param?}`, where `param` names a parameter the agent must supply (for example `text`). `next_richer` names the next, richer view available, and `next_cursor` continues a paged element list.
 
+`limit` accepts 1–100 controls. The compact default is a preview; omitted controls remain reachable through `next_cursor` using the same surface/query. Cursors bind the observation, backend, surface and query; stale or changed requests return `STALE_TARGET`. Native continuation pages the original bounded snapshot for up to 30 seconds rather than slicing a newly changed tree. Actions still validate fresh target state. Active modal controls and visible warnings with their recovery controls rank before ordinary main-page controls. Ranking never dismisses a warning or chooses its response for the agent.
+
 ### `computer_act({task_ref, request_id, choice?, text?, action?, expect?, effect?, steps?})`
 **One step:** a `choice` from the latest frame (with `text` when the choice takes text), or an explicit `action`, plus an optional `expect`. A typing or key choice sends only to the window it was offered for; if another window has the keyboard focus by then, the step is refused (`STALE_TARGET`, `execution_not_started: true`) and nothing is sent. An explicit `type` or `key` action goes to the window that has the focus when it runs, and typing stops between pieces if the focus moves.
 
@@ -120,7 +142,9 @@ While ibara itself holds the computer back, `computer_begin` returns `BUSY` with
 | `type` | `text`; sent in short pieces that are never cancelled |
 | `key` | `keys`, e.g. `"ctrl+s"` |
 | `scroll` | `target`, `dx`, `dy` |
-| `close` | `surface`, only surfaces this task opened |
+| `close` | `surface`; personal desktops: only surfaces this task opened; administered disposable desktops: any current window |
+
+**Native Unicode:** Focus an editable non-password field first. Ibara proves the focused field, pastes once using native input, checks the changed text, and restores the clipboard. An incomplete read or missing focus refuses insertion. `ACTION_UNCONFIRMED` means input may have occurred: inspect the field before another action. Saving and reopening the result is still the workflow’s responsibility.
 
 **Points:** `x` and `y` are pixels of a picture from `computer_observe` with `view: "image"` or `"screen"`, not screen coordinates. `frame` names the frame that returned the picture; without it, the task's latest picture is used, however many frames came after it (an elements observe, the frame every `computer_act` returns). ibara keeps the latest picture of each window, maps the point to the screen through it, and the step's `effect` names the screen point it clicked and the picture it came from. The step is refused with `STALE_TARGET` and `execution_not_started: true`, and nothing is sent, when the task has not taken a picture yet, when `frame` names a picture ibara no longer keeps, or when the pictured window has moved, changed size or closed since. Then observe with `view: "image"` again and read the point from the new picture. A point outside the picture is refused as `INVALID_ARGUMENT`.
 
@@ -156,10 +180,16 @@ A held step stays held while its approval is open: the same step under a new `re
 - A step that needs approval returns `status: "pending"` with an `att_` reference and a `next`, and does not run. See [Held for approval](#held-for-approval).
 
 ### `browser_act({task_ref, request_id, action, expect?, effect?})`
+
+Automatic situation, elements, window-image and full-screen observations all retain fresh controls for the focused browser. Named browser images also retain fresh page controls. Native dialogs and explicit native elements/situation inspection keep their own controls. Native date/time inputs expose their normalized current value and a click target; click, use `computer_act` with `type` for text in the displayed format or `key` for a single key/chord, then observe the value. Their rendered segment order depends on browser locale, so the ordinary text-fill route is not advertised. Native select clicks open the picker; exact `select` reuses it only when the reader verifies the same open picker and page focus. Every selection key rechecks focus/list identity, and completion verifies the exact option.
+
+A visible enabled `file_input` takes `click`: it opens the real native chooser. Continue with native controls, then verify the page accepted the exact file. Selected file names/counts are observations, not proof of upload. `select` resolves one enabled native option by unique value or exact label, then uses native Home/End, arrow keys and Return, verifying the same option and unchanged list. Unicode labels require no typing or clipboard use. Ambiguous/disabled options and readers lacking exact-option metadata are refused before input. A list that changes or loses focus after the click stops further keys and reports an uncertain outcome; inspect its receipt before any retry.
 A semantic action in the signed-in Chrome, through the extension. `action` is one of `navigate` (`url`), `click` (`target`), `type` (`target?`, `text`), `select` (`target`, `value`), `scroll` (`target?`, `dx?`, `dy?`), `key` (`keys`), `wait_for` (`target?`, `text?`, `within_ms?`) or `sign_in` (`sites?`, see [Logins](#logins)), with `kind` naming it. `target` is a page element id such as `b3`, from observing `surface: "tab"` with `view: "elements"`. `expect` works as in `computer_act`.
 
 ### `computer_exec({task_ref, request_id, command[], cwd?, timeout_ms?, background?, effect?})`
 Runs a command, bounded, in the task's workspace or in `cwd`. `cwd` takes a path as `computer_files` does. Its effect class is `change` unless declared otherwise with `effect: "send" | "spend" | "destructive"`. A command held for approval replies as in [Held for approval](#held-for-approval) and stays held: the same command and `cwd` under a new `request_id` is refused while its approval is open, and asks again once it was answered, as for `computer_act`.
+
+Arguments are passed directly with no implicit shell. `background: true` returns an operation reference while the supervised job runs. `timeout_ms` is an explicit runtime deadline, separate from response waiting and connection liveness. No default build deadline, action quota or image quota is imposed; explicit host/task limits remain enforced and disclosed. Commands, their descendants and output stay bound to the task. Inspect the operation to read live output and completion; exit 0 does not independently prove GUI behavior or saved business results.
 
 ### `computer_wait({task_ref, for, deadline_ms})`
 **`for`:** `{op}`, `{attention}` or `{expect}` (any expectation above). `deadline_ms` is at most 600000 (10 minutes).
@@ -202,6 +232,12 @@ A person can also answer **Always Allow**: the step is approved, and from then o
 A computer whose access rules make an agent ask before it begins, observes or reads files replies the same way. A `computer_begin` has no task to wait on yet, so its `next` says to send the same `computer_begin` request again after a few seconds until it is no longer pending.
 
 ### Logins
+
+**Login assistance v1 (private candidate, October 2026):** The attention item's `details.assistance.version` advertises meaningful response support. `deferred`, `no_account`, `without_account`, `person_sign_in`, `verify_session`, setup and reconciliation states are distinct from `declined`/`denied`. Each site has `next`, the person's response and timestamp, method and reported account availability. Status/wait exposes changes. New non-secret answers require target administration but no configured cookie source. Old peers must report unsupported actions, never reinterpret them.
+
+Deferred intent survives partial finish, disconnection and daemon restart; completed/cancelled task approvals do not resume. A continuing agent acquires the same computer and uses `computer_checkpoint` with `login:{attention,action:"continue"}`. No worker is launched by a late answer. Share once requires the displayed revision and does not write Allow; Remember for this computer is explicit. Google/Gmail export and import are blocked even with old Allow rules. Verify identity and task access independently of the disappearance of a sign-in form.
+
+`computer_checkpoint` also accepts `login` actions `propose_signup`, `claim_signup`, `record_created`, `resolve`, `recover_signup`, `record_not_created`. Proposals have `{site,identity,credential_store,cost:"free",summary}`. A fresh decision needs the exact displayed proposal approved before claiming; exact pre-existing task authority should use its normal workflow without asking again. `claim_signup` is one attempt, not a credential provider or registration engine. Keep credentials in an approved provider. `resolve` and `record_not_created` require a non-secret `evidence_ref`; the latter needs affirmative no-effect proof. Recovery uses a retained `claim_ref` and cannot grant a second submission. Claims are deduplicated on this computer by site/identity; never move an uncertain signup to another target. The original authority, correct-account and human-control checks still apply.
 An agent never sees or types a person's password. It says which sites it needs, and the person approves on the computer their logins come from (the sharing computer, usually their own); ibara then copies just those sites' logins (their cookies) fresh from the person's browser into this computer's browser. A site is a registrable domain, such as `irs.gov` or `id.me`.
 
 - **At begin:** `computer_begin({…, logins: [site, …]})` never waits. Its `logins` gives each site's `state`:
@@ -243,12 +279,12 @@ An agent never sees or types a person's password. It says which sites it needs, 
 
 **What it does:**
 - Evaluates every automatic check against current state.
-- Closes windows and tabs the task opened and still owns. It leaves anything a person touched (focused or retitled while no agent step ran), and anything with unsaved changes. A window counts as closed only once it has gone; one that ignores the request is listed in `left`.
+- On personal desktops, closes windows and tabs the task opened and still owns, leaving touched or apparently unsaved work. On an explicitly administered disposable desktop (`disposable_desktop`, default off), shared lease settlement politely closes **all** application windows, including old/untracked/hidden windows, and verifies zero before ready. Ownership is not a retention exception. Files and profile storage are not deleted. Save outputs before finish. A window counts as closed only once it has gone; refusal or a save prompt leaves the computer unavailable with a visible cleanup failure. There is no forced termination.
 - Releases control.
 - **After control ended** (a person took the computer, control expired, or ibara restarted), the task can still be finished. The outcome, summary and assessments are recorded, and control is not taken back. Checks that read the screen keep their last state. Windows are closed only when nobody has the computer; while a person or another task has it, every window is listed in `left` with the reason.
 - Apps a task launched run as the desktop's own apps, not inside ibara, so they and their unsaved work outlive a restart of ibara. Their windows stay the task's across the restart, so finishing closes them, or leaves them, by the same rules.
 
-**Result:** `{checks, delivery, cleanup: {closed[], left[]}, complete: bool, notes?}`. `complete` is true only with no unknown outcomes, every required check met, and every delivery verified.
+**Result:** `{checks, delivery, cleanup: {closed[], left[]}, complete: bool, notes?}`. Read cleanup and notes. `complete` also requires settled control: a failed disposable reset cannot report completion or readiness.
 
 ### `computer_procedures({op: "search" | "read", query?, ref?})`
 Reads approved procedures, which are deferred to later work. Until one exists, it returns the app notes that match.
@@ -286,3 +322,14 @@ A `url`, `element` or `text_present` check is `unknown` when ibara cannot read w
 ## Access-aware status
 
 Status includes `access`: the named caller, effective capabilities, effect rules (`effects`, what its steps follow; `own_effects`, the ones its own grant sets) and pairing state. Deny wins over ask over allow across agent/computer grants, and an agent's own grants count only while its computer's do. Send, spend and delete steps no rule covers follow this computer's Ask before agents send, spend or delete for agents from the owner's own computers, and ask for any other computer's agents (see [security and access](security-and-access.md#turning-approvals-off)). Ask returns a pending attention reference; a person with administer answers it, then the caller retries the exact request. Approvals expire across authority changes and never authorize a later step. See [security and access](security-and-access.md).
+
+## Administered disposable desktops
+
+This mode is opt-in per computer, never inferred from pairing. Entry, finish, expiry, revocation, daemon recovery and late idle windows use the same serialized settlement. Existing active leases and person-control fences remain authoritative. A personal computer keeps its existing conservative cleanup policy.
+
+Transport heartbeat is connection liveness, not task activity in this mode. Valid task-bound observations/actions/files/commands/checkpoints and explicit waits renew the existing five-minute work deadline. Bounded commands and waits reserve their bounded duration plus settlement margin; a bridge ping alone cannot keep abandoned windows. Use `computer_wait` for an approval or bounded operation, and finish promptly.
+
+Window observations expose dimensions and workspace so small tiles are apparent. Close choices are available for all current windows in disposable mode. If reset cannot verify zero, use the indicated person recovery; do not work around it through a second input channel or kill an app. Preserving a profile directory is not proof that session-only cookies survive browser shutdown; deployment qualification must measure authentication continuity.
+
+
+Disposable Chromium reset retires tabs with native keyboard input before graceful window close. Its reader supplies only lifecycle IDs/focus/blank status; unavailable inventory or native input refusal blocks readiness. Designated provisioning requires supported RestoreOnStartup=1 so session-only cookies persist; previous task tabs are retired rather than restored.

@@ -372,6 +372,7 @@ pub fn wait_ready(child: &mut Child, marker: &str) -> mpsc::Receiver<String> {
 /// key where the fake sshd looks for it.
 pub struct Target {
     pub child: Child,
+    restart_command: Command,
     pub root: PathBuf,
     pub projections: PathBuf,
 }
@@ -499,9 +500,20 @@ impl Target {
         writeln!(routes, "{} {}", n.ip, root.display()).unwrap();
         Target {
             child,
+            restart_command: command,
             root,
             projections,
         }
+    }
+
+    /// Restart the actual daemon over the same journal/identity, without fixture
+    /// reinitialization. Used to prove durable intent across process loss.
+    pub fn restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child=self.restart_command.spawn().unwrap();
+        let lines=wait_ready(&mut self.child,"\"pairing_listening\"");
+        std::thread::spawn(move || for _ in lines.iter() {});
     }
 
     /// The root power helper as systemd runs it (`Accept=yes`): each

@@ -169,6 +169,11 @@ pub(crate) struct BrowserNode {
     pub states: Vec<String>,
     /// Its containers on the page, as the page reader names them.
     pub context: String,
+    /// Bounded, non-password state from this observation (not target identity).
+    pub value: Option<String>,
+    pub files: Vec<String>,
+    pub file_count: usize,
+    pub selected_label: Option<String>,
     /// The address of the page it is on.
     pub page: String,
     pub tab_id: i64,
@@ -190,9 +195,20 @@ pub(crate) struct FrameState {
     pub input_for: Vec<(String, WinKey)>,
     pub elements: Vec<Element>,
     pub browser: Vec<BrowserNode>,
+    continuation: Option<Continuation>,
     /// The latest picture of each surface this task took (newest last):
     /// point coordinates are a picture's pixels, whatever frame came after.
     pub pictures: Vec<Picture>,
+}
+
+#[derive(Debug, Clone)]
+struct Continuation {
+    token: String,
+    query: Option<String>,
+    surface: Option<WinKey>,
+    offset: u32,
+    // Reader capture and tab; None means native accessibility pagination.
+    browser: Option<(String, i64)>,
 }
 
 /// A picture a frame returned, with what is needed to map its pixels to
@@ -230,6 +246,8 @@ impl FrameState {
 #[derive(Debug, Default)]
 pub(crate) struct Frames {
     map: HashMap<String, Rc<FrameState>>,
+    browser_ids: HashMap<String, HashMap<(String, String), String>>,
+    next_browser_id: u64,
 }
 
 impl Frames {
@@ -241,15 +259,31 @@ impl Frames {
             let oldest = self.map.iter().min_by_key(|(_, f)| f.frame.revision).map(|(k, _)| k.clone());
             if let Some(k) = oldest {
                 self.map.remove(&k);
+                self.browser_ids.remove(&k);
             }
         }
         self.map.insert(frame.task_ref.clone(), frame);
     }
     pub fn forget(&mut self, task_ref: &str) {
         self.map.remove(task_ref);
+        self.browser_ids.remove(task_ref);
     }
     pub fn clear(&mut self) {
         self.map.clear();
+        self.browser_ids.clear();
+    }
+    /// Stable for the same reader-bound element, never recycled for another
+    /// element when a query, screenshot or page replaces the current frame.
+    fn browser_id(&mut self, task: &str, document: &str, identity: &str) -> String {
+        let ids = self.browser_ids.entry(task.to_string()).or_default();
+        let key = (document.to_string(), identity.to_string());
+        if let Some(id) = ids.get(&key) { return id.clone(); }
+        // Bound a long task's cache. Retiring entries never recycles numbers.
+        if ids.len() >= 4096 { ids.clear(); }
+        self.next_browser_id += 1;
+        let id = format!("b{}", self.next_browser_id);
+        ids.insert(key, id.clone());
+        id
     }
 }
 
@@ -341,6 +375,7 @@ pub(crate) fn element_line(e: &Element) -> String {
 
 fn window_line(id: &str, w: &Win) -> String {
     let mut line = format!("{id} {} \"{}\"", w.class, squash(&w.title, 60));
+    line.push_str(&format!(" {}x{} workspace {}", w.rect.width, w.rect.height, w.workspace));
     if w.focused {
         line.push_str(" focused");
     }
@@ -381,6 +416,7 @@ pub(crate) fn choices_for(
     shortcuts: &[(String, String)],
     goal: &str,
     owned: &[TaskWindow],
+    disposable: bool,
 ) -> (Vec<Choice>, Vec<(String, WinKey)>) {
     let mut ranked: Vec<(u8, String, Action, Option<String>, Option<WinKey>)> = Vec::new();
     let focused = windows.iter().find(|(_, w)| w.focused);
@@ -431,8 +467,8 @@ pub(crate) fn choices_for(
         ranked.push((6, format!("focus {id} {} \"{}\"", w.class, squash(&w.title, 40)), Action::Focus(SurfaceAction { surface: id.clone() }), None, None));
     }
     for (id, w) in windows {
-        if owned.iter().any(|o| o.address == w.address) {
-            ranked.push((7, format!("close {id} {} (this task opened it)", w.class), Action::Close(SurfaceAction { surface: id.clone() }), None, None));
+        if disposable || owned.iter().any(|o| o.address == w.address) {
+            ranked.push((if disposable { 2 } else { 7 }, format!("close {id} {} ({})", w.class, if disposable { "disposable desktop" } else { "this task opened it" }), Action::Close(SurfaceAction { surface: id.clone() }), None, None));
         }
     }
     ranked.sort_by_key(|(rank, ..)| *rank);
@@ -473,6 +509,13 @@ impl Controller {
         events.last_desktop_ms = now;
         let text = match event {
             DesktopEvent::WindowOpened { address, class, title, .. } => {
+                if (self.disposable_desktop)() && super::windows::is_browser(&class) {
+                    self.record_window(self.journal.mark_browser_window_opened(&address));
+                }
+                if (self.disposable_desktop)() && self.journal.get_active_lease().ok().flatten().is_none() {
+                    self.record_window(self.journal.put_desktop_reset(&serde_json::json!({"state":"resetting","reason":"a window opened while idle","at":self.now_iso()})));
+                    self.record_window(self.journal.set_control(crate::store::ControlPatch { unsettled:Some(true), ..Default::default() }).map(|_| ()));
+                }
                 events.remember_title(&address, &class, &title);
                 format!("window \"{}\" opened ({class})", squash(&title, 48))
             }
@@ -620,28 +663,54 @@ impl Controller {
             }
             _ => ordered.iter().find(|w| w.focused).cloned(),
         };
-        let wants_elements = matches!(spec.view, View::Situation | View::Elements) && !spec.surface.as_deref().is_some_and(is_browser_surface);
+        let tabs = if self.desktop.browser_connected() { self.desktop.tabs().await.unwrap_or_default() } else { Vec::new() };
+        let explicit_page = spec.surface.as_deref().is_some_and(is_browser_surface) && spec.view == View::Elements;
+        // Automatic semantics follow the focused surface. A Chromium-owned
+        // file dialog is still native: require a normal window matching the
+        // focused tab before asking the page reader. A named browser picture
+        // carries the same fresh page controls; named native inspection stays native.
+        let follows_page = spec.surface.is_none()
+            || spec.surface.as_deref().is_some_and(is_browser_surface)
+            || matches!(spec.view, View::Image | View::Screen);
+        let automatic_browser = follows_page && matches!(spec.view, View::Situation | View::Elements | View::Image | View::Screen) && target.as_ref().is_some_and(|w| {
+            w.focused && !w.floating && super::agent::is_browser(&w.class)
+        });
+        let automatic_page = automatic_browser && target.as_ref().is_some_and(|w| {
+            tabs.iter().any(|t| t.focused && !t.title.is_empty() && w.title.contains(&t.title))
+        });
+        let mut wants_elements = matches!(spec.view, View::Situation | View::Elements) && !explicit_page;
         let limit = match spec.view {
-            View::Elements => spec.limit.unwrap_or(40).min(60),
-            _ => spec.limit.unwrap_or(SITUATION_ELEMENTS).min(60),
+            View::Elements | View::Image | View::Screen => spec.limit.unwrap_or(40).min(100),
+            _ => spec.limit.unwrap_or(SITUATION_ELEMENTS).min(100),
         };
-        let cursor = spec.cursor.as_deref().and_then(|c| c.parse::<u32>().ok());
-        if spec.cursor.is_some() && cursor.is_none() {
-            return Err(crate::error::invalid("cursor: pass back the next_cursor of the previous frame"));
-        }
+        let continuation = match spec.cursor.as_deref() {
+            None => None,
+            Some(token) => Some(previous.as_ref().filter(|p|p.generation==lease.generation)
+                .and_then(|p|p.continuation.clone())
+                .filter(|c|c.token==token && c.query==spec.query && c.surface==target.as_ref().map(Win::key)
+                    && c.browser.is_some()==(explicit_page || automatic_page))
+                .ok_or_else(||IbaraError::new("STALE_TARGET","Observation cursor is stale or belongs to a different query/surface; observe without cursor.",true))?),
+        };
+        let cursor = continuation.as_ref().filter(|c|c.browser.is_none()).map(|c|c.offset);
+        let mut page_note = (automatic_browser && !automatic_page).then(||
+            "page controls unavailable (focused tab not verified); showing the native surface; use a fresh image if needed".to_string());
+        let (browser, browser_total, browser_context, modal_background, browser_next) = if explicit_page || automatic_page {
+            match self.observe_browser(&task.task_ref, &tabs, spec.query.as_deref(), limit, continuation.as_ref()).await {
+                Ok(nodes) => { wants_elements = false; nodes }
+                Err(e) if spec.cursor.is_none() && automatic_page && !matches!(e.code, "SESSION_UNAVAILABLE" | "HUMAN_CONTROL") => {
+                    page_note = Some(format!("page controls unavailable ({}); showing the native surface; use a fresh image if needed", e.code));
+                    (Vec::new(), 0, None, None, None)
+                }
+                Err(e) => return Err(e),
+            }
+        } else { (Vec::new(), 0, None, None, None) };
         let page: ElementPage = match (&target, wants_elements) {
             (Some(win), true) => match self.desktop.elements(&win.key(), spec.query.as_deref(), limit, cursor).await {
                 Ok(page) => page,
-                Err(e) if e.code == "SESSION_UNAVAILABLE" || e.code == "HUMAN_CONTROL" => return Err(e),
+                Err(e) if spec.cursor.is_some() || e.code == "SESSION_UNAVAILABLE" || e.code == "HUMAN_CONTROL" => return Err(e),
                 Err(_) => ElementPage::default(),
             },
             _ => ElementPage::default(),
-        };
-        let tabs = if self.desktop.browser_connected() { self.desktop.tabs().await.unwrap_or_default() } else { Vec::new() };
-        let browser = if spec.surface.as_deref().is_some_and(is_browser_surface) && spec.view == View::Elements {
-            self.observe_browser(&tabs, spec.query.as_deref(), limit).await?
-        } else {
-            Vec::new()
         };
         let focused_app = target.as_ref().map(|w| w.class.to_lowercase()).unwrap_or_default();
         let notes = if focused_app.is_empty() { Vec::new() } else { self.journal.list_app_notes(&focused_app, None, None, 12).unwrap_or_default() };
@@ -658,6 +727,9 @@ impl Controller {
         };
 
         let mut lines: Vec<String> = Vec::new();
+        if continuation.is_some() {
+            lines.push("continued observation snapshot; omit cursor to refresh current state".into());
+        }
         let windows_shown = if spec.view == View::Elements { 3 } else { SITUATION_WINDOWS };
         for (id, w) in listed.iter().take(windows_shown) {
             lines.push(window_line(id, w));
@@ -680,9 +752,41 @@ impl Controller {
         for (i, tab) in tabs.iter().take(5).enumerate() {
             lines.push(format!("t{} tab \"{}\" {}{}", i + 1, squash(&tab.title, 48), host_path(&tab.url), if tab.focused { " focused" } else { "" }));
         }
+        let mut last_context = "";
         for node in &browser {
-            lines.push(format!("{} {} \"{}\"", node.id, node.role, squash(&node.name, 60)));
+            let mut line = format!("{} {} \"{}\"", node.id, node.role, squash(&node.name, 160));
+            for state in ["disabled", "readonly", "checked", "unchecked", "selected", "expanded", "collapsed", "invalid", "required", "value_hidden"] {
+                if node.states.iter().any(|s| s == state) { line.push(' '); line.push_str(state); }
+            }
+            if !node.actions.is_empty() && node.states.iter().any(|s| s == "enabled") { line.push_str(" enabled"); }
+            if let Some(value) = &node.value { line.push_str(&format!(" = {}", serde_json::to_string(value).unwrap_or_default())); }
+            if let Some(label) = &node.selected_label { line.push_str(&format!(" · selected {}", serde_json::to_string(label).unwrap_or_default())); }
+            if node.role == "file_input" {
+                if node.actions.iter().any(|a| a == "click") { line.push_str(" · click opens native file chooser"); }
+                if !node.files.is_empty() { line.push_str(&format!(" · selected files: {} (not proof of upload)", node.files.join(", "))); }
+                if node.file_count > node.files.len() { line.push_str(&format!(" · {} more selected files not shown", node.file_count - node.files.len())); }
+            }
+            if matches!(node.role.as_str(), "date_input" | "datetime-local_input" | "month_input" | "time_input" | "week_input") {
+                line.push_str(" · native picker: click; computer_act type enters text in the displayed format, key sends one key/chord; observe value");
+            }
+            if !node.context.is_empty() && node.context != last_context { line.push_str(&format!(" · {}", squash(&node.context, 140))); }
+            last_context = &node.context;
+            lines.push(line);
         }
+        if let Some((text, truncated)) = browser_context {
+            lines.push(format!("page text{}: {}", if truncated { " (excerpt truncated; query or view image for more)" } else { "" }, serde_json::to_string(&text).unwrap_or_default()));
+        }
+        if browser_total > browser.len() {
+            let start=continuation.as_ref().map_or(0,|c|c.offset as usize);
+            lines.push(format!("page controls: {}–{} of {browser_total}; {}",start+1,start+browser.len(),
+                if browser_next.is_some() {"continue with next_cursor and the same query/surface, or start a new elements query"}
+                else if start+browser.len()<browser_total {"reader supplied no continuation; narrow the elements query or view an image"}
+                else {"end of snapshot; start a new elements query or omit cursor to refresh"}));
+        }
+        if let Some(omitted) = modal_background {
+            lines.push(format!("page controls: modal scope; {omitted} background controls omitted; use an elements query to inspect the full page"));
+        }
+        if let Some(note) = page_note { lines.push(note); }
         let signature = listed.iter().find(|(_, w)| w.focused).map(|(_, w)| surface_signature(w, &page.elements));
         if wants_elements && let Some(win) = &target {
             let signature = surface_signature(win, &page.elements);
@@ -710,19 +814,25 @@ impl Controller {
         }
         shortcuts.truncate(3);
         let owned = self.journal.task_windows(&task.task_ref)?;
-        let (choices, input_for) = choices_for(&listed, target.as_ref(), if wants_elements { &page.elements } else { &[] }, &shortcuts, &task.goal, &owned);
+        let (choices, input_for) = choices_for(&listed, target.as_ref(), if wants_elements { &page.elements } else { &[] }, &shortcuts, &task.goal, &owned, (self.disposable_desktop)());
 
         let revision = self.next_revision();
         let frame_ref = id("frame");
+        let continuation = browser_next.map(|(capture,tab,offset)|Continuation {
+            token:format!("page_{revision}_{offset}"), query:spec.query.clone(),surface:target.as_ref().map(Win::key),offset,browser:Some((capture,tab)),
+        }).or_else(||page.next_cursor.map(|offset|Continuation {
+            token:format!("page_{revision}_{offset}"), query:spec.query.clone(),surface:target.as_ref().map(Win::key),offset,browser:None,
+        }));
         let captured_at = self.now_iso();
         let covered = match spec.view {
             View::Situation | View::Elements => format!(
-                "{} of {} windows; {} elements{}{}",
+                "{} of {} windows; {} native elements{}{}; {} page controls",
                 spec.view.as_str(),
                 listed.len(),
                 page.elements.len(),
                 target_id.as_deref().map(|t| format!(" in {t}")).unwrap_or_default(),
-                page.total.map(|t| format!(" of {t}")).unwrap_or_default()
+                page.total.map(|t| format!(" of {t}")).unwrap_or_default(),
+                browser.len()
             ),
             View::Image => format!("image of {}", target_id.as_deref().unwrap_or("the screen")),
             View::Screen => "full screen image".to_string(),
@@ -743,7 +853,7 @@ impl Controller {
             lines,
             choices,
             next_richer,
-            next_cursor: page.next_cursor.map(|c| c.to_string()),
+            next_cursor: continuation.as_ref().map(|c|c.token.clone()),
         };
         // Pictures of this lease carry over; a new one replaces its surface's.
         let mut pictures = previous.as_deref().filter(|p| p.generation == lease.generation).map(|p| p.pictures.clone()).unwrap_or_default();
@@ -770,6 +880,7 @@ impl Controller {
             input_for,
             elements: page.elements,
             browser,
+            continuation,
             pictures,
         });
         let record = json!({
@@ -792,14 +903,19 @@ impl Controller {
     }
 
     /// Page elements of the focused Chrome tab through the extension.
-    async fn observe_browser(&self, tabs: &[Tab], query: Option<&str>, limit: u32) -> Result<Vec<BrowserNode>> {
+    async fn observe_browser(&self, task_ref: &str, tabs: &[Tab], query: Option<&str>, limit: u32, continuation: Option<&Continuation>) -> Result<(Vec<BrowserNode>, usize, Option<(String, bool)>, Option<u64>, Option<(String,i64,u32)>)> {
         let Some(tab) = tabs.iter().find(|t| t.focused).or(tabs.first()) else {
             return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "No Chrome tab is available through the extension.", true)
                 .with("next", "Use computer_act on the browser window, or view \"image\"."));
         };
+        let mut args=json!({ "tabId": tab.id, "query": query.unwrap_or(""), "view": "elements", "limit": limit, "maxChars": 12000 });
+        if let Some(c)=continuation && let Some((capture,tab_id))=&c.browser {
+            if *tab_id!=tab.id {return Err(IbaraError::new("STALE_TARGET","The tab changed; observe without cursor.",true));}
+            args["capture"]=json!(capture);args["offset"]=json!(c.offset);
+        }
         let data = self
             .desktop
-            .browser_call("observe", json!({ "tabId": tab.id, "query": query.unwrap_or(""), "view": "elements", "limit": limit, "maxChars": 12000 }), false)
+            .browser_call("observe", args, false)
             .await?;
         if data.get("refused").and_then(Value::as_bool) == Some(true) {
             return Err(IbaraError::new("STALE_TARGET", "The Chrome tab is no longer visible or focused.", true));
@@ -812,24 +928,41 @@ impl Controller {
         let strings = |v: Option<&Value>| -> Vec<String> {
             v.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).take(12).collect()).unwrap_or_default()
         };
-        Ok(nodes
+        let total = data.get("count").and_then(Value::as_u64).unwrap_or(nodes.len() as u64) as usize;
+        let nodes = nodes
             .iter()
             .take(limit as usize)
             .enumerate()
             .map(|(i, node)| BrowserNode {
-                id: format!("b{}", i + 1),
+                id: self.frames.borrow_mut().browser_id(task_ref, document_id,
+                    &node.get("elementId").and_then(Value::as_str).map(str::to_string)
+                        .unwrap_or_else(|| format!("{capture}:{}:{i}", node.get("token").unwrap_or(&Value::Null)))),
                 role: clip(node.get("role").and_then(Value::as_str).unwrap_or("node"), 80),
                 name: clip(node.get("name").and_then(Value::as_str).unwrap_or(""), 400),
                 actions: strings(node.get("actions")),
                 states: strings(node.get("states")),
                 context: clip(node.get("ancestor").and_then(Value::as_str).unwrap_or(""), 500),
+                value: if node.get("states").and_then(Value::as_array).is_some_and(|states| states.iter().any(|s| matches!(s.as_str(), Some("password" | "value_hidden")))) || node.get("role").and_then(Value::as_str) == Some("password") {
+                    None
+                } else { node.get("value").and_then(Value::as_str).map(|s| format!("{}{}", clip(s, 240), if node.get("value_truncated").and_then(Value::as_bool) == Some(true) { "… [truncated]" } else { "" })) },
+                files: node.get("files").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).take(8).map(|s| clip(s, 180)).collect()).unwrap_or_default(),
+                file_count: node.get("file_count").and_then(Value::as_u64).unwrap_or(0) as usize,
+                selected_label: node.get("selected_label").and_then(Value::as_str).map(|s| clip(s, 260)),
                 page: clip(data.get("url").and_then(Value::as_str).unwrap_or(""), 4096),
                 tab_id: tab.id,
                 document_id: document_id.to_string(),
                 capture: capture.to_string(),
                 token: node.get("token").cloned().unwrap_or(Value::Null),
             })
-            .collect())
+            .collect();
+        let context = data.get("contextText").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(|text| {
+            (text.chars().take(800).collect(), text.chars().count() > 800 || data.get("contextTruncated").and_then(Value::as_bool) == Some(true))
+        });
+        let modal_background = (data.get("modalScope").and_then(Value::as_bool) == Some(true))
+            .then(|| data.get("omittedBackground").and_then(Value::as_u64).unwrap_or(0));
+        let next=data.get("next_offset").and_then(Value::as_u64).filter(|n|*n<total as u64 && *n>continuation.map_or(0,|c|c.offset as u64))
+            .and_then(|n|u32::try_from(n).ok()).map(|offset|(capture.to_string(),tab.id,offset));
+        Ok((nodes, total, context, modal_background,next))
     }
 
     /// Operations of a task whose outcome is unknown and not reconciled.
@@ -864,6 +997,7 @@ fn empty_frame(task: &TaskRecord, lease: &LeaseRecord) -> FrameState {
         input_for: Vec::new(),
         elements: Vec::new(),
         browser: Vec::new(),
+        continuation: None,
         pictures: Vec::new(),
     }
 }

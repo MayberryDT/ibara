@@ -23,6 +23,7 @@ pub mod mcp_route;
 pub mod onboarding;
 pub mod sessions;
 pub mod transport;
+pub mod work;
 
 use crate::error::{IbaraError, is_known_code};
 use serde_json::Value;
@@ -37,6 +38,7 @@ pub fn run_cli(sub: &str, args: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect();
     match sub {
         "client" => client::main(args),
+        "work" => work::main(args),
         "operator" => sessions::main(args),
         "control" => control::main(args),
         "mcp" => mcp_route::main(args),

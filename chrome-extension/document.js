@@ -43,14 +43,24 @@ export async function documentOperation(message) {
       return !button.matches(':disabled') && posts(el.form, button);
     return TYPING.includes(el.type) && posts(el.form, null) && fields.filter(f => f instanceof HTMLInputElement && TYPING.includes(f.type)).length === 1;
   };
+  const visible = (el) => {
+      if (el.closest('[hidden],[aria-hidden="true"],[inert]'))
+          return false;
+      // Closed disclosures can retain descendant layout boxes. Only their
+      // first summary is available until the person/agent opens them.
+      for (let p = el.parentElement; p; p = p.parentElement) {
+          if (p.tagName === 'DETAILS' && !p.open) {
+              const summary = p.querySelector(':scope > summary');
+              if (!summary || !(summary === el || summary.contains(el))) return false;
+          }
+      }
+      if (el.checkVisibility && !el.checkVisibility({visibilityProperty:true})) return false;
+      const style = getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && el.getClientRects().length > 0;
+  };
   const collect = function collectAccessibleNodesInDocument(query, onNode) {
     const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const visible = (el) => {
-        if (el.closest('[hidden],[aria-hidden="true"],[inert]'))
-            return false;
-        const style = getComputedStyle(el);
-        return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && el.getClientRects().length > 0;
-    };
+
     // An element's text, and its card text below, once per read: every
     // element inside asks again, and a long page (a Wikipedia article, a
     // repository page) otherwise clones its whole body for each link.
@@ -60,6 +70,10 @@ export async function documentOperation(message) {
         if (text === undefined) {
             const clone = el.cloneNode(true);
             clone.querySelectorAll('input,textarea,select,script,style,[hidden],[aria-hidden="true"]').forEach(n => n.remove());
+            for (const details of clone.querySelectorAll('details:not([open])')) {
+                const summary = details.querySelector(':scope > summary');
+                for (const child of [...details.childNodes]) if (child !== summary) child.remove();
+            }
             text = normalize(clone.textContent);
             contents.set(el, text);
         }
@@ -111,6 +125,7 @@ export async function documentOperation(message) {
             return explicit;
         switch (el.tagName) {
             case 'BUTTON': return 'button';
+            case 'SUMMARY': return el.parentElement?.tagName === 'DETAILS' ? 'button' : '';
             case 'A': return el.hasAttribute('href') ? 'link' : '';
             case 'TEXTAREA': return 'textbox';
             case 'SELECT': return el.multiple || el.size > 1 ? 'listbox' : 'combobox';
@@ -136,10 +151,12 @@ export async function documentOperation(message) {
                     return 'spinbutton';
                 if (type === 'search')
                     return 'searchbox';
-                // File inputs use a dedicated exact-label recipe, not getByRole.
+                // Clicking a visible file input opens its native chooser.
                 if (type === 'file')
-                    return name(el) ? 'file_input' : '';
-                if (['password', 'hidden', 'color', 'date', 'datetime-local', 'month', 'time', 'week'].includes(type))
+                    return 'file_input';
+                if (['date', 'datetime-local', 'month', 'time', 'week'].includes(type))
+                    return type + '_input';
+                if (['password', 'hidden', 'color'].includes(type))
                     return '';
                 return 'textbox';
             }
@@ -155,16 +172,14 @@ export async function documentOperation(message) {
         if (text !== undefined)
             return text;
         text = content(p);
-        if (text.length > 400)
-            text = '';
-        else {
+        {
             const headings = p.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]');
             const controls = Array.from(p.querySelectorAll('a[href],button,[role="link"],[role="button"]'));
             // Many cards identify records with plain text, not a heading. Require
             // a small action group and independent text beyond its control labels.
             const remaining = controls.reduce((s, control) => s.replace(content(control), ''), text).trim();
             const plainCard = controls.length > 0 && controls.length <= 4 && remaining.length >= 3;
-            if (!((headings.length === 1 && visible(headings[0])) || plainCard))
+            if (!(plainCard || (text.length <= 400 && headings.length === 1 && visible(headings[0]))))
                 text = '';
         }
         cards.set(p, text);
@@ -172,7 +187,7 @@ export async function documentOperation(message) {
     };
     const containers = new Set(['form', 'group', 'region', 'dialog', 'navigation', 'main', 'complementary', 'row', 'listitem']);
     const needle = normalize(query).toLowerCase();
-    const elements = document.querySelectorAll('button,input,textarea,select,a[href],fieldset,form,section,dialog,nav,main,aside,img,h1,h2,h3,h4,h5,h6,[role]');
+    const elements = document.querySelectorAll('button,summary,input,textarea,select,a[href],fieldset,form,section,dialog,nav,main,aside,img,h1,h2,h3,h4,h5,h6,[role]');
     const nodes = [];
     for (const el of elements) {
         if (!visible(el))
@@ -181,10 +196,12 @@ export async function documentOperation(message) {
         if (!r)
             continue;
         const n = name(el);
+        if (!n && ['form','group','region','navigation','main','complementary'].includes(r)) continue;
         const ancestors = [];
         // Keep nearby card identity separately from accessibility ancestors. Generic
         // div cards have no ARIA role; inventing one would break role-based locators.
         let context = '';
+        let contextGuard = '';
         for (let p = el.parentElement; p; p = p.parentElement) {
             const pr = role(p);
             if (containers.has(pr)) {
@@ -193,8 +210,12 @@ export async function documentOperation(message) {
                 // Keep textual context separately for a role-scoped exact text filter.
                 ancestors.unshift({ role: pr, name: pn, ...(pr === 'listitem' && !pn ? { text: content(p) } : {}) });
             }
-            if (!context && ['DIV', 'ARTICLE', 'SECTION', 'LI'].includes(p.tagName))
-                context = card(p);
+            if (!contextGuard && ['DIV', 'ARTICLE', 'SECTION', 'LI'].includes(p.tagName)) {
+                contextGuard = card(p);
+                // Long context still binds identity privately, even when it
+                // is too large for the compact public observation.
+                context = contextGuard.length <= 400 ? contextGuard : '';
+            }
         }
         if (needle && ![r, n, context, ...ancestors.map(a => `${a.role} ${a.text || a.name}`)].join(' ').toLowerCase().includes(needle))
             continue;
@@ -205,25 +226,40 @@ export async function documentOperation(message) {
         states.push(disabled ? 'disabled' : 'enabled');
         if (document.activeElement === el)
             states.push('focused');
+        if (el.tagName === 'SUMMARY' && el.parentElement?.tagName === 'DETAILS')
+            states.push(el.parentElement.open ? 'expanded' : 'collapsed');
+        if (el instanceof HTMLSelectElement && CSS.supports('selector(:open)'))
+            states.push(el.matches(':open') ? 'expanded' : 'collapsed');
         if (el.checked === true || el.getAttribute('aria-checked') === 'true')
             states.push('checked');
+        else if (['checkbox', 'radio'].includes(r))
+            states.push('unchecked');
+        if (el.required || el.getAttribute('aria-required') === 'true') states.push('required');
+        if (el.readOnly) states.push('readonly');
+        if (el.getAttribute('aria-invalid') === 'true' || (el.validity && !el.validity.valid)) states.push('invalid');
         if (submitter(el))
             states.push('submits');
         else if (enterSubmits(el))
             states.push('enter_submits');
         const actions = [];
         if (!disabled) {
-            if (['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab'].includes(r))
+            if (['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'textbox', 'searchbox', 'spinbutton'].includes(r))
                 actions.push('click');
             if (['textbox', 'searchbox', 'spinbutton'].includes(r) && !el.readOnly)
                 actions.push('fill', 'press');
             if (['combobox', 'listbox'].includes(r))
                 actions.push('select');
+            if (el instanceof HTMLSelectElement || (['date_input', 'datetime-local_input', 'month_input', 'time_input', 'week_input'].includes(r) && !el.readOnly))
+                actions.push('click');
             if (r === 'file_input')
-                actions.push('upload');
+                actions.push('click');
         }
-        const value = r !== 'file_input' && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) ? String(el.value ?? '') : undefined;
-        const node = { role: r, name: n, states, actions, ancestors, ...(context ? { context } : {}), ...(value !== undefined ? { value } : {}) };
+        const credential = el instanceof HTMLInputElement && (el.type === 'password' ||
+            /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(el.autocomplete) ||
+            [el.name,el.id].some(name=>/password|passcode|(?:^|[_-])(?:otp|secret|token|api[_-]?key)(?:$|[_-])/i.test(name)));
+        if (credential) states.push('value_hidden');
+        const value = !credential && r !== 'file_input' && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) ? String(el.value ?? '') : undefined;
+        const node = { role: r, name: n, states, actions, ancestors, contextGuard, ...(context ? { context } : {}), ...(value !== undefined ? { value } : {}) };
         nodes.push(node);
         onNode?.(el, node);
     }
@@ -239,8 +275,8 @@ export async function documentOperation(message) {
   // This global belongs only to the extension's isolated world, not page
   // scripts. An updated extension can meet the state and press listener its
   // previous copy left in an open page, so the key changes whenever they do.
-  const key='__ibaraPageReaderV4';
-  const state=globalThis[key] ||= {captures:new Map(),watch:null,listening:false,selecting:null,located:null,port:null};
+  const key='__ibaraPageReaderV5';
+  const state=globalThis[key] ||= {captures:new Map(),identities:new WeakMap(),watch:null,listening:false,selecting:null,located:null,port:null};
   if(!state.listening){
     // Which element the next trusted press reached, whether it submitted a
     // form, and whether the page then leaves. Page scripts cannot see or
@@ -264,9 +300,9 @@ export async function documentOperation(message) {
   }
   const pack=(el,node)=>{
     const ancestor=[...node.ancestors.map(a=>`${a.role}:${a.text||a.name}`),...(node.context?[`card:${node.context}`]:[])].join(' > ');
-    return {role:node.role,name:node.name.slice(0,1000),ancestor:ancestor.slice(0,500),
+    return {role:node.role,name:node.name.slice(0,1000),ancestor:ancestor.slice(0,500),contextGuard:node.contextGuard,
       states:[...node.states,...(node.name.length>1000||ancestor.length>500?['context_truncated']:[])].filter(s=>s!=='focused'),
-      actions:node.actions.filter(a=>a!=='upload'),href:el instanceof HTMLAnchorElement?el.href:''};
+      actions:node.actions,href:el instanceof HTMLAnchorElement?el.href:''};
   };
   // The element a capture/token names, only while the page still shows it
   // the same way (same URL, same element, same role, name and context). No age
@@ -312,6 +348,7 @@ export async function documentOperation(message) {
   // The next rendered frame; after 100 ms without one, go on.
   const frame=()=>new Promise(done=>{requestAnimationFrame(()=>done());setTimeout(done,100);});
   const centre=el=>{const r=el.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];};
+  const selectSignature=el=>JSON.stringify([...el.options].map(o=>[o.value,o.text,o.matches(':disabled')]));
   if(message.op==='keys') {
     // Not when the keyboard is elsewhere (the address bar). A form inside a
     // frame is not seen: the focus is then the frame itself.
@@ -328,9 +365,14 @@ export async function documentOperation(message) {
     return {observed:!!w?.result,hit:w?.result?w.result.hit:null};
   }
   if(message.op==='selected') {
-    const el=state.selecting;
-    if(!el||!el.isConnected)return refuse();
-    return {text:normalize(el.selectedOptions[0]?.text),value:el.value};
+    const selection=state.selecting;
+    const el=selection?.el;
+    if(!el||!el.isConnected||selection.capture!==args.capture||selection.token!==args.token||find()!==el)return refuse();
+    const stable=selection.signature===selectSignature(el);
+    return {ready:stable&&document.hasFocus()&&document.activeElement===el,
+      ...(CSS.supports('selector(:open)')?{open:el.matches(':open')} : {}),
+      matches:stable&&el.options[el.selectedIndex]===selection.option,
+      text:normalize(el.selectedOptions[0]?.text),value:el.value,index:el.selectedIndex};
   }
   if(message.op==='field') {
     // The element the last locate pointed at (the field ibara just clicked).
@@ -354,20 +396,23 @@ export async function documentOperation(message) {
     const scrolled=!inView(el);
     if(scrolled)el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
     if(message.op==='reveal')return {revealed:true};
-    // A list choice: the option's label, typed into the list once it is open.
-    let label;
+    // Read a unique native option and an ordinal among enabled options.
+    // The controller clicks and presses Home/End + arrows + Return; this
+    // reader never assigns selectedIndex/value or synthesizes input.
+    let label,selection;
     if(args.value!==undefined) {
-      if(!(el instanceof HTMLSelectElement)||el.multiple||el.size>1)return refuse();
+      if(!(el instanceof HTMLSelectElement)||el.multiple||el.size>1||el.matches(':disabled'))return refuse();
       const wanted=normalize(args.value);
-      const options=[...el.options].filter(o=>!o.disabled);
-      const option=options.find(o=>o.value===args.value)||options.find(o=>normalize(o.text)===wanted);
+      const options=[...el.options].filter(o=>!o.matches(':disabled'));
+      const byValue=options.filter(o=>o.value===args.value);
+      const matches=byValue.length?byValue:options.filter(o=>normalize(o.text)===wanted);
       const texts=options.slice(0,20).map(o=>normalize(o.text));
-      if(!option)return {label:'',options:texts};
+      if(matches.length!==1)return {label:'',options:texts,reason:matches.length?'more than one option matches':'no enabled option matches'};
+      const option=matches[0],index=options.indexOf(option),tail=options.length-1-index;
       label=normalize(option.text);
-      // Typing a label picks the first option that starts with it.
-      const first=options.find(o=>normalize(o.text).toLowerCase().startsWith(label.toLowerCase()));
-      if(first!==option)return {label:'',options:texts,reason:'another option starts with the same text'};
-      state.selecting=el;
+      selection={value:option.value,index:option.index,from:index<=tail?'Home':'End',steps:Math.min(index,tail)};
+      if(selection.steps>128)return {label:'',options:texts,reason:'more than 128 native arrow presses needed; use the visible menu'};
+      state.selecting={el,option,capture:args.capture,token:args.token,signature:selectSignature(el)};
     }
     // The page answers a scroll on later frames (a header that comes back,
     // a lazy image that pushes content down), and Cua then takes 0.35–1.4 s
@@ -391,13 +436,13 @@ export async function documentOperation(message) {
     state.located={el,capture:args.capture,token:args.token};
     try{state.port?.disconnect();}catch{}
     state.port=chrome.runtime.connect({name:'press:'+message.watch});
-    return {...point,watch:state.watch.id,outer:[outerWidth,outerHeight],inner:[innerWidth,innerHeight],...(label!==undefined?{label}:{})};
+    return {...point,watch:state.watch.id,outer:[outerWidth,outerHeight],inner:[innerWidth,innerHeight],...(selection?{label,selection}:{})};
   }
   const page=(capture,snapshot,offset)=>{
     const nodes=snapshot.nodes.slice(offset,offset+args.limit);
     const allText=args.view==='text'?(document.body?.innerText||''):'';
     const next=offset+nodes.length<snapshot.nodes.length?offset+nodes.length:null;
-    return {capture,url:location.href,title:document.title,nodes,count:snapshot.nodes.length,text:allText.slice(0,args.maxChars),
+    return {capture,url:location.href,title:document.title,nodes,count:snapshot.nodes.length,modalScope:!!snapshot.modalScope,omittedBackground:snapshot.omittedBackground||0,contextText:snapshot.contextText||'',contextTruncated:!!snapshot.contextTruncated,text:allText.slice(0,args.maxChars),
       truncated:next!==null||allText.length>args.maxChars,next_offset:next};
   };
   if(args.capture){
@@ -407,6 +452,13 @@ export async function documentOperation(message) {
     return page(args.capture,snapshot,args.offset);
   }
   const targets=new Map();const nodes=[];const equivalentLinks=new Set();
+  const dialogSelector='dialog,[role="dialog"],[role="alertdialog"]';
+  const dialogs=[...document.querySelectorAll(dialogSelector)].filter(el=>
+    !el.closest('[hidden],[aria-hidden="true"],[inert]') && el.checkVisibility({visibilityProperty:true}));
+  const focusedDialog=document.activeElement?.closest(dialogSelector);
+  const modals=dialogs.filter(el=>el.matches(':modal,[aria-modal="true"]'));
+  const activeDialog=modals.includes(focusedDialog)?focusedDialog:
+    modals.at(-1)||(dialogs.includes(focusedDialog)?focusedDialog:null);
   collect(args.query||'',(el,node)=>{
     const packed=pack(el,node);
     // Identical navigation aliases carry no additional choice. Different hrefs
@@ -418,13 +470,64 @@ export async function documentOperation(message) {
     }
     const token=crypto.randomUUID();
     targets.set(token,{el,packed});
-    nodes.push({...packed,token});
+    // Bind the same short controller reference to the same DOM element AND
+    // meaning, independent of filtering/ranking. A reused SPA node with a
+    // different record/label/context gets a new identity. State/value edits
+    // do not rename an otherwise identical control.
+    const meaning=JSON.stringify({...packed,states:[]});
+    let identity=state.identities.get(el);
+    if(!identity || identity.meaning!==meaning){identity={meaning,id:crypto.randomUUID()};state.identities.set(el,identity);}
+    const stateValue=el instanceof HTMLInputElement&&el.type==='password'?{}:
+      node.value!==undefined?{value:node.value.slice(0,240),value_truncated:node.value.length>240}:{};
+    const files=node.role==='file_input'?{files:[...el.files].slice(0,8).map(f=>f.name.length>160?f.name.slice(0,160)+'… [truncated]':f.name),file_count:el.files.length}:{};
+    const label=el instanceof HTMLSelectElement?[...el.selectedOptions].map(o=>normalize(o.text)).join(', '):null;
+    const selected=label===null?{}:{selected_label:label.slice(0,240)+(label.length>240?'… [truncated]':'')};
+    // Keep an application's warning and controls inside that warning together.
+    // This is relevance ordering only: never choose or execute its recovery.
+    const urgent=el.closest('[role="alert"],[aria-live="assertive"]');
+    const rank=activeDialog && (el===activeDialog || activeDialog.contains(el))?0:
+      urgent?1:el.closest(dialogSelector)?2:el.closest('main,[role="main"]')?3:4;
+    // Full context is an isolated-world guard, never observation payload.
+    const {contextGuard:privateGuard,...publicNode}=packed;
+    nodes.push({...publicNode,...stateValue,...files,...selected,token,elementId:identity.id,rank});
   });
+  // Preserve source order inside each surface. The active dialog/main work
+  // should not disappear behind a page's repeated header and navigation.
+  nodes.sort((a,b)=>a.rank-b.rank);
+  for(const node of nodes)delete node.rank;
   const counts=new Map();
   for(const n of nodes){const k=JSON.stringify([n.role,n.name,n.ancestor]);counts.set(k,(counts.get(k)||0)+1);}
   for(const n of nodes)if(counts.get(JSON.stringify([n.role,n.name,n.ancestor]))>1)n.states.push('ambiguous');
+  // A modal makes the surrounding page unavailable for normal interaction.
+  // Compact only the default view, after full-page ambiguity/identity checks.
+  // Explicit queries can still inspect the background; native hit guards apply.
+  const modalScope=!!activeDialog && modals.includes(activeDialog) && !normalize(args.query);
+  let omittedBackground=0;
+  if(modalScope)for(let i=nodes.length-1;i>=0;i--){
+    const el=targets.get(nodes[i].token).el;
+    if(el!==activeDialog && !activeDialog.contains(el)){nodes.splice(i,1);omittedBackground++;}
+  }
+  // A small excerpt of visible static context, separate from the control budget.
+  // Never read field values/editable content or copy a whole DOM subtree.
+  const main=document.activeElement?.closest('main,[role="main"]') ||
+    [...document.querySelectorAll('main,[role="main"]')].find(visible);
+  const scope=activeDialog || main || document.body;
+  const parts=[];let remaining=800,contextTruncated=false;
+  const needle=normalize(args.query||'').toLowerCase();
+  const excluded='a[href],button,label,input,textarea,select,option,summary,script,style,noscript,[contenteditable],[role="button"],[role="textbox"],[role="searchbox"],[role="spinbutton"],[role="combobox"],[role="option"],nav,[role="navigation"]';
+  for(const el of scope?.querySelectorAll('p,div,td,th,dt,dd,li,[role="status"],[role="alert"]')||[]){
+    if(el.closest(excluded) || el.querySelector('*:not(br)') || !visible(el))continue;
+    const text=normalize(el.innerText);
+    if(!text || (needle && !text.toLowerCase().includes(needle)))continue;
+    const chars=[...text];
+    if(parts.length>=16 || remaining<=0){contextTruncated=true;break;}
+    if(parts.length)remaining-=3; // the visible separator is part of the budget
+    if(remaining<=0){contextTruncated=true;break;}
+    const take=Math.min(chars.length,remaining);parts.push(chars.slice(0,take).join(''));remaining-=take;
+    if(take<chars.length){contextTruncated=true;break;}
+  }
   const capture=crypto.randomUUID();
-  const snapshot={url:location.href,at:Date.now(),targets,nodes,query:args.query||''};
+  const snapshot={url:location.href,at:Date.now(),targets,nodes,query:args.query||'',modalScope,omittedBackground,contextText:parts.join(' | '),contextTruncated};
   state.captures.set(capture,snapshot);
   while(state.captures.size>4)state.captures.delete(state.captures.keys().next().value);
   return page(capture,snapshot,0);

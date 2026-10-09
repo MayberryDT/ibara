@@ -33,6 +33,8 @@ pub struct WinKey {
     pub address: String,
     pub pid: i64,
     pub class: String,
+    pub process_start_ticks: Option<u64>,
+    pub compositor_instance: String,
 }
 
 /// One mapped window.
@@ -41,6 +43,8 @@ pub struct Win {
     pub address: String,
     pub pid: i64,
     pub class: String,
+    pub process_start_ticks: Option<u64>,
+    pub compositor_instance: String,
     pub title: String,
     pub focused: bool,
     /// Floating windows are how dialogs usually appear on Hyprland.
@@ -54,7 +58,7 @@ pub struct Win {
 
 impl Win {
     pub fn key(&self) -> WinKey {
-        WinKey { address: self.address.clone(), pid: self.pid, class: self.class.clone() }
+        WinKey { address: self.address.clone(), pid: self.pid, class: self.class.clone(), process_start_ticks: self.process_start_ticks, compositor_instance: self.compositor_instance.clone() }
     }
 }
 
@@ -163,6 +167,8 @@ pub trait DesktopPort {
         Box::pin(async { false })
     }
     fn windows(&self) -> LocalFuture<'_, Result<Vec<Win>>>;
+    /// Complete application-client inventory for lifecycle reset, including hidden clients.
+    fn all_windows(&self) -> LocalFuture<'_, Result<Vec<Win>>> { self.windows() }
     /// The workspace the focused monitor shows; `None` with no monitor.
     fn active_workspace(&self) -> LocalFuture<'_, Result<Option<WorkspaceRef>>>;
     /// Ask a window to close for a person managing windows, like its close

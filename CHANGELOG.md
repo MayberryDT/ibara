@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — Console Desktop Identity
+
+- Package an `io.zet.ibara` desktop entry and hicolor icons (the ibara mark, plus a symbolic 16-pixel version for bars). The entry opens the console from the app launcher and gives its window ibara's name and icon in window lists that match a shell window's title to an entry, where it showed as Quickshell before: the console is drawn by Omarchy's shell, so its window carries the shell's `org.quickshell` app id.
+
 ## 0.1.0-29 — 2026-10-03
 
 - NVIDIA screen encoding is available when you choose ibara in Screen Stream. It is still in testing; Automatic uses Sunshine for NVIDIA and ibara for VA-API. VA-API on the capture GPU stays preferred, followed by NVENC and OpenH264.

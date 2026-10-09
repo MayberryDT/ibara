@@ -20,7 +20,7 @@ _core=${IBARA_CORE_DIR:-$startdir/..}
 _plugin=${IBARA_PLUGIN_DIR:-}
 
 pkgname=ibara
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=${IBARA_PKGREL:-1}
 pkgdesc='Use your computers from any other, by you and your agents'
 arch=('x86_64')
@@ -115,6 +115,11 @@ package() {
   install -Dm644 packaging/60-ibara-uinput.rules "$pkgdir/usr/lib/udev/rules.d/60-ibara-uinput.rules"
   install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" packaging/ibara-refresh.hook packaging/ibara-cua.hook
   install -Dm644 skills/ibara/SKILL.md "$pkgdir/usr/share/ibara/skills/ibara/SKILL.md"
+  # The console runs inside Omarchy's shell, so its window carries the shell's
+  # app id; this entry gives it ibara's name, icon and a launcher to open it.
+  install -Dm644 packaging/io.zet.ibara.desktop "$pkgdir/usr/share/applications/io.zet.ibara.desktop"
+  install -Dm644 packaging/icons/io.zet.ibara.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.zet.ibara.svg"
+  install -Dm644 packaging/icons/io.zet.ibara-symbolic.svg "$pkgdir/usr/share/icons/hicolor/symbolic/apps/io.zet.ibara-symbolic.svg"
 
   # The console plugin: what Omarchy's shell loads, nothing from its tests.
   local plugin=$pkgdir/usr/share/ibara/omarchy-plugin

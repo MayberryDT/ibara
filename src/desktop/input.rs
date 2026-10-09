@@ -92,7 +92,7 @@ pub fn cua_key(name: &str) -> Result<String> {
         return Ok(key);
     }
     Err(invalid(format!(
-        "Unsupported key name: {name}. Use letters, digits, Return, Tab, Escape, BackSpace, Delete, arrows, Home, End, PageUp, PageDown, F1-F12 and modifiers."
+        "Unsupported key name: {name}. key sends one key or chord, such as Tab or ctrl+a. For text, use computer_act with action kind type and text. Keys include letters, digits, Return, Tab, Escape, BackSpace, Delete, arrows, Home, End, PageUp, PageDown, F1-F12 and modifiers."
     ))
     .with("field", "keys"))
 }

@@ -9,7 +9,7 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = argv.collect();
     match sub.as_str() {
         // Operator side (src/operator/).
-        "client" | "operator" | "control" | "mcp" | "prompt" => ibara::operator::run_cli(&sub, args),
+        "client" | "operator" | "control" | "mcp" | "prompt" | "work" => ibara::operator::run_cli(&sub, args),
         // Target side (src/entry/).
         "agent-entry" => code(ibara::entry::agent_entry(args)),
         "access-system" => code(ibara::access_system::main(args)),
@@ -56,6 +56,7 @@ Commands:
   prompt            Print the prompt that connects an agent
   mcp               The agent connection an agent's settings start
   client            Send and get files, and name computers
+  work              Run and inspect managed jobs on an Ibara computer
   join              Answer a request to add this computer
   unattended-boot   Let this computer start ibara before anyone signs in
   --version         Print ibara's version

@@ -781,6 +781,7 @@ mod tests {
             std::fs::create_dir_all(dir.join("hypr/sig")).unwrap();
             std::fs::write(dir.join("pos"), format!("{} {}", pointer.0, pointer.1)).unwrap();
             let d = dir.display();
+            let window = WINDOW.replace("\"pid\":100", &format!("\"pid\":{}", std::process::id()));
             // Hyprland 0.56.2 as probed: cursor settings apply at its next
             // cursor tick (here 0.3 s later), which hides the pointer only if
             // it has been still 0.1 s; a pointer hidden by `inactive_timeout`
@@ -816,8 +817,8 @@ case "$*" in
   *"invisible = true"*) touch "$dir/set_invisible"; later hide;;
   *"invisible = false"*) rm -f "$dir/set_invisible"; later show;;
   *cursor.move*) xy=$(printf '%s' "$*" | sed -n 's/.*x = \(-*[0-9]*\), y = \(-*[0-9]*\).*/\1 \2/p'); echo "$xy" >"$dir/pos"; log warp $xy;;
-  "-j clients") w=$(cat "$dir/window" 2>/dev/null || echo '{WINDOW}'); if [ -f "$dir/focus" ]; then echo "[$w,$(cat "$dir/focus")]"; else echo "[$w]"; fi;;
-  "-j activewindow") if [ -f "$dir/focus" ]; then cat "$dir/focus"; else cat "$dir/window" 2>/dev/null || echo '{WINDOW}'; fi;;
+  "-j clients") w=$(cat "$dir/window" 2>/dev/null || echo '{window}'); if [ -f "$dir/focus" ]; then echo "[$w,$(cat "$dir/focus")]"; else echo "[$w]"; fi;;
+  "-j activewindow") if [ -f "$dir/focus" ]; then cat "$dir/focus"; else cat "$dir/window" 2>/dev/null || echo '{window}'; fi;;
   "-j monitors") if [ -f "$dir/monitors" ]; then cat "$dir/monitors"; else echo '{MONITORS}'; fi;;
   *send_shortcut*)
     # Into whatever holds the keyboard: the app's model (`menu.sh`) of an open menu.
@@ -1022,7 +1023,7 @@ esac
             cfg.cua = dir.join("cua-driver");
             cfg.env.push(("XDG_RUNTIME_DIR".into(), dir.clone().into()));
             let desktop = Desktop::new(cfg);
-            let surface = SurfaceId { address: "0x1".into(), pid: 100, class: "app".into() };
+            let surface = desktop.windows().await.unwrap().into_iter().find(|w| w.address == "0x1").unwrap().id();
             Screen { dir, desktop, surface, _socket: serve, _helpers: helpers }
         }
 
@@ -1180,7 +1181,7 @@ esac
             std::fs::write(self.dir.join("elements"), elements).unwrap();
             ElementTarget {
                 surface: self.surface.clone(),
-                selector: serde_json::json!({"pid": 100, "window_id": 1, "identity": {"path": [], "role": "push button", "label": "Save", "ordinal": 1}}),
+                selector: serde_json::json!({"pid": std::process::id(), "window_id": 1, "identity": {"path": [], "role": "push button", "label": "Save", "ordinal": 1}}),
                 role: "push button".into(),
                 name: "Save".into(),
                 actions: vec!["click".into()],
@@ -1833,7 +1834,7 @@ mv "$dir/elements.new" "$dir/elements"
     /// (its structured content).
     fn gtk_folder(screen: &Screen, x: i64, refusal: &str) -> ElementTarget {
         let window = r#"{"address":"0x1","mapped":true,"hidden":false,"at":[100,50],"size":[1000,800],"workspace":{"id":1,"name":"1"},"class":"app","title":"App","pid":100,"monitor":0}"#;
-        std::fs::write(screen.dir.join("window"), window).unwrap();
+        std::fs::write(screen.dir.join("window"), window.replace("\"pid\":100", &format!("\"pid\":{}", std::process::id()))).unwrap();
         let elements = format!(
             r#"{{"elements":[{{"element_index":0,"role":"frame","label":"App","element_token":"t0","frame":{{"x":0,"y":0,"w":1000,"h":800}}}},{{"element_index":1,"parent_index":0,"role":"grid cell","label":"Documents","element_token":"t1","frame":{{"x":{x},"y":300,"w":80,"h":30}},"actions":["listitem.scroll-to","view.popup-menu"]}}],"elements_complete":true}}"#
         );
@@ -1841,7 +1842,7 @@ mv "$dir/elements.new" "$dir/elements"
         std::fs::write(screen.dir.join("refuse"), refusal).unwrap();
         ElementTarget {
             surface: screen.surface.clone(),
-            selector: serde_json::json!({"pid": 100, "window_id": 1, "identity": {"path": [["frame", "App"]], "role": "grid cell", "label": "Documents", "ordinal": 1}}),
+            selector: serde_json::json!({"pid": std::process::id(), "window_id": 1, "identity": {"path": [["frame", "App"]], "role": "grid cell", "label": "Documents", "ordinal": 1}}),
             role: "grid cell".into(),
             name: "Documents".into(),
             actions: vec!["listitem.scroll-to".into(), "view.popup-menu".into()],

@@ -377,6 +377,9 @@ pub struct ComputerSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefStatus {
+    /// Structured work/job state, when this reference has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     #[serde(rename = "ref")]
     pub reference: String,
     /// `computer`, `task`, `op`, `attention`, `artifact`, `frame`, …

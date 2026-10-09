@@ -10,7 +10,7 @@ const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field',
 const EFFECTS=['navigate','reveal','cookies_write','cookies_remove','login_reload'];
 // What each job lets ibara ask for. Anything else is refused unstarted.
 const JOBS={
-  pages:['tabs','navigate',...PAGE_OPS],
+  pages:['tabs','lifecycle_inventory','navigate',...PAGE_OPS],
   receive:['cookies_write','cookies_remove','cookies_count','login_context','login_page','login_reload'],
   share:['cookies_read','browser_info'],
 };
@@ -207,6 +207,11 @@ async function handle(m,jobs) {
       const known=root?.ready&&frames.every(f=>f.result?.ready)&&frames.length>=1+(root?.frames||0);
       return {result:{page:password?'still_sign_in':known?'left_sign_in':'unknown',document_ms:root?.origin}};
     }
+    if(m.op==='lifecycle_inventory') {
+      const windows=await chrome.windows.getAll({populate:true});
+      return {result:{windows:windows.map(w=>({id:w.id,focused:w.focused,type:w.type,incognito:w.incognito,
+        tabs:(w.tabs||[]).map(t=>({id:t.id,active:t.active,blank:t.url==='about:blank'}))}))}};
+    }
     if(m.op==='tabs') {
       const tabs=await chrome.tabs.query({active:true,lastFocusedWindow:true});
       const tab=tabs[0];
@@ -265,9 +270,10 @@ function connect() {
     p.postMessage({hello:1});
   } catch {setTimeout(connect,2000);}
 }
-// A new ibara release brings a new version. Chrome downloads it but holds it
-// while this worker is busy (the native port keeps it so), so apply it now.
-chrome.runtime.onUpdateAvailable.addListener(()=>chrome.runtime.reload());
+// Keep the current reader for this browser session. Reloading on an update
+// can cut an in-flight native reply and leave a real effect uncertain.
+// Chromium applies the downloaded update after the browser closes normally.
+chrome.runtime.onUpdateAvailable.addListener(()=>{});
 chrome.runtime.onStartup.addListener(()=>{chrome.runtime.requestUpdateCheck().catch(()=>{});});
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);

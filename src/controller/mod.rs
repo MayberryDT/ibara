@@ -164,6 +164,7 @@ pub struct ControllerOptions {
     pub computer: ComputerIdentity,
     pub effect_rules: EffectRules,
     pub ask_first: AskFirst,
+    pub disposable_desktop: AskFirst,
     pub idle_expiry_ms: i64,
     pub disconnect_grace_ms: i64,
     pub timing: Timing,
@@ -188,6 +189,7 @@ impl ControllerOptions {
             computer: ComputerIdentity { name: "this computer".into(), ..Default::default() },
             effect_rules: EffectRules::default(),
             ask_first: Rc::new(|| crate::settings::current().ask_first()),
+            disposable_desktop: Rc::new(|| crate::settings::current().bool("disposable_desktop")),
             idle_expiry_ms: IDLE_EXPIRY_MS,
             disconnect_grace_ms: DISCONNECT_GRACE_MS,
             timing: Timing::default(),
@@ -294,6 +296,7 @@ pub struct Controller {
     endpoint_id: String,
     clock: Clock,
     idle_expiry_ms: i64,
+    disposable_desktop: AskFirst,
     disconnect_grace_ms: i64,
     timing: Timing,
     home: checks::HomeRule,
@@ -402,6 +405,7 @@ impl Controller {
             computer_id,
             effect_rules: options.effect_rules,
             ask_first: options.ask_first,
+            disposable_desktop: options.disposable_desktop,
             access_projection: RefCell::new(None),
             access_projection_failed: RefCell::new(None),
             access_socket: options.access_socket,
@@ -461,9 +465,9 @@ impl Controller {
     pub async fn start(self: &Rc<Self>) -> Result<()> {
         *self.me.borrow_mut() = Rc::downgrade(self);
         self.desktop.start_watch();
-        if let Some(rx) = self.desktop.subscribe() {
-            tokio::task::spawn_local(situation::pump_events(Rc::downgrade(self), rx));
-        }
+        // Subscribe before initialization so no browser-opening event is lost,
+        // but do not let display events reconcile until startup owns settlement.
+        let events = self.desktop.subscribe();
         if let Err(e) = self.desktop.reset_input().await {
             log_event("reset_input_failed", &e.to_string());
         }
@@ -473,6 +477,9 @@ impl Controller {
             Ok(true) => log_event("stay_awake_on", "Turned on Omarchy's Stay Awake so this computer never locks agents out."),
             Ok(false) => {}
             Err(e) => log_event("stay_awake_failed", &e.to_string()),
+        }
+        if let Some(rx) = events {
+            tokio::task::spawn_local(situation::pump_events(Rc::downgrade(self), rx));
         }
         self.system_pause().await?;
         if self.stream.is_some() {
@@ -492,7 +499,9 @@ impl Controller {
     /// pause, and the watchdog ends it once the computer is healthy.
     pub async fn system_pause(&self) -> Result<Value> {
         self.ensure_open()?;
-        self.reconcile().await?;
+        // admin_pause fences and settles existing work itself. Reconciling
+        // first would allow an event-driven reset to race this pause and be
+        // cancelled by the very startup that needs it to finish.
         self.admin_pause(crate::store::PauseOrigin::System).await
     }
 

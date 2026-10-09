@@ -25,7 +25,7 @@ pub enum LockState {
 }
 
 /// Lock state from `monitors` (`sessionLockState`): no monitors, or any
-/// monitor without `solitaryBlockedBy`, is unknown; `LOCK` on any monitor is
+/// monitor without `solitaryBlockedBy`, is unknown; explicit null means no blockers; `LOCK` on any monitor is
 /// locked; unlocked needs at least one monitor not blocked by `WORKSPACE`.
 pub fn lock_state(monitors: &[Monitor]) -> LockState {
     if monitors.is_empty() {
@@ -199,6 +199,19 @@ mod tests {
         assert_eq!(lock_state(&[monitor(Some(&["WORKSPACE"]))]), LockState::Unknown);
         assert_eq!(lock_state(&[monitor(Some(&["WINDOWED"])), monitor(None)]), LockState::Unknown);
         assert_eq!(require_unlocked(Ok(vec![monitor(Some(&["LOCK"]))])).unwrap_err().code, "HUMAN_CONTROL");
+    }
+
+    // Protocol regression from live Hyprland 0.56.2. Explicit null is zero blockers;
+    // an absent field is unavailable evidence. Written before the parser repair.
+    #[test]
+    fn fullscreen_null_blockers_differ_from_missing_lock_evidence() {
+        let parse = |raw: &str| serde_json::from_str::<Monitor>(raw).unwrap();
+        let fullscreen = parse(r#"{"solitaryBlockedBy":null,"solitary":"5b14e5302210","activeWorkspace":{"id":2}}"#);
+        assert_eq!(lock_state(&[fullscreen.clone()]), LockState::Unlocked);
+        assert_eq!(lock_state(&[parse("{}")]), LockState::Unknown);
+        assert_eq!(lock_state(&[parse(r#"{"solitaryBlockedBy":["WORKSPACE"]}"#)]), LockState::Unknown);
+        assert_eq!(lock_state(&[fullscreen, parse(r#"{"solitaryBlockedBy":["LOCK"]}"#)]), LockState::Locked);
+        assert!(serde_json::from_str::<Monitor>(r#"{"solitaryBlockedBy":0}"#).is_err());
     }
 
     /// A fake `omarchy-toggle-idle` keeping its flag in a file, like the real one.

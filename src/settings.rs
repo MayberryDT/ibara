@@ -94,6 +94,9 @@ fn listed(def: &Def) -> bool {
 }
 
 const DEFS: &[Def] = &[
+    Def { section: "agents", key: "disposable_desktop", title: "Zero Windows Between Tasks",
+        help: "Dedicated agent desktop only: close application windows between tasks. Keeps files and the browser profile. Personal computers default off.",
+        kind: Kind::Bool(false) },
     Def { section: "control", key: "screen_stream", title: "Screen Stream",
         help: "Automatic uses ibara's stream when graphics can encode it.",
         kind: Kind::Choice(&[("auto", "Automatic"), ("ibara", "ibara"), ("sunshine", "Sunshine")], "auto") },

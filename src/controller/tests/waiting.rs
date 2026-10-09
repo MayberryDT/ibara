@@ -66,7 +66,7 @@ fn a_held_step_says_to_wait_and_runs_once_when_sent_again() {
             approved(c, &task, &att).await;
             let ran = call(c, tool, args.clone()).await;
             assert_eq!((ran["status"].as_str(), ran["result"]["steps"][0]["outcome"].as_str()), (Some("ok"), Some("done")), "{tool}: {ran}");
-            assert!(ran["result"].get("next").is_none(), "{tool}: nothing left to wait for: {ran}");
+            assert!(!ran["result"]["next"].as_str().unwrap_or("").contains("computer_wait"), "{tool}: no approval wait remains: {ran}");
             call(c, tool, args).await;
             assert_eq!(rig.desktop.acts(), n + 1, "{tool}: the approved step runs once");
         }

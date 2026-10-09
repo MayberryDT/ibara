@@ -15,13 +15,15 @@ Use ibara when the task needs a real screen:
 - running something on another computer and seeing the result;
 - getting a file from that computer, or putting one there.
 
-Keep code edits, git, tests, APIs and public pages you can fetch where you are. Don't use ibara to read your own files.
+Keep ordinary code, git, tests, APIs and public retrieval on the normal build/research host. When a task specifically needs another computer's environment—for example an Omarchy build plus GUI verification—use managed commands in that computer's Ibara task. Do not acquire a desktop and then run an untracked SSH build.
 
-`computer_status` lists the computers you may use, with their state. Use the one your person named. If they named none and more than one is ready, ask which.
+`computer_status` lists your computers. **For ordinary work, omit `computer` in `computer_begin`: Ibara selects any ready computer and tries another after a definite acquisition refusal.** Never default to one particular computer or ask which machine merely because several are available. Name a computer only when your person names it, a task requires state/apps on it, or a benchmark fixes that target. Verify the returned ID before effects; keep that task on its assigned machine. A named route stays pinned.
+
+You may use **multiple computers for separate independent tasks** in the same agent session. Give each begin a different request_id, keep each task_ref with its computer, and finish each promptly. Do not move an uncertain operation, partial registration or started benchmark to another machine. If an older client requires a name, inspect fleet status and try any eligible ready target; a definite BUSY/HUMAN_CONTROL refusal means another free machine can do ordinary unstarted work. Use a fresh request_id when starting that separate attempt.
 
 ## One task, start to finish
 
-A task holds the computer: your person sees it in their console, and no other agent can use that computer until you finish. If `computer_begin` says the computer is in use by a person or another task, tell your person instead of waiting in a loop.
+A task holds the computer: your person sees it in their console, and no other agent can use that computer until you finish. A busy computer does not block work on other free computers. If all suitable machines are unavailable, continue independent work and report the actual states. Never steal a lease or override a person’s pause.
 
 1. **Prepare before you begin.** Have the URLs, text and your definition of done ready before `computer_begin`.
 2. **Begin with checks that prove the result.** Give `computer_begin` a `goal` and `checks`. Prefer typed checks (`file_exists`, `file_content`, `url`, `text_present`, `element`, `delivered`); ibara proves those itself. Checks without a type are yours to assess honestly at finish, and so is a typed check ibara can't read: text in a terminal, which has no accessibility tree, is `unknown` until your assessment decides it. The reply has your `task_ref` and the first frame.
@@ -36,7 +38,21 @@ A task holds the computer: your person sees it in their console, and no other ag
 4. **Read text from elements, not pictures.** Use `computer_observe` with `view: "elements"` and a `query`. An agent that read a code off a picture typed M for N.
 5. **Verify every step.** `done` means ibara sent the input, not that it had the intended effect. Confirm with `expect` or a fresh observation. When ibara can't prove an outcome it says `unknown`; treat that as unproven.
 6. **Observe again after anything changes the screen,** such as navigation, a dialog or a new window. Refs from an old frame go stale (`STALE_TARGET`).
-7. **Finish at the first safe point.** Call `computer_finish` with `complete` only when the checks are met. Otherwise use `partial` or `blocked`, with a summary that says what is and isn't done. Tell your person what the checks proved, not only that you finished. Don't keep the computer while you write code, think at length, or wait for your person. Begin again when you next need the screen.
+7. **Finish at the first safe point.** Call `computer_finish` with `complete` only when the checks are met. Otherwise use `partial` or `blocked`, with a summary that says what is and isn't done. Tell your person what the checks proved, not only that you finished. Finish when work on that computer is settled; finish cancels remaining managed jobs. Keep its task through dependent build and desktop phases. Do independent planning/research elsewhere; do not reserve an idle computer for later work.
+   - Save required files first and read `cleanup`, `complete` and `notes`. A computer labeled **disposable desktop** must reach zero application windows between tasks, regardless of who opened them; finish and crash recovery enforce this. The mode preserves saved files and profile storage, not windows. Close current windows with `{kind:"close",surface:"wN"}`; observations show tile dimensions. On cleanup-capable targets, known task-owned Mousepad save prompts are resolved automatically and unsaved task edits discarded; saved files stay unchanged. Save required work before finish. Known task-owned native file choosers are cancelled before browser cleanup; this does not select or save a file. Human-touched or unidentified windows and unfamiliar dialogs remain protected; a refused reset never permits force-killing the app. Personal computers retain their conservative ownership rules.
+   - Background connection pings do not count as work on disposable desktops. Use `computer_wait` for a bounded operation or approval wait; finish instead of keeping the machine while planning.
+
+## Commands, builds and reconnection
+
+On work-capable targets, one `task_ref` owns the workspace, supervised commands and desktop. The initial policy is one exclusive task per computer; separate tasks can use different computers. Different directories alone do not isolate builds.
+
+Use `computer_exec` with the task reference for remote builds/tests, then the same task for native verification. Keep command output/result files in its workspace. `computer_status({ref:op_ref})` reads job state/output even after the task ends. `done` input and exit0 are not independent GUI or saved-output proof.
+
+The equivalent CLI is `ibara work [--computer NAME] [--agent NAME] run --goal TEXT --request-id ID -- PROGRAM ARG...`, then `exec --task TASK --request-id ID -- PROGRAM ARG...`, `status REF`, or `cancel TASK`. Use the same agent name as the owning MCP client when mixing routes. Preserve the printed request, task and receipt IDs; a lost reply is reconciled with those IDs, never a replacement launch. Same-ID `run` inspects the existing work. Explicit `finish`/`cancel` cancels remaining jobs and cleans windows.
+
+A disconnected agent is not a cancelled task. Managed jobs keep ownership; the same authenticated agent can reconnect without replaying effects. A live second session cannot steal it. Once jobs settle and the disconnected task's grace expires, cleanup releases the computer and retains readable results. A killed relay is detected after three missed30s heartbeats; this is liveness detection, not a job runtime limit. Human takeover fences input and cancels managed jobs; old approvals do not resume. A daemon restart may stop work and leaves uncertain effects for inspection.
+
+Administrative SSH and detached external services are outside this supervision. Do not describe them as reserved/isolated work. Old targets without structured work details or the CLI subcommand are unsupported for this workflow; retain the normal build host instead of silently falling back to an untracked SSH job.
 
 ## Approvals and people
 
@@ -53,7 +69,7 @@ A task holds the computer: your person sees it in their console, and no other ag
 
 ## Signing in to websites
 
-Your person can share their logins with you, one site at a time. You never see a password or a login; ibara copies it from their browser into the computer's browser.
+Each computer keeps its own browser session. Use an existing approved session and verify the expected account. Google/Gmail cookie copying is disabled. Eligible other sites may offer Share sign-in; once is the default, and remembered sharing is an explicit choice. Never expose credentials in tool text or receipts.
 
 - **Name the sites you know you'll need when you begin:** `computer_begin({…, logins: ["irs.gov", "id.me"]})`. Your person answers once for all of them, and you can start working meanwhile. The reply gives each site's `state`. For `rejected_before`, plan for your person to sign in with Take Control.
 - **At a sign-in page, use `browser_act` with `{kind: "sign_in"}`** before anything else. It covers the site the tab shows and the site it came from. The reply's `page` is `left_sign_in` when the page is past its sign-in form. `unknown` is not success, so check the page.
@@ -61,6 +77,11 @@ Your person can share their logins with you, one site at a time. You never see a
   - `waiting_for_person`, `waiting_for_browser` or `waiting_for_sharing_computer`: wait as `next` says, then resend the same request.
   - `declined` or `denied`: don't ask again for that site. Take another route, or ask with `computer_checkpoint`.
   - `site_rejected`: the site didn't accept the shared login. Ask your person to sign in with Take Control.
+- **On assistance-capable computers, read the actual human answer.** `deferred` means do independent work, checkpoint and finish partial when blocked; do not repeatedly ask or leave windows open. `no_account` means check a legitimate guest/public route or prepare a concrete signup proposal; it authorizes no creation. `without_account` means use the guest route. `person_sign_in` means respect human control and verify the expected account after handback. `cancelled` stops this sign-in.
+- **Continue after cleanup:** keep the `att_` reference. `computer_status({ref: "att_…"})` exposes the durable answer. Acquire the same computer with a fresh task and call `computer_checkpoint({task_ref, login:{attention:"att_…",action:"continue"}})`. This restores intent, never old input approval or a cancelled task. A late answer does not start a disconnected agent.
+- **When a new signup decision is needed:** `computer_checkpoint({task_ref,login:{attention,action:"propose_signup",proposal:{site,identity,credential_store,cost:"free",summary}}})`. Use exact approved owner/email and storage labels, registration data and verification requirements in the summary; no secrets. The same card displays the proposal. After approval, `claim_signup` with `site` records one attempt before submission. If exact setup is already authorized in the task, do not ask for redundant approval; use that existing authority and keep equivalent non-secret evidence through normal checkpoints.
+- **Never retry uncertain registration.** `record_created` marks a claimed setup for verification, not completion. `resolve` with `site` and `evidence_ref` records verified task access, account identity and recoverable storage, or a verified guest route. After cancellation/process loss, use `recover_signup` with the `claim_ref` from `prior_setups` on the same computer. `record_not_created` requires evidence that submission had no effect; absence of confirmation is insufficient. Unknown stays blocked. This ledger is per computer: keep a setup attempt pinned there until reconciled; do not re-register on another computer.
+- **Provider not configured:** have the person join for secure setup. Do not invent a vault integration or create an account with credentials only the agent can recover. Keep account/site substitutions, paid plans and added identity scopes within explicit authority.
 - **Each site gets one try per task.**
 - **Never ask your person for a password or a code in chat.** A code the site texts or emails goes through `computer_checkpoint` with `ask`.
 - `computer_status` shows each computer's logins ("logins from Laptop · 23 sites allowed"). Prefer a computer that already has the sites you need.
@@ -76,7 +97,7 @@ Your person can share their logins with you, one site at a time. You never see a
 
 ## Files
 
-- **On that computer:** `computer_files` reads, writes and lists files in the task's workspace and the home folder. `computer_exec` runs one bounded command; `command` is the program and its arguments, with no shell.
+- **On that computer:** `computer_files` reads, writes and lists files in the task's workspace and the home folder. `computer_exec` runs managed command argv in the task workspace, with no implicit shell. On work-capable targets, `background:true` returns an operation reference immediately; jobs keep the computer occupied through client loss. `timeout_ms` is an explicit runtime deadline, not the response wait. An explicit host maximum is enforced and reported; no default action/image quota or build deadline is implied.
 - **Bringing a file to your own computer takes two steps.**
   - `send` records the delivery but moves no bytes.
   - Then run the fetch command its `next` gives (`ibara client … fetch …`) on your computer.
@@ -85,3 +106,5 @@ Your person can share their logins with you, one site at a time. You never see a
 ## What leaves the computer
 
 Screens and text you read go to your model provider. Read what the task needs: an element query or a cropped image, not the whole screen.
+
+On a designated disposable desktop, finish/reset may visibly create a blank browser tab and close transient tabs using native input before closing windows. A failed retirement leaves the computer unavailable with recovery guidance; do not bypass it or force-kill the browser. Save/deliver needed files before finish.

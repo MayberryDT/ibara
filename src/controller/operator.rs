@@ -107,7 +107,7 @@ impl Controller {
                 | "access_remove" | "access_unpair" | "attention" | "answer_attention" | "viewer_register" | "viewer_ticket"
                 | "warm" | "join" | "screen_failed"
                 | "clipboard_get" | "clipboard_set" | "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer"
-                | "login_remove" | "login_probe"
+                | "login_remove" | "login_probe" | "login_assist" | "login_authorize_once"
         )
             || FILE_OPS.contains(&op.as_str())
             || super::EVERYDAY_OPS.contains(&op.as_str());
@@ -142,7 +142,7 @@ impl Controller {
         // administer access and fail closed before any cookie effect.
         if op.starts_with("login_") {
             let access=crate::access::Access::load(&self.journal)?.ok_or_else(||denied("Login sharing needs current access records."))?;
-            if access.pairings.get(operator_id).and_then(|p| p.endpoint.as_deref()) == Some(self.endpoint_id.as_str()) {
+            if op != "login_assist" && access.pairings.get(operator_id).and_then(|p| p.endpoint.as_deref()) == Some(self.endpoint_id.as_str()) {
                 return Err(denied("This computer also runs agents, so it can't share logins yet. Turn on sharing from the computer you use."));
             }
             if access.rule(operator_id,"administer",self.now_ms())!=super::Rule::Allow {
@@ -201,6 +201,9 @@ impl Controller {
                     self.journal.list_attention(Some("open"), None, 100)?.into_iter().map(|item| {
                         let mut v = json!(item);
                         v["summary"] = json!(squash(&item.question, 400));
+                        if item.kind=="login" && item.details.pointer("/assistance/version").and_then(Value::as_u64)==Some(1) {
+                            if let Ok(Some(view))=self.login_assistance_status(&item.att_ref) { v["details"]["assistance"]=view; }
+                        }
                         v
                     }).collect()
                 } else {
@@ -408,6 +411,11 @@ impl Controller {
                     "principal": l.principal,
                     "state": t.state,
                     "started_at": l.acquired_at,
+                    "connection": if self.connection_gone(&l.connection_id) {"disconnected"} else {"connected"},
+                    "active_jobs": self.storage.active_job_count(Some(&l.task_ref)),
+                    "uncertain_jobs": self.storage.uncertain_job_count(Some(&l.task_ref)),
+                    "resources": ["computer_exclusive"],
+                    "takeover_policy": "cancel_owned_jobs_and_fence_input",
                 });
                 if let Some(seen) = self.last_step.borrow().as_ref().filter(|s| s.task_ref == l.task_ref) {
                     active["last_step"] = json!({ "summary": seen.summary, "at": seen.at });

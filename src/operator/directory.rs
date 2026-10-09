@@ -139,7 +139,27 @@ fn validate_database_file(database_path: &Path, create: bool) -> Result<bool> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = database_path.as_os_str().to_owned();
         sidecar.push(suffix);
-        if let Some(stat) = lstat_or_missing(Path::new(&sidecar))?
+        let sidecar = Path::new(&sidecar);
+        let mut observed = lstat_or_missing(sidecar)?;
+        // SQLite removes WAL/SHM files when its last connection closes. lstat
+        // can find the old inode just before unlink and return nlink=0. That
+        // inode no longer describes this path. Allow two bounded re-observations
+        // of this disappearance; always validate a replacement independently.
+        // Never accept zero links or retry any other unsafe state.
+        for _ in 0..2 {
+            if !observed.as_ref().is_some_and(|stat| {
+                stat.nlink() == 0
+                    && stat.is_file()
+                    && !stat.file_type().is_symlink()
+                    && stat.uid() == current_uid()
+                    && stat.mode() & 0o077 == 0
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            observed = lstat_or_missing(sidecar)?;
+        }
+        if let Some(stat) = observed
             && !private_regular(&stat)
         {
             return Err(unsafe_file(format!("Unsafe SQLite sidecar: {suffix}")));
@@ -965,6 +985,28 @@ impl OperatorDirectory {
         }
         tx.commit()?;
         Ok(removed)
+    }
+
+    /// Durable automatic-begin routing, before a request leaves this operator.
+    /// A definite pre-acquisition refusal permits compare-and-swap to another
+    /// target. Unknown results and successful tasks keep their original route.
+    pub(crate) fn auto_begin_route(&mut self, key: &str, fingerprint: &str, candidate: Option<&str>, refused: Option<&str>) -> Result<Option<String>> {
+        let key=format!("auto_begin:{key}");
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved: Option<String>=tx.query_row("SELECT value FROM directory_meta WHERE key=?",[&key],|r|r.get(0)).optional()?;
+        let saved: Option<Value>=saved.map(|s|serde_json::from_str(&s)).transpose().map_err(|_|fail("Invalid saved begin route."))?;
+        if let Some(saved)=&saved {
+            if saved["fingerprint"]!=fingerprint {
+                return Err(IbaraError::new("REQUEST_CONFLICT","request_id already names different begin arguments; use a fresh request_id for new work.",false));
+            }
+            let target=saved["computer"].as_str().ok_or_else(||fail("Invalid saved begin route."))?;
+            if refused!=Some(target) || candidate.is_none() {return Ok(Some(target.into()));}
+        }
+        let Some(candidate)=candidate else {return Ok(None)};
+        tx.execute("INSERT INTO directory_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key,json!({"fingerprint":fingerprint,"computer":candidate}).to_string()])?;
+        tx.commit()?;
+        Ok(Some(candidate.into()))
     }
 
     /// `bindOperation(computerId, {requestId, recordId})` (operator-directory.mjs:355):

@@ -487,7 +487,7 @@ pub struct CheckSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BeginInput {
-    /// Name or cmp_ id; optional with one computer.
+    /// Optional name or cmp_ id to pin a required machine; omit for any ready computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<String>,
     pub goal: String,
@@ -842,11 +842,40 @@ pub struct Ask {
     pub options: Vec<String>,
 }
 
+/// A concrete, non-secret account setup proposal. Credentials stay in their provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignupProposal {
+    pub site: String,
+    pub identity: String,
+    pub credential_store: String,
+    pub cost: String,
+    pub summary: String,
+}
+
+/// Continue login assistance or prepare/record a scoped signup; never carries a secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoginAssistanceInput {
+    pub attention: Ref,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<SignupProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+}
+
 /// `computer_checkpoint({task_ref, note?, ask?, stop_asking?})`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointInput {
     pub task_ref: Ref,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginAssistanceInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -858,8 +887,8 @@ pub struct CheckpointInput {
 
 impl Validate for CheckpointInput {
     fn validate(&self) -> Result<(), FieldError> {
-        if self.note.is_none() && self.ask.is_none() && !self.stop_asking {
-            return Err(FieldError::new("note", "give a note, an ask, stop_asking, or more than one"));
+        if self.note.is_none() && self.ask.is_none() && self.login.is_none() && !self.stop_asking {
+            return Err(FieldError::new("note", "give a note, an ask, login assistance, stop_asking, or more than one"));
         }
         Ok(())
     }

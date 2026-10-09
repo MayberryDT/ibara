@@ -555,6 +555,7 @@ async fn push(
 /// A request an agent made, as `login_pending` lists it.
 struct Asked {
     request_ref: String,
+    grant_revision: Option<u64>,
     task_ref: Option<String>,
     goal: Option<String>,
     own: bool,
@@ -570,6 +571,7 @@ impl Asked {
         };
         Some(Asked {
             request_ref: text("request_ref")?,
+            grant_revision: None,
             task_ref: text("task_ref"),
             goal: text("goal").map(|g| clip(&g, 200)),
             own: request["own"] == true,
@@ -609,12 +611,16 @@ async fn share_fresh(
     computer: &str,
     name: &str,
     asked: Option<&Asked>,
+    once: bool,
 ) -> Result<Outcome> {
+    if crate::logins::independent_site(name) {
+        return Err(denied("This site requires an independent session; cookie export is disabled."));
+    }
     let settings = load()?;
     if !settings.enabled {
         return Ok(Outcome::Off);
     }
-    if settings.logins.rule(name, computer) != Rule::Allow {
+    if settings.logins.rule(name, computer) == Rule::Deny || (!once && settings.logins.rule(name, computer) != Rule::Allow) {
         return Ok(Outcome::Denied);
     }
     let Ok(chrome) = chrome(console, &settings) else {
@@ -642,6 +648,7 @@ async fn share_fresh(
     let mut fields = json!({"site": name, "cookies": cookies, "refresh": refresh});
     if let Some(asked) = asked {
         fields["request_ref"] = json!(asked.request_ref);
+        if let Some(revision)=asked.grant_revision {fields["revision"]=json!(revision);}
     }
     let result = call(console, computer, "login_deliver", fields, DELIVER_DEADLINE).await?;
     let failed = result["failed"].as_array().map_or(0, Vec::len);
@@ -946,7 +953,7 @@ async fn deliver_pending(console: &Console, computer: &str, requests: &Value) ->
             if entry["need"] != "deliver" {
                 continue;
             }
-            let reason = match share_fresh(console, computer, &name, Some(&asked)).await {
+            let reason = match share_fresh(console, computer, &name, Some(&asked), false).await {
                 Ok(Outcome::NoBrowser) => "waiting_for_browser",
                 Ok(Outcome::SignedOut) => "signed_out_there",
                 Ok(Outcome::Off) => "sharing_off",
@@ -986,6 +993,7 @@ pub(super) async fn command(ctx: &Ctx) -> Handled {
         "login-rule" => login_rule(ctx).await,
         "login-rows" => login_rows(ctx),
         "login-answer" => login_answer(ctx).await,
+        "login-assist" => login_assist(ctx).await,
         "login-share-with" => share_with(ctx).await,
         "login-sync" => sync(ctx).await,
         "login-remove" => remove(ctx).await,
@@ -1231,6 +1239,7 @@ fn login_rows(ctx: &Ctx) -> Handled {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Decision {
+    ShareOnce,
     Share,
     ShareAll,
     Decline,
@@ -1251,6 +1260,7 @@ fn decisions(raw: &str) -> Result<Vec<(String, Decision)>> {
     let mut out: Vec<(String, Decision)> = Vec::new();
     for (name, value) in map {
         let decision = match value.as_str() {
+            Some("share_once") => Decision::ShareOnce,
             Some("share") => Decision::Share,
             Some("share_all") => Decision::ShareAll,
             Some("decline") => Decision::Decline,
@@ -1312,10 +1322,17 @@ async fn login_answer(ctx: &Ctx) -> Handled {
         .flatten()
         .find(|r| r["att_ref"] == att.as_str())
         .ok_or_else(|| invalid(NOT_WAITING))?;
-    let asked = Asked::read(request).ok_or_else(|| invalid(NOT_WAITING))?;
+    let mut asked = Asked::read(request).ok_or_else(|| invalid(NOT_WAITING))?;
     let listed: Vec<String> = request_sites(request).map(|(name, _)| name).collect();
     if let Some((name, _)) = decisions.iter().find(|(name, _)| !listed.contains(name)) {
         return Err(Fault::Plain(format!("{name} is not part of this request.")));
+    }
+    let displayed_revision=option(&ctx.args,"--revision").map(|s|s.parse::<u64>().map_err(|_|invalid("Invalid displayed revision."))).transpose()?;
+    let grants: Vec<&String>=decisions.iter().filter(|(_,d)|*d==Decision::ShareOnce || (displayed_revision.is_some() && *d==Decision::Share)).map(|(n,_)|n).collect();
+    if !grants.is_empty() {
+        let revision=displayed_revision.ok_or_else(||invalid("Share once requires the revision shown on the card. Refresh the request."))?;
+        let granted=call(console,&computer,"login_authorize_once",json!({"att_ref":att,"revision":revision,"sites":grants}),CALL_DEADLINE).await?;
+        asked.grant_revision=granted["revision"].as_u64();
     }
     update(|s| {
         let mut changed = false;
@@ -1324,7 +1341,7 @@ async fn login_answer(ctx: &Ctx) -> Handled {
                 Decision::Share => vec![(computer.as_str(), Rule::Allow)],
                 Decision::ShareAll => vec![("all", Rule::Allow), (computer.as_str(), Rule::Allow)],
                 Decision::Never => vec![("all", Rule::Deny)],
-                Decision::Decline => continue,
+                Decision::Decline | Decision::ShareOnce => continue,
             };
             // Ask First on either layer must not defeat an explicit Share.
             // Preserve an All Computers Deny unless Share All replaces it.
@@ -1361,8 +1378,8 @@ async fn login_answer(ctx: &Ctx) -> Handled {
         let outcome = match decision {
             Decision::Decline => "declined",
             Decision::Never => "denied",
-            Decision::Share | Decision::ShareAll => {
-                match share_fresh(console, &computer, name, Some(&asked)).await? {
+            Decision::Share | Decision::ShareAll | Decision::ShareOnce => {
+                match share_fresh(console, &computer, name, Some(&asked), *decision==Decision::ShareOnce).await? {
                     Outcome::Off => "sharing_off",
                     Outcome::Denied if load()?.logins.rule(name, &computer) == Rule::Deny => {
                         "denied"
@@ -1434,7 +1451,7 @@ impl Spread {
         }
         let (mut all, mut sent, mut unknown) = (true, 0, false);
         for name in sites {
-            match share_fresh(console, &computer, name, None).await {
+            match share_fresh(console, &computer, name, None, false).await {
                 Ok(Outcome::Sent { failed: 0, .. }) => sent += 1,
                 Ok(Outcome::Sent { .. }) => unknown = true,
                 // Allowed for All Computers but Ask First or Denied on this
@@ -1703,7 +1720,7 @@ async fn share(ctx: &Ctx) -> Handled {
             )));
         }
     }
-    let reply = match share_fresh(console, &computer, &name, None).await? {
+    let reply = match share_fresh(console, &computer, &name, None, false).await? {
         Outcome::Off => json!({"site": name, "reason": "sharing_off"}),
         Outcome::Denied => return Err(Fault::plain("Allow this site before sharing its login.")),
         Outcome::NoBrowser => json!({"site": name, "reason": "waiting_for_browser"}),
@@ -1790,4 +1807,16 @@ async fn test_seed(ctx: &Ctx) -> Handled {
         )
         .await?;
     Ok(ctx.ready(json!({"written": result["written"]})))
+}
+
+/// Non-secret human responses do not need a configured cookie-sharing source.
+async fn login_assist(ctx: &Ctx) -> Handled {
+    let att = validated_id(option(&ctx.args, "--att"), "attention reference")?;
+    let revision = option(&ctx.args, "--revision").and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| invalid("Give the login request revision."))?;
+    let decisions: Value = serde_json::from_str(option(&ctx.args, "--decisions").unwrap_or(""))
+        .map_err(|_| invalid("Give per-site login assistance decisions."))?;
+    let computer = administered_computer(&ctx.console, option(&ctx.args, "--computer").unwrap_or("")).await?;
+    let result = call(&ctx.console, &computer, "login_assist", json!({"att_ref":att,"revision":revision,"decisions":decisions}), CALL_DEADLINE).await?;
+    Ok(ctx.ready(result))
 }

@@ -35,6 +35,7 @@ use crate::contract::{Envelope, RefStatus, StatusResult};
 use crate::error::{IbaraError, Result};
 use crate::mcp::CallOutcome;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -477,6 +478,7 @@ impl Router {
                     None => Some(self.local_ok(StatusResult::Ref(ended(&r)), fleet.len())),
                 },
             },
+            "computer_begin" if reference("computer").is_none_or(|s|s.trim().is_empty()) => self.begin_any(call, message, &fleet).await,
             "computer_begin" => {
                 let target = match pick(&fleet, reference("computer").as_deref()) {
                     Ok(target) => target.clone(),
@@ -518,6 +520,68 @@ impl Router {
                 }
             }
         }
+    }
+
+    /// Ordinary work needs no machine name. Status probes are read-only; only one
+    /// begin is sent at a time. Its route is durable before sending any effects.
+    async fn begin_any(self: &Arc<Self>, call: &str, message: Map<String,Value>, fleet: &[Target]) -> Option<Map<String,Value>> {
+        if fleet.is_empty() {return Some(self.local_error(&no_computers(),0));}
+        let args=message["params"]["arguments"].clone();
+        let request=args["request_id"].as_str().filter(|s|!s.is_empty() && s.len()<=200);
+        let Some(request)=request else {return Some(self.local_error(&crate::error::invalid("request_id: give a nonempty request identity (at most 200 characters)."),fleet.len()));};
+        // Client identity is part of the operator namespace; no goal or login
+        // text is retained in the directory, only digests and a computer ID.
+        let identity=lock(&self.init).as_ref().and_then(|i|i.pointer("/clientInfo/name")).and_then(Value::as_str).unwrap_or("agent").to_string();
+        let key=format!("{:x}",Sha256::digest(format!("{identity}:{request}").as_bytes()));
+        let fingerprint=format!("{:x}",Sha256::digest(crate::store::canonical::canonicalize(&args).as_bytes()));
+        let route=|candidate:Option<&str>,refused:Option<&str>| -> Result<Option<String>> {
+            OperatorDirectory::open(self.database())?.auto_begin_route(&key,&fingerprint,candidate,refused)
+        };
+        let bound=match route(None,None) {Ok(bound)=>bound,Err(e)=>return Some(self.local_error(&e,fleet.len()))};
+        let answers=if bound.is_none() {self.ask_all(call,fleet,json!({})).await?} else {Vec::new()};
+        let mut ready:Vec<Target>=answers.iter().filter_map(|(t,a)|match a {
+            Answer::Result{envelope:Some(e),..} if e["status"]=="ok" && e.pointer("/result/access/capabilities/agents").and_then(Value::as_str)!=Some("deny")
+                && e.pointer("/result/computers").and_then(Value::as_array).is_some_and(|cs|cs.iter().any(|c|c["state"]=="ready"))=>Some(t.clone()),
+            _=>None,
+        }).collect();
+        // Stable request-specific ordering spreads unrelated agents across free
+        // computers; replay goes to the durable binding, regardless of readiness.
+        ready.sort_by_key(|t|Sha256::digest(format!("{key}:{}",t.computer_id).as_bytes()).to_vec());
+        let mut selected=bound;
+        let mut refused=None::<String>;
+        let mut last=None;
+        loop {
+            if selected.is_none() {
+                let Some(candidate)=ready.first().cloned() else {break;};
+                ready.remove(0);
+                selected=match route(Some(&candidate.computer_id),refused.as_deref()) {
+                    Ok(r)=>r,Err(e)=>return Some(self.local_error(&e,fleet.len()))
+                };
+            }
+            let id=selected.take().unwrap();
+            ready.retain(|t|t.computer_id!=id);
+            let Some(target)=fleet.iter().find(|t|t.computer_id==id) else {
+                return Some(self.local_error(&unreachable_route("The original computer for this request is unavailable. Inspect its task/receipt; do not start this request elsewhere."),fleet.len()));
+            };
+            let mut outgoing=message.clone();
+            outgoing.get_mut("params")?.get_mut("arguments")?.as_object_mut()?.insert("computer".into(),json!(target.cmp_id()));
+            let reply=self.send(call,target,outgoing).await?;
+            self.note_begin(target,&reply);
+            let envelope=reply.get("result").and_then(envelope_of);
+            let definitely_refused=envelope.as_ref().is_some_and(|e|e["status"]=="error"
+                && e.pointer("/result/task_ref").is_none()
+                && matches!(e.pointer("/error/code").and_then(Value::as_str),Some("BUSY"|"HUMAN_CONTROL"|"CONTROL_UNSETTLED")));
+            if !definitely_refused {return Some(reply);}
+            // A bound replay never selects a new host after an uncertain send.
+            // These three errors are pre-acquisition refusals, retained by the target.
+            refused=Some(id); last=Some(reply);
+        }
+        if let Some(reply)=last {return Some(reply);}
+        let states=answers.iter().map(|(t,a)|{
+            let state=match a {Answer::Result{envelope:Some(e),..}=>e.pointer("/result/computers/0/state").and_then(Value::as_str).unwrap_or("unavailable"),_=>"unreachable"};
+            format!("{}: {state}",t.label)
+        }).collect::<Vec<_>>().join(", ");
+        Some(self.local_error(&IbaraError::new("BUSY",format!("No free computer right now ({states}). Continue independent work; retry computer_begin without computer with a fresh request_id. No task started."),true),fleet.len()))
     }
 
     /// The computer that owns `reference`: remembered, named by it, the only one, or
@@ -809,6 +873,7 @@ fn ended(reference: &str) -> RefStatus {
         _ => "reference",
     };
     RefStatus {
+        details: None,
         reference: reference.to_string(),
         kind: kind.into(),
         state: "ended".into(),

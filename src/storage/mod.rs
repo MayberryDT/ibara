@@ -111,7 +111,9 @@ impl StorageOptions {
             max_file_bytes: DEFAULT_FILE_LIMIT,
             max_artifact_bytes: DEFAULT_FILE_LIMIT,
             max_output_chars: 12_000,
-            max_exec_timeout_ms: 1_800_000,
+            // No implicit build deadline. A caller may set one per command;
+            // an explicitly configured host cap remains enforceable.
+            max_exec_timeout_ms: 0,
             chunk_bytes: 1024 * 1024,
             min_free_bytes: 5 * 1024 * 1024 * 1024,
             warn_free_bytes: 15 * 1024 * 1024 * 1024,

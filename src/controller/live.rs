@@ -101,7 +101,7 @@ struct LiveDesktop {
 }
 
 fn surface(key: &WinKey) -> SurfaceId {
-    SurfaceId { address: key.address.clone(), pid: key.pid, class: key.class.clone() }
+    SurfaceId { address: key.address.clone(), pid: key.pid, class: key.class.clone(), process_start_ticks: key.process_start_ticks, compositor_instance: key.compositor_instance.clone() }
 }
 
 fn button(b: Button) -> desktop::Button {
@@ -151,6 +151,8 @@ impl DesktopPort for LiveDesktop {
                         address: w.address,
                         pid: w.pid,
                         class: w.class,
+                        process_start_ticks: w.process_start_ticks,
+                        compositor_instance: w.compositor_instance,
                         title: w.title,
                         floating: w.floating,
                         workspace: w.workspace.name,
@@ -165,6 +167,18 @@ impl DesktopPort for LiveDesktop {
 
     fn active_workspace(&self) -> LocalFuture<'_, Result<Option<WorkspaceRef>>> {
         Box::pin(self.desktop.active_workspace())
+    }
+
+    fn all_windows(&self) -> LocalFuture<'_, Result<Vec<Win>>> {
+        Box::pin(async move {
+            Ok(self.desktop.windows().await?.into_iter().map(|w| {
+                let g = w.geometry();
+                Win { address: w.address, pid: w.pid, class: w.class, title: w.title,
+                    process_start_ticks: w.process_start_ticks, compositor_instance: w.compositor_instance,
+                    focused: false, floating: w.floating, workspace: w.workspace.name,
+                    workspace_id: w.workspace.id, fullscreen: w.fullscreen != 0, rect: rect(g) }
+            }).collect())
+        })
     }
 
     fn close_window<'a>(&'a self, key: &'a WinKey) -> LocalFuture<'a, Result<()>> {

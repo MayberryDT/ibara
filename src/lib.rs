@@ -28,10 +28,11 @@ pub mod settings;
 pub mod wake;
 pub mod theme;
 
-/// `pkgver-pkgrel` for a packaged build (the PKGBUILD sets IBARA_PKGREL), `pkgver` otherwise.
+/// Packaged releases and private builds are visibly distinct. The build caller
+/// can bind a private build to its source manifest with IBARA_BUILD_ID.
 pub fn version() -> String {
     match option_env!("IBARA_PKGREL") {
         Some(rel) if !rel.is_empty() => format!("{}-{rel}", env!("CARGO_PKG_VERSION")),
-        _ => env!("CARGO_PKG_VERSION").to_string(),
+        _ => format!("{}-dev.{}", env!("CARGO_PKG_VERSION"), option_env!("IBARA_BUILD_ID").unwrap_or("local")),
     }
 }

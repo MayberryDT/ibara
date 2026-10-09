@@ -153,6 +153,7 @@ pub(super) struct JobHandle {
     pub request_id: String,
     pub principal: Option<String>,
     max_chars: usize,
+    limits: Option<(u64, i64)>,
     st: Mutex<JobState>,
     settled: watch::Sender<bool>,
 }
@@ -184,8 +185,8 @@ impl JobState {
 }
 
 impl JobHandle {
-    fn new(job_ref: String, task_ref: String, request_id: String, principal: Option<String>, max_chars: usize, st: JobState) -> Self {
-        JobHandle { job_ref, task_ref, request_id, principal, max_chars, st: Mutex::new(st), settled: watch::channel(false).0 }
+    fn new(job_ref: String, task_ref: String, request_id: String, principal: Option<String>, max_chars: usize, limits: Option<(u64, i64)>, st: JobState) -> Self {
+        JobHandle { job_ref, task_ref, request_id, principal, max_chars, limits, st: Mutex::new(st), settled: watch::channel(false).0 }
     }
 
     fn base_record(&self, state: &str) -> Map<String, Value> {
@@ -195,6 +196,14 @@ impl JobHandle {
         m.insert("task_ref".into(), json!(self.task_ref));
         m.insert("request_id".into(), json!(self.request_id));
         m.insert("state".into(), json!(state));
+        if let Some((runtime, deadline)) = self.limits {
+            m.insert("runtime_limit_ms".into(), json!(runtime));
+            m.insert("deadline_at".into(), json!(iso_from_millis(deadline)));
+            m.insert("deadline_ms".into(), json!(deadline));
+        } else {
+            m.insert("runtime_limit_ms".into(), Value::Null);
+            m.insert("deadline_at".into(), Value::Null);
+        }
         m
     }
 
@@ -332,11 +341,14 @@ impl StorageService {
                 return Err(fail("PERMISSION_DENIED", "Program is not in the task allowlist.", true));
             }
         }
-        let max_timeout = opts.max_exec_timeout_ms as f64;
-        let timeout = num_or(input, "timeout_ms", max_timeout);
-        let timeout = if timeout.is_nan() { timeout } else { timeout.min(max_timeout) };
-        if !timeout.is_finite() || timeout < 1.0 {
-            return Err(fail("INVALID_ARGUMENT", "timeout_ms is required.", true));
+        let max_timeout = (opts.max_exec_timeout_ms > 0).then_some(opts.max_exec_timeout_ms);
+        let timeout = match input.get("timeout_ms").filter(|v|!v.is_null()) {
+            Some(v) => Some(v.as_u64().filter(|n|*n>0 && *n<=i64::MAX as u64)
+                .ok_or_else(||fail("INVALID_ARGUMENT","timeout_ms must be a positive integer.",true))?),
+            None => max_timeout,
+        };
+        if timeout.zip(max_timeout).is_some_and(|(requested,max)|requested>max) {
+            return Err(fail("INVALID_ARGUMENT",format!("timeout_ms exceeds this host's configured {} ms limit.",max_timeout.unwrap()),true));
         }
         let max_out = opts.max_output_chars as f64;
         let max_chars = num_or(input, "max_output_chars", max_out).min(max_out);
@@ -367,8 +379,9 @@ impl StorageService {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(false);
+        let limits = timeout.map(|ms|(ms,self.clock().saturating_add(ms as i64)));
         let mk = |st: JobState| {
-            Arc::new(JobHandle::new(job_ref.clone(), ctx.task_ref.clone(), request_id.clone(), Some(ctx.principal.clone()), max_chars, st))
+            Arc::new(JobHandle::new(job_ref.clone(), ctx.task_ref.clone(), request_id.clone(), Some(ctx.principal.clone()), max_chars, limits, st))
         };
         let blank = JobState {
             state: "running".into(),
@@ -422,11 +435,11 @@ impl StorageService {
             h.clone(),
             child,
             stdin,
-            Duration::from_secs_f64(timeout / 1000.0),
+            timeout.map(Duration::from_millis),
             ctx.signal.clone(),
         ));
         let background = input.get("background") == Some(&Value::Bool(true));
-        let wait_ms = if background { 0 } else { opts.initial_wait_ms.min(timeout as u64) };
+        let wait_ms = if background { 0 } else { timeout.map_or(opts.initial_wait_ms,|ms|opts.initial_wait_ms.min(ms)) };
         let _ = tokio::time::timeout(Duration::from_millis(wait_ms), settled_rx.wait_for(|v| *v)).await;
         let mut st = h.st.lock();
         if st.settled {
@@ -449,7 +462,7 @@ impl StorageService {
         h: Arc<JobHandle>,
         mut child: Child,
         stdin: Option<Vec<u8>>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         mut signal: Option<watch::Receiver<bool>>,
     ) {
         let stdin_pipe = child.stdin.take();
@@ -474,7 +487,7 @@ impl StorageService {
             status
         };
         tokio::pin!(io);
-        let sleep = tokio::time::sleep(timeout);
+        let sleep = async { match timeout {Some(duration)=>tokio::time::sleep(duration).await,None=>std::future::pending::<()>().await} };
         tokio::pin!(sleep);
         let mut timer_fired = false;
         let status = loop {
@@ -678,6 +691,31 @@ impl StorageService {
         !self.active_jobs(task_ref).is_empty()
     }
 
+    pub fn active_job_count(&self, task_ref: Option<&str>) -> usize {
+        self.active_jobs(task_ref).len()
+    }
+
+    pub fn uncertain_job_count(&self, task_ref: Option<&str>) -> usize {
+        self.active_jobs(task_ref).iter().filter(|h|h.st.lock().state=="unknown").count()
+    }
+
+    /// A parent may exit before a redirected descendant. Recheck physical
+    /// quiescence without claiming that an unknown historical effect succeeded.
+    pub fn refresh_job_quiescence(&self) -> Result<()> {
+        for h in self.active_jobs(None) {
+            let mut st = h.st.lock();
+            if st.state == "unknown" && st.identity.as_ref().is_some_and(|i|inspect_process_group(i)==ProcessGroupVerdict::Dead) {
+                let mut record=st.record.clone().unwrap_or_else(||h.base_record("unknown"));
+                record.insert("termination_confirmed".into(),json!(true));
+                st.record=Some(record);
+                self.persist_job(&h,&st)?;
+            }
+            drop(st);
+            self.retire_if_inactive(&h);
+        }
+        Ok(())
+    }
+
     /// storage.ts:1453-1459: SIGKILL the owned processes of running jobs.
     pub(super) fn kill_running_jobs_now(&self) {
         for h in self.inner.jobs.lock().values() {
@@ -693,10 +731,21 @@ impl StorageService {
 
     /// storage.ts:2179-2184 `jobRecord`.
     fn job_record(&self, job_ref: &str) -> Result<Option<Value>> {
-        if let Some(h) = self.inner.jobs.lock().get(job_ref).cloned()
-            && let Some(r) = h.st.lock().record.clone()
-        {
-            return Ok(Some(Value::Object(r)));
+        let live = self.inner.jobs.lock().get(job_ref).cloned();
+        if let Some(h) = live {
+            let st = h.st.lock();
+            if let Some(mut r) = st.record.clone() {
+                if st.state == "running" {
+                    // Pumps already bound these buffers. A status read must see
+                    // progress without rewriting durable state for every byte.
+                    let (stdout, t1) = sanitize_log(&st.stdout, h.max_chars);
+                    let (stderr, t2) = sanitize_log(&st.stderr, h.max_chars);
+                    r.insert("stdout".into(), json!(stdout));
+                    r.insert("stderr".into(), json!(stderr));
+                    r.insert("output_truncated".into(), json!(st.truncated || t1 || t2));
+                }
+                return Ok(Some(Value::Object(r)));
+            }
         }
         self.with_db(|db| {
             let text: Option<String> =
@@ -870,6 +919,8 @@ impl StorageService {
                 _ => Dead,
             };
             let confirmed = verdict == Dead;
+            let limits = record.get("runtime_limit_ms").and_then(Value::as_u64)
+                .zip(record.get("deadline_ms").and_then(Value::as_i64));
             let mut next = record;
             next.insert("state".into(), json!("unknown"));
             next.insert("termination_confirmed".into(), json!(confirmed));
@@ -888,7 +939,7 @@ impl StorageService {
                 truncated: truncated != 0,
                 settled: true,
             };
-            let h = Arc::new(JobHandle::new(job_ref.clone(), task_ref, request_id, principal, self.inner.opts.max_output_chars, st));
+            let h = Arc::new(JobHandle::new(job_ref.clone(), task_ref, request_id, principal, self.inner.opts.max_output_chars, limits, st));
             {
                 let st = h.st.lock();
                 self.persist_job(&h, &st)?;

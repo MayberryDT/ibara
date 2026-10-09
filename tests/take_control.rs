@@ -119,6 +119,7 @@ esac
 /// Hyprland with one unlocked screen.
 const FAKE_HYPRCTL: &str = r#"#!/bin/sh
 case "$*" in
+  *instances*) echo '[{"instance":"hypr-e2e","pid":1}]' ;;
   *monitors*) echo '[{"id":0,"name":"IbaraVirtual","width":1920,"height":1080,"x":0,"y":0,"scale":1.0,"focused":true,"solitaryBlockedBy":[],"activeWorkspace":{"id":1,"name":"1"}}]' ;;
   *) echo '[]' ;;
 esac
@@ -347,6 +348,13 @@ signal.pause()
     let began = agent.call(&world, "computer_begin", json!({"request_id":"takeover-begin", "goal":"Take over, then press Done"}));
     assert_eq!(began["status"], "ok", "{began}");
     let task = began["result"]["task_ref"].as_str().unwrap().to_string();
+    // A running job, not only a held approval, must settle at human takeover.
+    let workspace=PathBuf::from(began["result"]["workspace"].as_str().unwrap());
+    let running=agent.call(&world,"computer_exec",json!({"task_ref":task,"request_id":"takeover-running","background":true,"timeout_ms":60000,
+        "command":["/bin/sh","-c","sleep 55 & echo $! > takeover-child; echo started >> takeover-starts; wait"]}));
+    assert_eq!(running["status"],"pending","{running}");
+    let child_pid=wait_for("managed descendant starts",5,||fs::read_to_string(workspace.join("takeover-child")).ok().and_then(|s|s.trim().parse::<i64>().ok()));
+    let mut sentinel=Command::new("sleep").arg("55").spawn().unwrap();
     let asked = agent.call(&world, "computer_checkpoint", json!({"task_ref":task,"ask":{"question":"Take over, then press Done","options":["Done"]}}));
     let attention = asked["result"]["attention"].as_str().unwrap().to_string();
     let held_args = json!({"task_ref":task,"request_id":"held-step", "command":["/bin/true"], "effect":"send"});
@@ -373,11 +381,21 @@ signal.pause()
 
     // Take Control: the viewer, and only the viewer, gets a ticket issued for this console's certificate.
     let taken = control(&mut vesper, &id, &e, "take_control");
+    assert!(ibara::storage::read_process_stat(child_pid).is_none_or(|s|s.state=="Z" || s.state=="X"),"owned descendant survived takeover");
+    assert!(sentinel.try_wait().unwrap().is_none(),"unrelated process was stopped");
+    sentinel.kill().unwrap();sentinel.wait().unwrap();
     let pending = vesper.ok("fleet-attention", &["--fresh", &id]);
     assert!(pending.to_string().contains(&attention), "the question stays in the console: {pending}");
     assert!(!pending.to_string().contains(&approval), "the held step expires: {pending}");
     let still_waiting = agent.receive(&world, waiting);
     assert_eq!(still_waiting["status"], "pending", "a wait started before takeover stays open: {still_waiting}");
+    let stopped=agent.call(&world,"computer_status",json!({"ref":running["result"]["op_ref"]}));
+    assert_eq!(stopped["result"]["details"]["termination_confirmed"],true,"{stopped}");
+    assert_eq!(fs::read_to_string(workspace.join("takeover-starts")).unwrap(),"started\n");
+    if let Some(dir)=std::env::var_os("IBARA_E2E_ARTIFACTS") {
+        let dir=PathBuf::from(dir);fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("takeover-managed-group.json"),serde_json::to_vec_pretty(&json!({"kind":"daemon_operator_e2e","native_input":false,"running":running,"stopped":stopped,"unrelated_sentinel_survived":true})).unwrap()).unwrap();
+    }
     let refused = agent.call(&world, "computer_exec", json!({"task_ref":task,"request_id":"during-takeover", "command":["/bin/true"]}));
     assert_eq!(refused["error"]["code"], "HUMAN_CONTROL", "{refused}");
     assert!(refused["error"]["next"].as_str().unwrap().contains("Hand Back"), "{refused}");

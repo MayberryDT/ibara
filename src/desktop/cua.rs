@@ -138,8 +138,6 @@ pub fn dispatch_count() -> u64 {
 /// A window's only enabled editable text element, as one read found it.
 #[derive(Debug, Clone)]
 pub struct Field {
-    token: Option<String>,
-    password: bool,
     /// Its box as Cua gives it: x, y, width, height.
     frame: Option<[f64; 4]>,
     /// The read was whole, so the window has no other.
@@ -215,6 +213,8 @@ struct Inner {
     yielded: AtomicBool,
     /// A read in flight, which a person's move may stop.
     reading: Mutex<Reading>,
+    // One bounded native snapshot; actions still resolve against fresh state.
+    elements_page: Mutex<Option<(i64, u64, Option<String>, Instant, Tree)>>,
 }
 
 /// A read or picture in flight, for [`Cua::hide_cursor_now`].
@@ -265,6 +265,7 @@ impl Cua {
                 shown: AtomicBool::new(false),
                 yielded: AtomicBool::new(false),
                 reading: Mutex::new(Reading::None),
+                elements_page: Mutex::new(None),
             }),
         }
     }
@@ -272,6 +273,9 @@ impl Cua {
     /// The agent whose cursor subsequent actions show (`codex@vesper`), or
     /// none. Clearing it closes the cursor at the next idle check.
     pub fn set_agent(&self, label: Option<String>) {
+        if self.agent() != label {
+            *self.inner.elements_page.lock().unwrap_or_else(|p|p.into_inner()) = None;
+        }
         *self.inner.agent.lock().unwrap_or_else(|p| p.into_inner()) = label;
     }
 
@@ -545,7 +549,16 @@ impl Cua {
 
     /// One page of compact, ranked elements.
     pub async fn elements(&self, pid: i64, window: u64, query: Option<&str>, limit: u32, cursor: Option<u32>) -> Result<ElementPage> {
-        let tree = self.tree(pid, window).await?;
+        let tree = if cursor.is_some() {
+            self.inner.elements_page.lock().unwrap_or_else(|p|p.into_inner()).as_ref()
+                .filter(|(p,w,q,at,_)|*p==pid && *w==window && q.as_deref()==query && at.elapsed()<Duration::from_secs(30))
+                .map(|(_,_,_,_,tree)|tree.clone())
+                .ok_or_else(||stale("Native observation snapshot expired or changed; observe without cursor."))?
+        } else {
+            let tree=self.tree(pid, window).await?;
+            *self.inner.elements_page.lock().unwrap_or_else(|p|p.into_inner())=Some((pid,window,query.map(str::to_owned),Instant::now(),tree.clone()));
+            tree
+        };
         Ok(page(tree, query, limit, cursor))
     }
 
@@ -836,8 +849,6 @@ impl Cua {
         let [element] = editable.as_slice() else { return Ok(None) };
         let frame = &element["frame"];
         Ok(Some(Field {
-            token: element["element_token"].as_str().map(str::to_string),
-            password: element["role"].as_str() == Some("password text"),
             frame: match (frame["x"].as_f64(), frame["y"].as_f64(), frame["w"].as_f64(), frame["h"].as_f64()) {
                 (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some([x, y, w, h]),
                 _ => None,
@@ -854,29 +865,10 @@ impl Cua {
         self.only_field(pid, window, FIELD_LOOK).await.ok().flatten().filter(|f| f.whole)
     }
 
-    /// The element [`Cua::type_semantic`] inserts text into, from a read of
+    /// The sole editable field for native Unicode paste, from a read of
     /// the whole window.
     pub async fn insert_field(&self, pid: i64, window: u64) -> Result<Option<Field>> {
         self.only_field(pid, window, WALK_BUDGET).await
-    }
-
-    /// Text with non-ASCII characters, inserted through accessibility into the
-    /// window's only editable text element (`field`, from [`Cua::insert_field`]).
-    pub async fn type_semantic(&self, pid: i64, window: u64, field: Option<&Field>, text: &str) -> Result<()> {
-        let Some(field) = field else {
-            return Err(unavailable(
-                "Cua types only ASCII into windows. Text with other characters needs exactly one editable text element in the window; this one has none or several.",
-            )
-            .with("reason", "non_ascii_text")
-            // A property of this window, which later agents should know.
-            .with("about", "app"));
-        };
-        if field.password {
-            return Err(unavailable("ibara does not type non-ASCII text into password fields.").with("reason", "password_field"));
-        }
-        let token = field.token.as_deref().ok_or_else(|| stale("Element has no token."))?;
-        let args = json!({"pid": pid, "window_id": window, "element_token": token, "text": text});
-        self.call("type_text", args, true, ACT_TIMEOUT).await.map(|_| ())
     }
 
     /// Move only the agent's cursor, in the overlay's (screen) coordinates;
@@ -1569,8 +1561,12 @@ fn refused_by(tool: &str, sc: &Value, text: &str) -> IbaraError {
             Some("Wait until the person stops, observe again, then try again.".into()),
         ),
         "constraint" => (
-            unavailable("Cua refused: an app has locked or confined the pointer."),
-            Some(format!("Press Escape (kind key) so the app lets go of the pointer, then try again. {KEYS_INSTEAD}")),
+            unavailable("Cua refused: the pointer constraint does not belong to this exact focused target, changed during input, or does not support this action."),
+            Some("Observe the focused window again. Keys and clicks work only with that window's own pointer lock; confinement and locked dragging are unsupported. If the owner cannot be safely identified, finish partial and ask the person to release the constraint. Do not retry through another input route.".into()),
+        ),
+        "primary_binding" => (
+            unavailable("Cua could not verify this window's primary input resources, or they changed during the action. This does not establish that another person or task owns the computer."),
+            Some("Observe again before retrying. If the same binding refusal persists, finish partial and report it for input diagnostics; switching between keys and clicks cannot repair it. A task-owned app opened before the input plugin loaded may need to be closed and reopened after preserving its work.".into()),
         ),
         "physical_pointer" => (
             unavailable("Cua refused: this computer has no mouse, and its desktop session started before ibara's own pointer was installed."),

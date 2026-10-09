@@ -21,6 +21,8 @@
 #include <src/managers/input/InputManager.hpp>
 #include <src/pointer/PointerManager.hpp>
 #include <src/protocols/core/Seat.hpp>
+#include <src/protocols/PointerConstraints.hpp>
+#include <src/protocols/VirtualPointer.hpp>
 #include <src/protocols/core/DataDevice.hpp>
 #include <src/layout/LayoutManager.hpp>
 #include <src/desktop/view/Popup.hpp>
@@ -231,6 +233,8 @@ struct InputExperiment::Impl {
     Clock::time_point expires{};
     InputGrant grant;
     std::optional<Drag> drag;
+    std::optional<Clock::time_point> key_release_at;
+    std::vector<CHyprSignalListener> pulse_input_listeners;
     std::uint32_t held_button = 0;
     std::vector<std::uint32_t> held_keys;
     xkb_context* xkb_context_ = nullptr;
@@ -247,7 +251,10 @@ struct InputExperiment::Impl {
     bool foreground_keyboard_used = false;
     bool foreground_needs_pointer = false;
     WP<CWLSurfaceResource> foreground_surface;
-    WP<CWLSeatResource> foreground_seat;
+    std::vector<WP<CWLSeatResource>> primary_seats, foreground_seats;
+    CHyprSignalListener primary_seat_added;
+    WP<CPointerConstraint> foreground_lock;
+    bool foreground_locked = false;
     std::vector<WP<CWLPointerResource>> foreground_pointers;
     std::vector<WP<CWLKeyboardResource>> foreground_keyboards;
     std::array<std::uint32_t, 4> foreground_modifiers{};
@@ -361,6 +368,12 @@ struct InputExperiment::Impl {
                 seat->wl->sendCapabilities(static_cast<wl_seat_capability>(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD));
     }
     void start() {
+        // Only Hyprland's typed seat event supplies native resources. Never
+        // reinterpret arbitrary wl_seat userdata (including independent seats).
+        primary_seat_added = PROTO::seat->m_events.newSeatResource.listen([this](SP<CWLSeatResource> seat) {
+            std::erase_if(primary_seats, [](const auto& s) { return !s || !s->good(); });
+            if (primary_seats.size() < kMaxResources) primary_seats.push_back(seat);
+        });
         sync_keymap();
         timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, tick, this);
         if (!timer) throw std::runtime_error("input timer registration failed");
@@ -422,6 +435,7 @@ struct InputExperiment::Impl {
         // callbacks until compositor exit; input-enabled modules are NODELETE.
         suspend("plugin_shutdown");
         keymap_listener.reset();
+        primary_seat_added.reset();
         retired = true;
         for (auto& seat : seats)
             if (!seat->dead && seat->wl->resource())
@@ -640,6 +654,9 @@ struct InputExperiment::Impl {
     }
     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
+        if (key_release_at && lease && !lease->dead)
+            send(*lease, failure.reason == ForegroundFailureReason::none ? refusal("foreground_partial_unknown") :
+                refusal("foreground_partial_unknown", failure));
         if (drag && drag->client && !drag->client->dead) {
             // ibara: a click still travelling or resting sent no button, so it
             // is refused with its cause, as upstream refuses before its press.
@@ -782,36 +799,56 @@ struct InputExperiment::Impl {
     bool point(Client& c, double x, double y) const {
         return std::isfinite(x) && std::isfinite(y) && x >= 0 && y >= 0 && x < c.geometry[2] && y < c.geometry[3];
     }
-    bool unique_primary_seat(wl_client* client) const {
-        struct Scan {
-            const Impl* self;
-            ForegroundSeatBindings bindings;
-        } scan{this, {}};
-        // Hyprland's public lookup returns only the first primary binding.
-        // Count classes without casting arbitrary protocol user data. Agent
-        // seats are excluded only by exact resource identity, never by name.
+    struct PrimaryBindings {
+        std::vector<WP<CWLSeatResource>> seats;
+        std::vector<WP<CWLPointerResource>> pointers;
+        std::vector<WP<CWLKeyboardResource>> keyboards;
+        unsigned resource_count = 0;
+        bool valid() const { return !seats.empty() && seats.size() == resource_count; }
+    };
+    PrimaryBindings primary_bindings(wl_client* client) const {
+        struct Scan { const Impl* self; unsigned count = 0; } scan{this};
         wl_client_for_each_resource(client, [](wl_resource* resource, void* data) {
             auto& scan = *static_cast<Scan*>(data);
-            const std::string_view resource_class = wl_resource_get_class(resource);
-            if (resource_class != "wl_seat") return WL_ITERATOR_CONTINUE;
-            bool owned = false;
+            if (std::string_view(wl_resource_get_class(resource)) != "wl_seat") return WL_ITERATOR_CONTINUE;
             for (const auto* peer : scan.self->peers) {
                 if (!peer) continue;
                 for (const auto& seat : peer->seats)
-                    if (seat->wl->resource() == resource) { owned = true; break; }
-                if (owned) break;
+                    if (seat->wl->resource() == resource) return WL_ITERATOR_CONTINUE;
             }
-            scan.bindings.observe(resource_class, owned);
+            ++scan.count;
             return WL_ITERATOR_CONTINUE;
         }, &scan);
-        if (!scan.bindings.unique()) return false;
+        PrimaryBindings result;
+        result.resource_count = scan.count;
+        const auto add = [&](const SP<CWLSeatResource>& seat) {
+            if (!seat || !seat->good() || seat->client() != client) return;
+            if (std::ranges::any_of(result.seats, [&](const auto& s) { return s.lock() == seat; })) return;
+            result.seats.push_back(seat);
+            for (const auto& p : seat->m_pointers) if (p && p->good()) result.pointers.push_back(p);
+            for (const auto& k : seat->m_keyboards) if (k && k->good()) result.keyboards.push_back(k);
+        };
+        // The public lookup seeds clients that predate plugin loading. Extra
+        // unobserved bindings fail closed, rather than guessing their identity.
+        add(g_pSeatManager->seatResourceForClient(client));
+        for (const auto& seat : primary_seats) add(seat.lock());
+        return result;
+    }
+    bool primary_bindings_match(wl_client* client) const {
+        const auto current = primary_bindings(client);
+        if (!current.valid()) return false;
         if (!foreground_started) return true;
-        // A release/rebind or new child resource during a drag must not leave
-        // our captured delivery set different from the primary seat's set.
-        const auto seat = g_pSeatManager->seatResourceForClient(client);
-        if (!seat || seat != foreground_seat.lock()) return false;
-        return foreground_resources_match(seat->m_pointers, foreground_pointers) &&
-            foreground_resources_match(seat->m_keyboards, foreground_keyboards);
+        return foreground_resources_match(current.seats, foreground_seats) &&
+            foreground_resources_match(current.pointers, foreground_pointers) &&
+            foreground_resources_match(current.keyboards, foreground_keyboards);
+    }
+    SP<CPointerConstraint> own_pointer_lock(const Client& c) const {
+        const auto root = c.surface.lock();
+        if (!root || Desktop::focusState()->surface() != root || Desktop::focusState()->window() != c.window.lock() ||
+            g_pSeatManager->m_state.keyboardFocus != root || g_pSeatManager->m_state.pointerFocus != root) return nullptr;
+        const auto surface = Desktop::View::CWLSurface::fromResource(root);
+        const auto constraint = surface ? surface->constraint() : nullptr;
+        return constraint && constraint->isActive() && constraint->isLocked() && constraint->owner() == surface ? constraint : nullptr;
     }
     // ibara: the seat grab is one of the target's own popups (a GTK popover
     // or menu of this window). Hyprland's xdg-shell grab holds each grabbing
@@ -866,7 +903,7 @@ struct InputExperiment::Impl {
         const bool exact_root = geometry && *geometry == c.geometry;
         return {
             .exact_root = exact_root,
-            .primary_binding = !exact_root || unique_primary_seat(root->client()),
+            .primary_binding = !exact_root || primary_bindings_match(root->client()),
             .peer_conflict = agent_conflict(c),
             .physical_keys = pressed,
             .physical_buttons = g_pInputManager->hasHeldButtons(),
@@ -875,11 +912,30 @@ struct InputExperiment::Impl {
             .grab = (g_pSeatManager->m_seatGrab && !own_grab(root)) || bool(g_layoutManager->dragController()->target()) ||
                 !g_pInputManager->m_exclusiveLSes.empty(),
             .dnd = PROTO::data && PROTO::data->dndActive(),
-            .constraint = g_pInputManager->isConstrained(),
+            .constraint = g_pInputManager->isConstrained() && !own_pointer_lock(c),
             .exact_keyboard_focus = own_surface(root, g_pSeatManager->m_state.keyboardFocus.lock()) &&
                 Desktop::focusState()->window() == c.window.lock() && Desktop::focusState()->surface() == root,
             .exact_pointer_focus = own_surface(root, g_pSeatManager->m_state.pointerFocus.lock()),
         };
+    }
+    void watch_pulse_pointer_input() {
+        // Locked/subpixel motion need not change Hyprland's floored cursor
+        // position. Observe real device events, not simulated refocus/warps.
+        const auto stop = [this] { if (key_release_at) cancel_authority("interrupted"); };
+        for (const auto& pointer : g_pInputManager->m_pointers) {
+            pulse_input_listeners.push_back(pointer->m_pointerEvents.motion.listen([stop](const IPointer::SMotionEvent& event) {
+                if (event.delta != Vector2D{} || event.unaccel != Vector2D{}) stop();
+            }));
+            pulse_input_listeners.push_back(pointer->m_pointerEvents.motionAbsolute.listen([stop](const IPointer::SMotionAbsoluteEvent&) { stop(); }));
+            pulse_input_listeners.push_back(pointer->m_events.destroy.listen(stop));
+        }
+        pulse_input_listeners.push_back(g_pCompositor->m_aqBackend->events.newPointer.listen([stop](const auto&) { stop(); }));
+        pulse_input_listeners.push_back(PROTO::virtualPointer->m_events.newPointer.listen([stop](const auto&) { stop(); }));
+    }
+    void require_lock_unchanged(const Client& c) const {
+        if (foreground_started && (bool(own_pointer_lock(c)) != foreground_locked ||
+            (foreground_locked && own_pointer_lock(c) != foreground_lock.lock())))
+            throw ForegroundFailure{ForegroundFailureReason::constraint};
     }
     void require_foreground(Client& c) {
         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
@@ -887,11 +943,14 @@ struct InputExperiment::Impl {
         if (!available()) throw ForegroundFailure{ForegroundFailureReason::session_unavailable};
         if (!layout_qualified()) throw ForegroundFailure{ForegroundFailureReason::unsupported_layout};
         if (Clock::now() >= expires) throw ForegroundFailure{ForegroundFailureReason::lease_expired};
+        require_lock_unchanged(c);
         const auto failure = foreground_guard(c).dispatch_failure(foreground_needs_pointer);
         if (failure != ForegroundFailureReason::none) throw ForegroundFailure{failure};
     }
     void finish_foreground() {
         foreground_activating = false;
+        key_release_at.reset();
+        pulse_input_listeners.clear();
         if (!foreground_started) return;
         // Release only our own synthetic state, and only while these resources
         // still address the original root or its own popup. A focus loss must
@@ -910,7 +969,8 @@ struct InputExperiment::Impl {
                     k->sendMods(foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], foreground_modifiers[3]);
                 }
         held_button = 0; held_keys.clear();
-        foreground_pointers.clear(); foreground_keyboards.clear(); foreground_surface.reset(); foreground_seat.reset();
+        foreground_pointers.clear(); foreground_keyboards.clear(); foreground_surface.reset(); foreground_seats.clear();
+        foreground_lock.reset(); foreground_locked = false;
         foreground_started = false;
         foreground_keyboard_used = false;
     }
@@ -922,13 +982,13 @@ struct InputExperiment::Impl {
         if (!physical) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
         if (!keyboard_state) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
         if (needs_pointer && !g_pSeatManager->m_mouse) throw ForegroundFailure{ForegroundFailureReason::physical_pointer};
-        const auto hit = needs_pointer ? pointer_hit(c, x, y) : PointerHit{};
-        if (needs_pointer && !hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
-        const auto seat = g_pSeatManager->seatResourceForClient(root->client());
-        if (!seat || !seat->good()) throw ForegroundFailure{ForegroundFailureReason::seat_resource};
-        foreground_pointers.clear(); foreground_keyboards.clear();
-        for (const auto& p : seat->m_pointers) if (p && p->good()) foreground_pointers.push_back(p);
-        for (const auto& k : seat->m_keyboards) if (k && k->good()) foreground_keyboards.push_back(k);
+        const auto lock = own_pointer_lock(c);
+        const auto hit = needs_pointer && !lock ? pointer_hit(c, x, y) : PointerHit{};
+        if (needs_pointer && !lock && !hit.surface) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+        const auto bindings = primary_bindings(root->client());
+        if (!bindings.valid()) throw ForegroundFailure{ForegroundFailureReason::primary_binding};
+        foreground_pointers = bindings.pointers;
+        foreground_keyboards = bindings.keyboards;
         if (needs_pointer && foreground_pointers.empty()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
         if (foreground_keyboards.empty()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
         foreground_modifiers = {physical->m_modifiersState.depressed, physical->m_modifiersState.latched,
@@ -951,7 +1011,9 @@ struct InputExperiment::Impl {
         }
         xkb_state_update_mask(keyboard_state, foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], 0, 0, foreground_modifiers[3]);
         foreground_surface = root;
-        foreground_seat = seat;
+        foreground_seats = bindings.seats;
+        foreground_lock = lock;
+        foreground_locked = bool(lock);
         foreground_needs_pointer = needs_pointer;
         c.foreground_attempted = true;
         foreground_started = true;
@@ -966,7 +1028,8 @@ struct InputExperiment::Impl {
         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
         const auto focus_failure = foreground_guard(c).dispatch_failure(false);
         if (focus_failure != ForegroundFailureReason::none) throw ForegroundFailure{focus_failure};
-        if (!needs_pointer) { require_foreground(c); return; }
+        require_lock_unchanged(c);
+        if (!needs_pointer || lock) { require_foreground(c); return; }
         foreground_activating = true;
         warp_pointer({x + c.geometry[0], y + c.geometry[1]});
         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
@@ -1000,6 +1063,7 @@ struct InputExperiment::Impl {
     // Points on the way may lie over the target's own subsurfaces; only the
     // press point must hit the root or its popup itself (checked on arrival).
     void travel_motion(Client& c, double x, double y) {
+        require_lock_unchanged(c);
         const auto root = c.surface.lock();
         if (!root || !point(c, x, y)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
         auto hit = pointer_hit(c, x, y);
@@ -1152,7 +1216,7 @@ struct InputExperiment::Impl {
 #endif
         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
-            if (drag) { send(c, refusal("invalid_request")); return; }
+            if (drag || key_release_at) { send(c, refusal("invalid_request")); return; }
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
             if (f.size() != (kProduction ? 4u : 3u)) {
@@ -1228,7 +1292,7 @@ struct InputExperiment::Impl {
         if (!available()) { revoke("session_unavailable", true); send(c, refusal("session_unavailable")); return; }
         if (!layout_qualified()) { revoke("unsupported_layout", true); send(c, refusal("unsupported_layout")); return; }
         if (lease && Clock::now() >= expires) revoke("lease_expired");
-        if (drag) { send(c, refusal("lease_busy")); return; }
+        if (drag || key_release_at) { send(c, refusal("lease_busy")); return; }
         if (lease != &c || !(capabilities & cap) || (kProduction && !grant.permits(cap, Clock::now()))) {
             if (kProduction) {
                 revoke("action_not_admitted");
@@ -1321,6 +1385,22 @@ struct InputExperiment::Impl {
             }
         }
         if (!consume_grant(c, cap)) return;
+        if (command == "CLICK" && own_pointer_lock(c)) {
+            // A locked pointer has no absolute destination. Preserve its lock,
+            // focus and position; deliver the button on the captured primary
+            // resources exactly as the compositor does for a physical click.
+            start_foreground(c, x, y, true, false);
+            for (unsigned i = 0; i < clicks; ++i) {
+                foreground_button(c, code, true); foreground_button(c, code, false);
+            }
+            require_foreground(c);
+            ++dispatches;
+            complete_action();
+            send(c, kForegroundDelivered);
+            return;
+        }
+        if ((command == "DRAG" || command == "SCROLL") && own_pointer_lock(c))
+            throw ForegroundFailure{ForegroundFailureReason::constraint};
         if (command == "CLICK") {
             // ibara: start where the pointer is (kept inside the window), then
             // travel, rest and press from step(). The reply follows the release.
@@ -1347,7 +1427,15 @@ struct InputExperiment::Impl {
         if (command == "KEY") {
             const std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
             for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && keys[i] != code) foreground_key(c, keys[i], true);
-            foreground_key(c, code, true); foreground_key(c, code, false);
+            // Frame-polled games miss a down/up in the same compositor turn.
+            // Keep plain locked keys down for 100 ms; Escape and chords stay
+            // immediate. Existing grant/target/takeover cleanup owns the key.
+            const bool pulse = foreground_locked && mods == 0 && code != KEY_ESC;
+            if (pulse && Clock::now() + std::chrono::milliseconds(100) >= expires)
+                throw ForegroundFailure{ForegroundFailureReason::lease_expired};
+            foreground_key(c, code, true);
+            if (pulse) { key_release_at = Clock::now() + std::chrono::milliseconds(100); watch_pulse_pointer_input(); return; }
+            foreground_key(c, code, false);
             for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && keys[i] != code) foreground_key(c, keys[i], false);
         } else if (command == "SCROLL") {
             require_foreground(c);
@@ -1407,6 +1495,18 @@ struct InputExperiment::Impl {
         if (!retired) sync_keymap();
         for (auto& c : clients) if (c->deadline.expired(c->hello, Clock::now())) c->dead = true;
         guard_targets();
+        if (key_release_at && lease) {
+            require_foreground(*lease);
+            if (Clock::now() >= *key_release_at) {
+                auto* client = lease;
+                const auto keys = held_keys;
+                for (auto i = keys.rbegin(); i != keys.rend(); ++i) foreground_key(*client, *i, false);
+                require_foreground(*client);
+                key_release_at.reset();
+                ++dispatches;
+                complete_action(); send(*client, kForegroundDelivered);
+            }
+        }
         if (drag) {
             const auto d = *drag;
             const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - d.start).count();

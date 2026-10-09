@@ -766,6 +766,7 @@ const WINDOWS_HYPRCTL: &str = r#"#!/bin/sh
 here="$(dirname "$0")"
 address=$(printf '%s' "$*" | sed -n "s/.*w.address == '\(0x[0-9a-f]*\)'.*/\1/p")
 case "$*" in
+  *instances*) echo '[{"instance":"windows-fixture","pid":1}]' ;;
   *hl.dsp.window.close*)
     grep -v "^$address " "$here/clients" > "$here/clients.new"; mv "$here/clients.new" "$here/clients" ;;
   *hl.dsp.window.move*)

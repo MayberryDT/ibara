@@ -15,6 +15,12 @@ pub fn site(input: &str) -> Result<String> {
     Ok(domain.to_string())
 }
 
+/// Google sessions are established independently on each machine. This guard
+/// is used before source export and receiver import, including federated routes.
+pub fn independent_site(name: &str) -> bool {
+    site(name).is_ok_and(|s| matches!(s.as_str(), "google.com" | "gmail.com"))
+}
+
 /// What a site did with the last login shared for it: `worked` or
 /// `site_rejected`, with when (Unix milliseconds).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

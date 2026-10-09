@@ -71,7 +71,7 @@ fn takes_action(op: &str) -> bool {
         || is_control(op)
         || matches!(op,"pairing_confirm"|"access_set"|"access_remove"|"access_unpair"|"answer_attention"|"viewer_register"|"viewer_ticket"|"observe_video")
         || CLIPBOARD_OPS.contains(&op)
-        || matches!(op, "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer" | "login_remove" | "login_probe")
+        || matches!(op, "login_configure" | "login_pending" | "login_deliver" | "login_report" | "login_answer" | "login_remove" | "login_probe" | "login_assist" | "login_authorize_once")
         || crate::controller::EVERYDAY_OPS.contains(&op)
 }
 

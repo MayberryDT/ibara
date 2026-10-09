@@ -218,6 +218,7 @@ struct BrowserStep {
     window: WinKey,
     /// The page element: `{tabId, documentId, capture, token}`.
     target: Option<Value>,
+    opens_file_chooser: bool,
     op: BrowserOp,
 }
 
@@ -337,6 +338,34 @@ impl Controller {
             let _: BeginInput = parse_input(tool,args)?;
             if let Some(pending)=self.access_gate(agent,"agents",args)? {
                 return Ok(access_pending(tool, args, pending));
+            }
+        }
+        // Transport pings prove connection liveness, not task work. Only a
+        // task-bound call can renew a disposable desktop's work deadline.
+        if (self.disposable_desktop)() && matches!(tool, "computer_observe" | "computer_act" | "browser_act" | "computer_exec" | "computer_files" | "computer_wait" | "computer_checkpoint") {
+            // Validate before renewing: malformed requests are not useful work.
+            let bounded = match tool {
+                "computer_observe" => { let _: ObserveInput = parse_input(tool, args)?; 0 }
+                "computer_act" => {
+                    let input: ActInput = parse_input(tool, args)?;
+                    input.into_steps().iter().map(|s| s.expect.as_ref().map_or(0, |e| super::checks::default_within(e).as_millis() as i64) + 10_000).sum()
+                }
+                "browser_act" => { let input: BrowserActInput = parse_input(tool, args)?; input.expect.as_ref().map_or(0, |e| super::checks::default_within(e).as_millis() as i64) }
+                "computer_exec" => {
+                    let input: ExecInput = parse_input(tool, args)?;
+                    input.timeout_ms.unwrap_or(self.storage.options().max_exec_timeout_ms).min(self.storage.options().max_exec_timeout_ms) as i64
+                }
+                "computer_files" => { let _: FilesInput = parse_input(tool, args)?; 0 }
+                "computer_wait" => { let input: WaitInput = parse_input(tool, args)?; input.deadline_ms as i64 }
+                "computer_checkpoint" => { let _: CheckpointInput = parse_input(tool, args)?; 0 }
+                _ => unreachable!(),
+            };
+            if let Some(mut lease) = self.journal.get_active_lease()?
+                && lease.principal == principal && lease.connection_id == connection_id
+                && args["task_ref"].as_str() == Some(lease.task_ref.as_str())
+            {
+                lease.idle_expires_at_ms = lease.idle_expires_at_ms.max(self.now_ms() + self.idle_expiry_ms.max(bounded + 30_000));
+                self.journal.put_lease(&lease)?;
             }
         }
         match tool {
@@ -644,7 +673,7 @@ impl Controller {
         }
         let control = self.journal.get_control().ok()?;
         if control.human_control || control.paused {
-            return Some("a person (paused)".into());
+            return Some(if control.pause_origin == Some(crate::store::PauseOrigin::System) {"ibara (cleanup paused)"} else {"a person (paused)"}.into());
         }
         match self.journal.get_active_lease().ok().flatten() {
             Some(l) if self.holds_lease(&l, principal, connection_id, agent) => Some(format!("you ({agent})")),
@@ -690,6 +719,15 @@ impl Controller {
             line.push_str("; no browser open yet (its page reader connects when one opens)");
         }
         line.push_str(&format!("; {}", self.login_phrase()));
+        if (self.disposable_desktop)() {
+            let reset = self.journal.desktop_reset().unwrap_or(Value::Null);
+            let state = if self.journal.get_active_lease().ok().flatten().is_some() { "active work; zero windows required on release" }
+                else { reset["state"].as_str().unwrap_or("not verified") };
+            line.push_str(&format!("; disposable desktop; {state}"));
+            if let Some(reason) = reset["reason"].as_str().filter(|_| state == "blocked") {
+                line.push_str(&format!(" ({reason})"));
+            }
+        }
         if let Some(p) = self.desktop.memory_pressure() {
             line.push_str(&format!("; {p}"));
         }
@@ -709,6 +747,7 @@ impl Controller {
 
     fn ended(&self, reference: &str, kind: &str, summary: &str) -> RefStatus {
         RefStatus {
+            details: None,
             reference: reference.to_string(),
             kind: kind.to_string(),
             state: "ended".into(),
@@ -741,6 +780,7 @@ impl Controller {
                 let children = self.journal.get_active_lease()?.filter(|l| l.principal == principal).map(|l| vec![l.task_ref]).unwrap_or_default();
                 (
                     RefStatus {
+                        details: None,
                         reference: reference.clone(),
                         kind: "computer".into(),
                         state: s.state.clone(),
@@ -794,10 +834,25 @@ impl Controller {
             children.push(r.clone());
         }
         let (met, total) = (statuses.iter().filter(|s| s.state == CheckState::Met).count(), statuses.len());
+        let jobs = self.storage.task_jobs(&task.task_ref, Some(principal))?;
+        let active_jobs = self.storage.active_job_count(Some(&task.task_ref));
+        let lease = self.journal.get_active_lease()?.filter(|l| l.task_ref == task.task_ref);
+        let disconnected = lease.as_ref().is_some_and(|l|self.connection_gone(&l.connection_id));
+        let work = json!({
+            "work_ref": task.task_ref,
+            "workspace": self.storage.workspace(&task.task_ref, false)?.to_string_lossy(),
+            "resources": if live { vec!["computer_exclusive"] } else { Vec::<&str>::new() },
+            "connection": if !live { "ended" } else if disconnected { "disconnected" } else { "connected" },
+            "active_jobs": active_jobs,
+            "jobs": jobs.iter().map(|j| json!({"job_ref":j["job_ref"],"state":j["state"],"termination_confirmed":j["termination_confirmed"],"runtime_limit_ms":j["runtime_limit_ms"],"deadline_at":j["deadline_at"]})).collect::<Vec<_>>(),
+            "disconnect_policy": "registered_jobs_keep_ownership; once settled, abandoned desktop cleanup releases control",
+            "takeover_policy": "cancel_owned_jobs_and_fence_input",
+            "budgets": task.budgets,
+        });
         let state = if live { "active".to_string() } else { task.state.clone() };
         let mut next = Vec::new();
         if mine {
-            next.push("computer_act or computer_observe to continue; computer_finish when the checks are met".into());
+            next.push("computer_act or computer_observe to continue interaction; computer_exec continues commands in this task. computer_finish ends it and cancels running jobs".into());
         } else if live {
             next.push("another agent holds this task; wait or ask a person".into());
         } else if matches!(task.state.as_str(), "active" | "created" | "interrupted") {
@@ -827,6 +882,7 @@ impl Controller {
         );
         Ok((
             RefStatus {
+                details: Some(work),
                 reference: reference.to_string(),
                 kind: "task".into(),
                 state,
@@ -888,6 +944,7 @@ impl Controller {
         };
         Ok((
             RefStatus {
+                details: r.get("job_ref").and_then(Value::as_str).map(|j| self.storage.get_job(j, op.task_ref.as_deref(), Some(principal))).transpose()?.flatten(),
                 reference: reference.to_string(),
                 kind: "op".into(),
                 state,
@@ -909,13 +966,22 @@ impl Controller {
             Some(answer) => format!("{} · answered: {}", squash(&item.question, 120), squash(answer, 80)),
             None => squash(&item.question, 160),
         };
-        let next = match item.state.as_str() {
+        let mut next = match item.state.as_str() {
             "open" => vec![format!("computer_wait({{for: {{attention: \"{reference}\"}}}})")],
             _ if item.kind == "approval" => vec!["repeat the held call with the same request_id".to_string()],
             _ => Vec::new(),
         };
+        if item.kind=="login" && item.details.pointer("/assistance/version").and_then(Value::as_u64)==Some(1) {
+            if let Some(view)=self.login_assistance_status(reference)? {
+                next=vec![format!("login_assistance: {}", view)];
+                if item.state=="open" {
+                    next.push(format!("After acquiring the same computer with a fresh task, continue with computer_checkpoint({{task_ref: <new task>, login: {{attention: \"{reference}\", action: \"continue\"}}}}). This does not start an agent or replay old input."));
+                }
+            }
+        }
         Ok((
             RefStatus {
+                details: None,
                 reference: reference.to_string(),
                 kind: "attention".into(),
                 state: item.state.clone(),
@@ -943,6 +1009,7 @@ impl Controller {
         );
         Ok((
             RefStatus {
+                details: None,
                 reference: reference.to_string(),
                 kind: "artifact".into(),
                 state,
@@ -1000,6 +1067,7 @@ impl Controller {
         };
         Ok((
             RefStatus {
+                details: None,
                 reference: reference.to_string(),
                 kind: "frame".into(),
                 state: state.into(),
@@ -1022,6 +1090,7 @@ impl Controller {
         };
         Ok((
             RefStatus {
+                details: None,
                 reference: reference.to_string(),
                 kind: "note".into(),
                 state: "saved".into(),
@@ -1184,6 +1253,12 @@ impl Controller {
         }
         self.desktop.session_ready().await?;
         let capabilities = self.refresh_capabilities().await?;
+        if self.settling.get() {
+            return Err(fail("BUSY", "Desktop reset is in progress; no task acquired control.", true));
+        }
+        if (self.disposable_desktop)() && self.journal.get_active_lease()?.is_none() {
+            self.release_lease(None, Release::Finished, false).await?;
+        }
         if let Some(active) = self.journal.get_active_lease()? {
             if self.holds_lease(&active, principal, connection_id, agent) {
                 return Err(fail("BUSY", format!("You already control {}; carry on with it, or finish it before beginning another task.", active.task_ref), true)
@@ -1192,8 +1267,12 @@ impl Controller {
             }
             return Err(self.redacted_busy());
         }
-        if control.unsettled || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
+        if self.journal.get_control()?.unsettled || self.settling.get() || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
             self.journal.set_control(crate::store::ControlPatch { unsettled: Some(true), ..Default::default() })?;
+            if (self.disposable_desktop)() && self.journal.desktop_reset()?["state"] == "blocked" {
+                return Err(fail("CONTROL_UNSETTLED", "The disposable desktop has not reached zero windows.", false)
+                    .requires_reconciliation().with("next", "Ask the person to save/close the resisting app through existing recovery, then hand back. No task was started; do not force-kill apps."));
+            }
             return Err(fail("CONTROL_UNSETTLED", "Previous controllable work has not settled.", false).requires_reconciliation());
         }
         let task_ref = id("task");
@@ -1240,7 +1319,7 @@ impl Controller {
             state: "active".into(),
             goal: input.goal.clone(),
             success_criteria: criteria,
-            budgets: json!({ "active_control_seconds": null, "max_actions": 200, "text_chars": 12000, "image_count": 40, "max_download_bytes": 67108864, "max_task_tabs": 5, "max_wait_ms": 600000 }),
+            budgets: json!({ "active_control_seconds": null, "max_actions": null, "text_chars": 12000, "image_count": null, "max_download_bytes": 67108864, "max_task_tabs": 5, "max_wait_ms": 600000 }),
             client_flags: json!({ "agent": agent }),
             authorization_ref: None,
             required_capabilities: Vec::new(),
@@ -1586,12 +1665,22 @@ impl Controller {
                 _ if pictures => self.replay_capture(picture_surface.as_ref()).await,
                 _ => None,
             };
+            let portal_before = if matches!(&resolved.plan, Planned::Browser(step) if step.opens_file_chooser) {
+                self.desktop.all_windows().await.ok()
+            } else { None };
             let dispatched = self.dispatch_planned(ctx, &resolved).await;
             if !matches!(resolved.plan, Planned::Observe) {
                 touched_desktop = true;
             }
             let launched = dispatched.as_ref().ok().and_then(|d| d.pid);
             // Control that changed hands after the input finished leaves nothing held.
+            let dispatched = dispatched.and_then(|done| self.assert_authority(ctx.lease).map(|_| done).map_err(|e| e.with("no_input_held", true)));
+            if dispatched.is_ok() && let (Some(before), Planned::Browser(step)) = (&portal_before, &resolved.plan) {
+                self.mark_effect(Some(ctx.task_ref));
+                let tracked = self.claim_portal_after_file_input(ctx.task_ref, ctx.lease, before, &step.window, ctx.gone).await;
+                self.mark_effect(None);
+                if let Err(error) = tracked { receipt.insert("window_ownership_warning".into(), json!({"code":error.code,"message":error.message})); }
+            }
             let dispatched = dispatched.and_then(|done| self.assert_authority(ctx.lease).map(|_| done).map_err(|e| e.with("no_input_held", true)));
             let (outcome, text) = match dispatched {
                 Err(e) if not_started(&e) => {
@@ -1692,29 +1781,37 @@ impl Controller {
             self.timeline("step", Some(ctx.task_ref), &ctx.lease.principal, &clip(&text, 200), json!({ "op": op_ref, "outcome": outcome_name(outcome), "effect_class": resolved.class, "replay": replay }));
             results.push(step_result(i, outcome, text, Some(&op_ref)));
         }
+        // A bounded desktop quiet check lets focus/dialog transitions land.
+        // It is not a claim that a webpage committed a transaction.
+        let quiet = if touched_desktop && attention.is_none() && !ctx.gone.is_cancelled() {
+            let expect = Expectation::Settled(crate::contract::SettledExpect { quiet_ms: 100, within_ms: Some(800) });
+            Some(self.await_expectation(ctx.task_ref, &expect, &[], None, None, ctx.gone).await)
+        } else { None };
         let frame = if touched_desktop || results.iter().any(|r| r.outcome != StepOutcome::NotRun) {
             let task = self.task(ctx.task_ref)?;
-            // After a browser step the new frame is the page's elements, so
-            // the next browser step can name them without another observe.
-            let page = FrameSpec { view: View::Elements, surface: Some("tab".into()), ..FrameSpec::default() };
-            let browser = steps.iter().all(|s| matches!(s, StepSpec::Browser { .. }));
-            let built = match browser {
-                true => match self.build_frame(&task, ctx.lease, &page).await {
-                    Ok(built) => Ok(built),
-                    Err(_) => self.build_frame(&task, ctx.lease, &FrameSpec::default()).await,
-                },
-                false => self.build_frame(&task, ctx.lease, &FrameSpec::default()).await,
+            let spec = FrameSpec { view: View::Elements, ..FrameSpec::default() };
+            let built = match self.assert_authority(ctx.lease) {
+                Ok(()) => self.build_frame(&task, ctx.lease, &spec).await,
+                Err(e) => Err(e),
             };
             match built {
                 Ok((f, _)) => Some(f.frame.clone()),
                 Err(e) => Some(unreadable_frame(&e)),
             }
-        } else {
-            None
-        };
+        } else { None };
         let held = attention.as_ref().map(|(i, a)| (*i, a.as_str()));
         let status = if held.is_some() { Status::Pending } else { Status::Ok };
-        let next = held.map(|(_, a)| approval_next(ctx.tool, Some(ctx.task_ref), a));
+        let next = Some(if let Some((_, a)) = held {
+            approval_next(ctx.tool, Some(ctx.task_ref), a)
+        } else if results.iter().any(|r| r.outcome == StepOutcome::Unknown) {
+            "An effect is uncertain. Inspect its operation receipt and saved state before another action; do not retry it with a new request_id.".into()
+        } else if results.iter().any(|r| r.outcome == StepOutcome::Unmet) {
+            "Input ran, but its expectation was not seen. Inspect the current frame and saved result before another action; do not assume failure means no effect.".into()
+        } else if quiet.as_ref().is_some_and(|q| !q.met) {
+            "The desktop has not settled. Observe again before acting; input delivery does not prove the intended saved result.".into()
+        } else {
+            "Review current values, unchecked controls and every requested output before finishing. Input delivery does not prove a saved result; reopen saved records/files to verify them.".into()
+        });
         let reply = Reply::with_status(status, ActResult { steps: results, frame, attention: held.map(|(_, a)| a.to_string()), next }, ctx.task_ref);
         let outcome = Ok(reply);
         let mut stored = self.journal.get_operation_by_ref(&op0.operation_ref)?.and_then(|o| o.receipt.as_object().cloned()).unwrap_or(receipt0);
@@ -1728,9 +1825,11 @@ impl Controller {
     async fn password_shown(&self, resolved: &Resolved, frame: Option<&FrameState>) -> bool {
         let Planned::Desktop(effect) = &resolved.plan else { return false };
         let Effect::Type { surface, .. } = effect.as_ref() else { return false };
-        if let Some(frame) = frame.filter(|f| f.surface.as_ref() == Some(surface)) {
-            return frame.elements.iter().any(|e| e.role == "password text");
+        if frame.filter(|f| f.surface.as_ref() == Some(surface))
+            .is_some_and(|f| f.elements.iter().any(|e| e.role == "password text")) {
+            return true;
         }
+        // A compact or page-only frame cannot prove absence of a password.
         // Unknown counts as shown: no picture rather than a picture of a secret.
         self.desktop.has_password_field(surface).await.unwrap_or(true)
     }
@@ -1784,6 +1883,15 @@ impl Controller {
                 return Ok(Resolved { plan: Planned::Observe, describe: "expect".into(), said: "check the screen".into(), class: "observe", route: "expect" });
             }
         };
+        // A page reference is already an observed computer target. Reuse the
+        // browser plan (and its native hit/focus/effect checks), not a second
+        // input path or an unguarded DOM click.
+        if let Action::Click(crate::contract::TargetAction { target: Target::Element(ref target) }) = action
+            && target.as_str().starts_with('b')
+        {
+            return self.resolve_browser(frame, windows,
+                &BrowserAction::Click(crate::contract::BrowserTarget { target: target.to_string() }), step.effect);
+        }
         // Keys and text go to the focused window; a choice's, only to the
         // window it was offered for, while that window still has the focus.
         let focused = || {
@@ -1882,7 +1990,7 @@ impl Controller {
             Action::Close(s) => {
                 let win = self.resolve_surface(frame, windows, &s.surface)?;
                 let owned = self.journal.task_windows(task_ref).map_err(|e| e.with("execution_not_started", true))?;
-                if !owned.iter().any(|o| o.address == win.address && o.pid == win.pid) {
+                if !(self.disposable_desktop)() && !owned.iter().any(|o| o.address == win.address && o.pid == win.pid) {
                     return Err(denied(format!("surface: close only closes windows this task opened; {} was not", s.surface)).with("execution_not_started", true));
                 }
                 let describe = format!("close {} \"{}\"", win.class, squash(&win.title, 40));
@@ -2024,7 +2132,7 @@ impl Controller {
             }
             BrowserAction::Scroll(s) => {
                 if !(-50..=50).contains(&s.dx) || !(-50..=50).contains(&s.dy) {
-                    return Err(invalid("Scroll notches must be between -50 and 50.").with("field", "action.dx/dy").with("execution_not_started", true));
+                    return Err(invalid("Scroll dx/dy are wheel notches from -50 to 50, not pixels; for example dy: 3 scrolls down three notches.").with("field", "action.dx/dy").with("execution_not_started", true));
                 }
                 let target = match &s.target {
                     Some(target) => {
@@ -2045,7 +2153,8 @@ impl Controller {
             BrowserAction::WaitFor(_) => unreachable!("handled above"),
             BrowserAction::SignIn(_) => unreachable!("sign_in never becomes a step"),
         };
-        Ok(Resolved { plan: Planned::Browser(Box::new(BrowserStep { window, target, op })), describe, said, class, route })
+        let opens_file_chooser = matches!(action, BrowserAction::Click(t) if frame.is_some_and(|f| f.browser.iter().any(|n| n.id == t.target && n.role == "file_input")));
+        Ok(Resolved { plan: Planned::Browser(Box::new(BrowserStep { window, target, opens_file_chooser, op })), describe, said, class, route })
     }
 
     /// Run a browser step. Only the extension's page reads happen before the
@@ -2074,7 +2183,7 @@ impl Controller {
                 }
                 Ok(Done::default())
             }
-            BrowserOp::Click => self.browser_click(step, step.target.clone().unwrap_or(Value::Null), true, cancel).await.map(|(done, _)| done),
+            BrowserOp::Click => self.browser_click(step, step.target.clone().unwrap_or(Value::Null), true, cancel).await.map(|(done, _, _)| done),
             BrowserOp::Type(text) => match &step.target {
                 Some(target) => {
                     self.browser_click(step, target.clone(), false, cancel).await?;
@@ -2085,22 +2194,34 @@ impl Controller {
                     .map_err(|e| typing_stopped(e, 0, text.chars().count(), TypedInto::Window)),
             },
             BrowserOp::Select(value) => {
-                // As a person does it: open the list with a click, type the
-                // option's label, confirm with Return.
                 let mut args = step.target.clone().unwrap_or(Value::Null);
                 args["value"] = json!(value);
-                let (_, located) = self.browser_click(step, args, false, cancel).await?;
-                let label = located.get("label").and_then(Value::as_str).unwrap_or_default().to_string();
-                act(Effect::Type { surface: surface(), text: label.clone(), cursor: TypingCursor::Stays })
-                    .await
-                    .map_err(|e| typing_stopped(e, 0, label.chars().count(), TypedInto::Field))?;
-                act(Effect::Key { surface: surface(), combo: "Return".into() }).await.map_err(started)?;
-                let chosen = self.desktop.browser_call("selected", step.target.clone().unwrap_or(Value::Null), false).await.map_err(started)?;
-                let now = chosen.get("text").and_then(Value::as_str).unwrap_or_default();
-                if now != label {
-                    return Err(fail("OUTCOME_UNKNOWN", format!("The list now shows \"{}\", not \"{}\"; observe the page.", clip(now, 60), clip(&label, 60)), false));
+                let (_, located, mut input_sent) = self.browser_click(step, args, false, cancel).await?;
+                // The read-only reader bound this ordinal to a unique enabled
+                // option before any input. Never type labels into native menus.
+                let selection = &located["selection"];
+                let edge = selection["from"].as_str().unwrap();
+                let arrow = if edge == "Home" { "Down" } else { "Up" };
+                let steps = selection["steps"].as_u64().unwrap();
+                for key in std::iter::once(edge).chain(std::iter::repeat_n(arrow, steps as usize)).chain(std::iter::once("Return")) {
+                    let ready = self.desktop.browser_call("selected", step.target.clone().unwrap(), false).await
+                        .map_err(|e| e.with("execution_not_started", !input_sent))?;
+                    if ready.get("ready").and_then(Value::as_bool) != Some(true)
+                        || ready.get("open").and_then(Value::as_bool) == Some(false)
+                    {
+                        return Err(fail(if input_sent { "OUTCOME_UNKNOWN" } else { "STALE_TARGET" },
+                            "The list changed, closed or lost focus; no further selection keys were sent. Observe the page before retrying.", !input_sent)
+                            .with("execution_not_started", !input_sent));
+                    }
+                    act(Effect::Key { surface: surface(), combo: key.into() }).await
+                        .map_err(|e| if !input_sent && not_started(&e) { e } else { started(e) })?;
+                    input_sent = true;
                 }
-                Ok(Done::default())
+                let chosen = self.desktop.browser_call("selected", step.target.clone().unwrap(), false).await.map_err(started)?;
+                if chosen.get("matches").and_then(Value::as_bool) != Some(true) {
+                    return Err(fail("OUTCOME_UNKNOWN", "The requested option was not verified on the same unchanged list; observe the page and inspect this operation before retrying.", false));
+                }
+                Ok(Done { note: Some("The requested option is selected; this does not prove the form was saved.".into()), ..Done::default() })
             }
             BrowserOp::Scroll { dx, dy } => {
                 let mut moved = false;
@@ -2126,11 +2247,26 @@ impl Controller {
     /// the page saw on the chosen element counts as done. With `navigation`
     /// (a plain click) the extension also says where the page went when the
     /// press, or the form it submitted, made it leave.
-    async fn browser_click(&self, step: &BrowserStep, args: Value, navigation: bool, cancel: &Cancel) -> Result<(Done, Value)> {
+    /// Exact selection may reuse an already open, focused picker; the final
+    /// tuple field records whether pointer input was sent by this preparation.
+    async fn browser_click(&self, step: &BrowserStep, args: Value, navigation: bool, cancel: &Cancel) -> Result<(Done, Value, bool)> {
         let mut target = step.target.clone().unwrap_or(Value::Null);
         let data = self.desktop.browser_call("locate", args, false).await.map_err(|e| e.with("execution_not_started", true))?;
         page_refusal(&data)?;
-        if data.get("label").is_some_and(|l| l.as_str() == Some("")) {
+        if matches!(step.op, BrowserOp::Select(_)) {
+            let selection = &data["selection"];
+            if !matches!(selection["from"].as_str(), Some("Home" | "End"))
+                || !selection["steps"].as_u64().is_some_and(|n| n <= 128)
+                || selection["index"].as_u64().is_none()
+                || selection["value"].as_str().is_none()
+            {
+                let why = data.get("reason").and_then(Value::as_str).unwrap_or("the page reader cannot identify a unique enabled native option; update the reader or inspect the visible menu");
+                return Err(fail("AMBIGUOUS_TARGET", format!("No selection input was sent: {why}."), true)
+                    .with("options", data.get("options").cloned().unwrap_or(Value::Null))
+                    .with("execution_not_started", true));
+            }
+        }
+        if !matches!(step.op, BrowserOp::Select(_)) && data.get("label").is_some_and(|l| l.as_str() == Some("")) {
             let why = data.get("reason").and_then(Value::as_str).unwrap_or("no option has that value or label");
             return Err(fail("AMBIGUOUS_TARGET", format!("That choice cannot be made by typing: {why}."), true)
                 .with("options", data.get("options").cloned().unwrap_or(Value::Null))
@@ -2145,9 +2281,33 @@ impl Controller {
             .find(|w| w.address == step.window.address && w.pid == step.window.pid)
             .filter(|w| w.focused)
             .ok_or_else(|| fail("STALE_TARGET", "The browser window closed or lost focus; observe again.", true).with("execution_not_started", true))?;
+        if matches!(step.op, BrowserOp::Select(_)) {
+            // A second press on an open native picker can dismiss it without
+            // reaching the page. Skip only with fresh exact focus AND open
+            // state. A closed focused list still opens before ordinal keys,
+            // so its change handlers do not see intermediate choices.
+            let selected = self.desktop.browser_call("selected", target.clone(), false).await
+                .map_err(|e| e.with("execution_not_started", true))?;
+            page_refusal(&selected)?;
+            if selected.get("open").and_then(Value::as_bool) == Some(true) {
+                if selected.get("ready").and_then(Value::as_bool) != Some(true) {
+                    return Err(fail("STALE_TARGET", "The open list changed or lost page focus; no selection input was sent. Observe again.", true)
+                        .with("execution_not_started", true));
+                }
+                return Ok((Done::default(), data, false));
+            }
+        }
         let (x, y) = page_point(&data, &win.rect)?;
         let click = Effect::ClickPoint { x, y, surface: Some(step.window.clone()), button: Button::Left, double: false };
-        let done = self.send_input(&click, cancel).await?;
+        let done = self.send_input(&click, cancel).await.map_err(|mut e| {
+            if not_started(&e) && e.details.get("reason").and_then(Value::as_str) == Some("pointer_target") {
+                // This caller already addressed a page element. Repeating that
+                // advice cannot recover a native surface covering its point.
+                e.message = "A native popup or overlay covers the browser target; the requested click was not sent.".into();
+                e = e.with("next", "Take a fresh computer_observe image. If it shows a browser suggestion or menu, dismiss that visible popup (for example Escape), observe again, then retry the requested action. Otherwise handle the covering surface shown in the image; do not repeat the same blocked point.");
+            }
+            e
+        })?;
         // The page reports the press over a connection it opened before the
         // click, so a press that navigates the page away (a link, a form's
         // submit button) is still reported. A press the page never saw went
@@ -2163,7 +2323,7 @@ impl Controller {
                     let went = if seen.get("arrived").and_then(Value::as_bool) == Some(false) { "began loading" } else { "went to" };
                     format!("the click reached it; the page then {went} {}", page_address(url))
                 });
-                Ok((Done { note, ..done }, data))
+                Ok((Done { note, ..done }, data, true))
             }
             (Some(true), _) => Err(fail("OUTCOME_UNKNOWN", "The click reached a different element than the one chosen; observe the page.", false)),
             _ if seen.get("gone").and_then(Value::as_bool) == Some(true) => {
@@ -2365,7 +2525,7 @@ impl Controller {
         let Ok(after) = self.desktop.windows().await else { return };
         let fresh: Vec<&Win> = after.iter().filter(|w| self.claims(&owner, before, w)).collect();
         for w in &fresh {
-            self.record_window(self.journal.own_window(task_ref, &w.address, w.pid, &w.class, &w.title));
+            self.record_window(self.journal.own_window(task_ref, &w.address, w.pid, &w.class, &w.title, w.process_start_ticks, &w.compositor_instance));
         }
         if let Planned::Desktop(effect) = &resolved.plan
             && let Effect::Key { surface, combo } = effect.as_ref()
@@ -2908,6 +3068,13 @@ impl Controller {
                 }
                 loop {
                     let item = self.journal.get_attention(att.as_str())?.ok_or_else(|| invalid("for.attention: the item is gone"))?;
+                    let assistance = if item.kind=="login" && item.details.pointer("/assistance/version").and_then(Value::as_u64)==Some(1) {
+                        self.login_assistance_status(att.as_str())?.filter(|v|v["sites"].as_array().is_some_and(|sites|sites.iter().any(|e| !matches!(e["state"].as_str(),Some("asking"|"deliver"|"deliver_once")))))
+                    } else {None};
+                    if let Some(view)=assistance {
+                        break contract::WaitResult {met:true,waited_ms:started.elapsed().as_millis() as u64,
+                            state:"assistance_updated".into(),answer:Some(view.to_string()),frame:None};
+                    }
                     if item.state != "open" || started.elapsed() >= deadline || gone.is_cancelled() {
                         break contract::WaitResult {
                             met: item.state != "open",
@@ -3023,6 +3190,9 @@ impl Controller {
             self.push_event(Some(&task.task_ref), &format!("{} asks a person: {}", item.att_ref, squash(&ask.question, 80)));
             result.insert("attention".into(), json!(item.att_ref));
             status = Status::Pending;
+        }
+        if let Some(login) = &input.login {
+            result.insert("login".into(), self.login_checkpoint(&task, login)?);
         }
         // The agent cannot change its own access: it asks, and a person decides.
         if input.stop_asking {
@@ -3142,7 +3312,7 @@ impl Controller {
         }
         let unknown = self.unknown_operations(&task_ref);
         let keep = if lease.is_some() { None } else { self.computer_is_taken()? };
-        let cleanup = self.cleanup(&task_ref, keep).await;
+        let mut cleanup = if (self.disposable_desktop)() { Cleanup::default() } else { self.cleanup(&task_ref, keep).await };
         let delivery = task.deliveries.first().map(|d| {
             let verified = self.storage.delivery_verified(&task_ref, d);
             DeliveryStatus {
@@ -3164,6 +3334,24 @@ impl Controller {
             // The paused task can finish without taking the screen back or
             // releasing input held by its person. Its work already settled.
             self.journal.revoke_active_leases("finished", self.now_ms())?;
+        }
+        if (self.disposable_desktop)() {
+            if lease.is_none() && keep.is_none() {
+                self.release_lease(None, Release::Finished, true).await?;
+            }
+            if lease.is_some() || keep.is_none() {
+                let reset = self.journal.desktop_reset()?;
+                cleanup = serde_json::from_value(reset["cleanup"].clone()).unwrap_or_default();
+                if reset["automatic_dialogs"].as_array().is_some_and(|a| !a.is_empty()) {
+                    notes.push("Cleanup resolved known task-owned dialogs; saved files were not overwritten. Save required work before finishing.".into());
+                }
+                if reset["state"] != "verified" {
+                    notes.push(format!("Zero-window reset not verified: {}. Computer remains unavailable; no forced termination.",
+                        reset["reason"].as_str().unwrap_or("window close or settlement did not complete")));
+                }
+            } else {
+                notes.push("Desktop reset deferred while control is reserved; no competing cleanup was attempted.".into());
+            }
         }
         let control = self.journal.get_control()?;
         let complete = !control.unsettled
@@ -3238,7 +3426,11 @@ impl Controller {
         receipt.insert("effect".into(), json!(if control.unsettled { "unknown" } else { "none" }));
         receipt.insert("summary".into(), json!(summary));
         self.frames.borrow_mut().forget(&task_ref);
-        self.record_window(self.journal.forget_task_windows(&task_ref));
+        // Retain exact ownership for disposable recovery; close events remove
+        // records. A blocked finish must not erase permission to clean its work.
+        if !(self.disposable_desktop)() {
+            self.record_window(self.journal.forget_task_windows(&task_ref));
+        }
         let _ = self.journal.expire_attention(None, Some(&task_ref), "finish", &self.now_iso());
         self.timeline("task_finished", Some(&task_ref), agent, &clip(&input.summary, 200), json!({ "outcome": state, "complete": complete }));
         let result = FinishResult { checks, delivery, cleanup, complete, notes };
@@ -3643,4 +3835,3 @@ fn unreadable_frame(e: &IbaraError) -> Frame {
         next_cursor: None,
     }
 }
-

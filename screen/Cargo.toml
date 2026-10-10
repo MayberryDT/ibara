@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false
+[features]
+qualification = []
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -28,5 +30,8 @@ gbm = { version="0.15", default-features=false, features=["drm-support"] }
 moq-nvenc = "=0.1.0"
 cudarc = { version = "0.19", default-features = false, features = ["driver", "fallback-dynamic-loading", "cuda-12020"] }
 libloading = "0.9"
+pipewire = "0.10"
+futures-util = "0.3"
+zbus = { version = "5", features = ["blocking-api"] }
 [build-dependencies]
 cc = "1"

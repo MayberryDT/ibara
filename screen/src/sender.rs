@@ -72,6 +72,13 @@ impl State {
     }
 }
 pub async fn run(dir: &Path) -> Result<()> {
+    run_bound(dir,None).await
+}
+#[cfg(feature="qualification")]
+pub async fn proof_run(dir:&Path)->Result<()> {
+    run_bound(dir,Some("127.0.0.1:0".parse()?)).await
+}
+async fn run_bound(dir:&Path,qualification_bind:Option<SocketAddr>)->Result<()> {
     unsafe {
         let parent = libc::getppid();
         ensure!(
@@ -82,9 +89,13 @@ pub async fn run(dir: &Path) -> Result<()> {
     }
     let id = identity::Identity::load(dir)?;
     let server = identity::server(&id)?;
+    let mut endpoints = vec![];
+    if let Some(address)=qualification_bind {
+        ensure!(cfg!(feature="qualification") && address.ip().is_loopback() && address.port()==0,"Invalid qualification bind");
+        endpoints.push(quinn::Endpoint::server(server.clone(),address)?);
+    } else {
     let output = std::process::Command::new("tailscale").arg("ip").output()?;
     ensure!(output.status.success(), "Tailscale addresses unavailable");
-    let mut endpoints = vec![];
     for line in std::str::from_utf8(&output.stdout)?.lines() {
         let ip: IpAddr = line.parse()?;
         let tailnet = match ip {
@@ -96,6 +107,7 @@ pub async fn run(dir: &Path) -> Result<()> {
             server.clone(),
             SocketAddr::new(ip, 47910),
         )?);
+    }
     }
     ensure!(!endpoints.is_empty(), "no tailnet address");
     let health = Arc::new(Health::default());
@@ -126,7 +138,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         encoder: encoder_name.clone(),
     }));
     emit(
-        json!({"v":1,"t":"ready","port":47910,"cert_sha256":identity::hash(&id.cert),"encoder":encoder_name,"capture":capture_name,"command_results":true}),
+        json!({"v":1,"t":"ready","port":endpoints[0].local_addr()?.port(),"cert_sha256":identity::hash(&id.cert),"encoder":encoder_name,"capture":capture_name,"command_results":true}),
     );
     start_tx
         .send(())

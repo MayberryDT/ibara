@@ -87,6 +87,8 @@ pub struct Window {
     pub accepts_input: bool,
     pub at: [i32; 2],
     pub size: [i32; 2],
+    /// Trusted compositor content bounds for AT-SPI WINDOW coordinates.
+    pub client_rect: Option<[i32; 4]>,
     pub workspace: WorkspaceRef,
     pub floating: bool,
     pub monitor: i64,
@@ -274,7 +276,7 @@ fn ctl_failure(out: &Output) -> IbaraError {
 }
 
 /// Linux stat field 22; comm may itself contain spaces or parentheses.
-fn process_start_ticks(pid: i64) -> Option<u64> {
+pub(super) fn process_start_ticks(pid: i64) -> Option<u64> {
     if pid <= 0 { return None; }
     let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     raw.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
@@ -284,14 +286,18 @@ fn process_start_ticks(pid: i64) -> Option<u64> {
 #[derive(Clone, Debug)]
 pub struct Hyprland {
     hyprctl: OsString,
+    gnome: Option<super::gnome::Gnome>,
     instance: String,
     env: Arc<[(OsString, OsString)]>,
 }
 
 impl Hyprland {
     pub fn new(hyprctl: impl Into<OsString>, instance: impl Into<String>, env: Arc<[(OsString, OsString)]>) -> Self {
-        Hyprland { hyprctl: hyprctl.into(), instance: instance.into(), env }
+        let gnome = super::gnome::Gnome::selected(&env).then(|| super::gnome::Gnome::new(env.clone()));
+        Hyprland { hyprctl: hyprctl.into(), instance: instance.into(), env, gnome }
     }
+
+    pub fn gnome(&self) -> Option<super::gnome::Gnome> { self.gnome.clone() }
 
     fn cmd(&self, args: &[&str]) -> Cmd {
         let mutates = matches!(args.first(), Some(&"eval" | &"output" | &"keyword"));
@@ -305,6 +311,7 @@ impl Hyprland {
     }
 
     async fn text(&self, cmd: Cmd) -> Result<String> {
+        if self.gnome.is_some() { return Err(super::gnome::input_unavailable()); }
         let out = run(cmd).await?;
         if !out.success() {
             return Err(ctl_failure(&out));
@@ -320,11 +327,13 @@ impl Hyprland {
     }
 
     pub async fn monitors(&self) -> Result<Vec<Monitor>> {
+        if let Some(gnome) = &self.gnome { return Ok(gnome.state().await?.monitors); }
         self.json(self.cmd(&["-j", "monitors"]), "monitors").await
     }
 
     /// `monitors` for the operator path: 1 s and 128 KiB (§3.1, `server.ts:145-170`).
     pub async fn monitors_quick(&self) -> Result<Vec<Monitor>> {
+        if let Some(gnome) = &self.gnome { return Ok(gnome.state().await?.monitors); }
         let cmd = self.cmd(&["-j", "monitors"]).timeout(Duration::from_secs(1)).max_output(128 * 1024);
         self.json(cmd, "monitors").await
     }
@@ -338,6 +347,7 @@ impl Hyprland {
     }
 
     pub async fn clients(&self) -> Result<Vec<Window>> {
+        if let Some(gnome) = &self.gnome { return Ok(gnome.state().await?.windows); }
         let instance = self.instance_signature().await?;
         let bound = Self { instance: instance.clone(), ..self.clone() };
         let mut windows: Vec<Window> = bound.json(bound.cmd(&["-j", "clients"]), "clients").await?;
@@ -353,12 +363,14 @@ impl Hyprland {
     }
 
     pub async fn hypoland_version(&self) -> Result<Option<String>> {
+        if self.gnome.is_some() { return Ok(None); }
         let version: serde_json::Value = self.json(self.cmd(&["-j", "version"]), "version").await?;
         Ok(version["hypolandVersion"].as_str().filter(|v| !v.is_empty()).map(str::to_owned))
     }
 
     /// The focused window, or `None` when nothing is focused.
     pub async fn active_window(&self) -> Result<Option<Window>> {
+        if let Some(gnome) = &self.gnome { let state = gnome.state().await?; return Ok(state.windows.into_iter().find(|w| Some(&w.address) == state.focused.as_ref())); }
         let instance = self.instance_signature().await?;
         let bound = Self { instance: instance.clone(), ..self.clone() };
         let value: serde_json::Value = bound.json(bound.cmd(&["-j", "activewindow"]), "activewindow").await?;
@@ -375,6 +387,7 @@ impl Hyprland {
     /// Cua's Hyprland plugin is loaded for this compositor's ABI and its input
     /// transport is open (`hyprctl -j cua:status`).
     pub async fn cua_status(&self) -> Result<bool> {
+        if self.gnome.is_some() { return Err(super::gnome::input_unavailable()); }
         let out = run(self.cmd(&["-j", "cua:status"])).await?;
         if !out.success() && session_gone(&out.failure_text("hyprctl")) { return Err(ctl_failure(&out)); }
         let raw = out.stdout_text();
@@ -393,6 +406,7 @@ impl Hyprland {
 
     /// Live Hyprland instances, in the order `-i <n>` indexes them.
     pub async fn instances(&self) -> Result<Vec<Instance>> {
+        if let Some(gnome) = &self.gnome { let state = gnome.state().await?; return Ok(vec![Instance { instance: state.windows.first().map(|w|w.compositor_instance.clone()).unwrap_or_else(||format!("gnome|{}",state.epoch)), pid: 0 }]); }
         let cmd = Cmd::new(&self.hyprctl).args(["-j", "instances"]).envs(&self.env).timeout(DEFAULT_TIMEOUT);
         self.json(cmd, "instances").await
     }
@@ -412,6 +426,7 @@ impl Hyprland {
 
     /// Run Lua through `hyprctl eval` and return its exit status and text.
     async fn eval_raw(&self, lua: &str) -> Result<(bool, String)> {
+        if self.gnome.is_some() { return Err(super::gnome::input_unavailable()); }
         let out = run(self.cmd(&["eval", lua])).await?;
         let text = out.failure_text("hyprctl");
         Ok((out.success(), text))
@@ -484,6 +499,7 @@ impl Hyprland {
     /// Graceful close with process incarnation/session guard, then an atomic
     /// compositor-side address/PID/class check. Never fall back to a new session.
     pub async fn close_surface(&self, surface: &SurfaceId) -> Result<()> {
+        if let Some(gnome) = &self.gnome { return gnome.mutate("Close", surface).await; }
         let bound = self.surface_session(surface).await?;
         let lua = format!(
             "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {} and w.class == {} then target = w break end end; \

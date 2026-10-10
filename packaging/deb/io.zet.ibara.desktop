@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ibara
+Comment=Your computers, their agents and what needs you
+Exec=ibara-console
+TryExec=ibara-console
+Icon=io.zet.ibara
+Terminal=false
+StartupNotify=true
+Categories=Utility;
+Keywords=computers;agents;approvals;console;

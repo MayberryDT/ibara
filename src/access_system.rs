@@ -228,7 +228,7 @@ fn project(inventory: &Value, request: &Value) -> anyhow::Result<()> {
                     bail!("Account binding changed");
                 }
                 let _ = Command::new("/usr/bin/pkill").args(["-KILL", "-u", &uid.to_string()]).status();
-                run("/usr/bin/userdel", &[name])?;
+                run(if Path::new("/usr/sbin/userdel").is_file() {"/usr/sbin/userdel"} else {"/usr/bin/userdel"}, &[name])?;
             }
         } else {
             if account(name).is_none() {
@@ -252,7 +252,7 @@ fn project(inventory: &Value, request: &Value) -> anyhow::Result<()> {
                 }
                 let hash = String::from_utf8(out.stdout)?;
                 run(
-                    "/usr/bin/useradd",
+                    if Path::new("/usr/sbin/useradd").is_file() {"/usr/sbin/useradd"} else {"/usr/bin/useradd"},
                     &[
                         "--system",
                         "--no-create-home",

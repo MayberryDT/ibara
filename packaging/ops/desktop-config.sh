@@ -49,6 +49,9 @@ if present then
   pcall(hl.config, { plugin = { cua = { enabled = true } } })
 end
 
+-- Video must remain opaque even when Omarchy makes ordinary windows translucent.
+o.window("^io\\.zet\\.ibara\\.Screen$", { tag = "-default-opacity", opacity = "1 1" })
+
 -- A computer without a display gets its headless output, IbaraVirtual, as
 -- Hyprland starts, before session services look for a screen: Sunshine
 -- started without any output falls back to the screencast portal, whose share

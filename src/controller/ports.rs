@@ -266,8 +266,13 @@ pub trait DesktopPort {
     fn clipboard_watch(&self) -> Result<tokio::sync::mpsc::Receiver<()>> {
         Err(crate::error::unavailable("This computer has no clipboard."))
     }
-    /// Set everything the clipboard holds aside, every type, and watch it
-    /// until it is put back.
+    /// Native UTF-8 typing preserves the clipboard without a paste transaction.
+    fn native_unicode_typing(&self) -> bool { false }
+    fn browser_native_text<'a>(&'a self, _key: &'a WinKey, _text: &'a str, _cancel: &'a Cancel) -> LocalFuture<'a, Result<()>> {
+        Box::pin(async { Err(crate::error::unavailable("Native browser text is unavailable.")) })
+    }
+
+    /// Set everything the clipboard holds aside and watch until restored.
     fn clipboard_set_aside(&self) -> LocalFuture<'_, Result<()>> {
         Box::pin(async { Err(crate::error::unavailable("This computer has no clipboard.")) })
     }

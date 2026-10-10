@@ -48,6 +48,9 @@ impl Engine for crate::controller::Controller {
 }
 
 pub(super) async fn run_target(paths: Paths) -> anyhow::Result<()> {
+    if crate::desktop::gnome::Gnome::selected(&std::env::vars_os().collect::<Vec<_>>()) {
+        crate::install::gnome::require_target().map_err(anyhow::Error::msg)?;
+    }
     crate::install::user::start_shell_retry();
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

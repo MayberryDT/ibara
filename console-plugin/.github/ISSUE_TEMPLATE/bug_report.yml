@@ -1,0 +1,36 @@
+name: Bug report
+description: Something in the bar, the quick panel or the console does not work or look right.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report this. To report a security problem, do not use this form: follow ibara's security policy instead.
+        Remove anything private, such as computer names, addresses and file names, from what you paste.
+  - type: input
+    id: version
+    attributes:
+      label: ibara version
+      description: The output of `pacman -Q ibara`.
+      placeholder: ibara 0.1.0-1
+    validations:
+      required: true
+  - type: input
+    id: omarchy
+    attributes:
+      label: Omarchy version and theme
+      description: The output of `omarchy version`, and the theme you use.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. A screenshot helps.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the console and choose a computer.
+        2. …

@@ -15,10 +15,14 @@ pub mod clipboard;
 pub mod compositor_input;
 pub mod cua;
 pub mod handover;
+pub mod gnome;
+pub mod gnome_control;
+pub mod gnome_idle;
 pub mod hyprland;
 pub mod idle;
 pub mod input;
 pub mod native_field;
+pub mod native_elements;
 pub mod run;
 pub mod selection;
 pub mod video;
@@ -353,13 +357,18 @@ pub struct Desktop {
     preview: Mutex<Option<PreviewFlight>>,
     /// Which one cursor the screen shows: the person's or the agent's.
     handover: handover::Handover,
+    gnome_control: Option<gnome_control::GnomeControl>,
+    gnome_idle: Option<gnome_idle::Idle>,
+    native_page: Mutex<Option<(Window,Option<String>,Instant,atspi::Tree)>>,
     /// Live video streams of the displays.
     video: video::Video,
 }
 
 impl Desktop {
     pub fn new(cfg: DesktopConfig) -> Desktop {
-        let env: Arc<[(OsString, OsString)]> = Arc::from(cfg.env.clone());
+        let mut effective_env = cfg.env.clone();
+        if gnome::Gnome::selected(&effective_env) { effective_env.push(("CUA_DRIVER_RS_ENABLE_WAYLAND".into(), "1".into())); }
+        let env: Arc<[(OsString, OsString)]> = Arc::from(effective_env);
         let hypr = Hyprland::new(&cfg.hyprctl, cfg.hyprland_instance.clone(), env.clone());
         let cua = cua::Cua::new(cua::CuaConfig { program: cfg.cua.clone(), home: cfg.state_dir.join("cua"), env: env.clone() });
         let idle = idle::Idle::new(cfg.idle_binary.clone(), cfg.idle_state.clone(), env.clone());
@@ -369,7 +378,9 @@ impl Desktop {
         let compositor_input = compositor_input::CompositorInput::new(hypr.clone(), cua.clone(), runtime.clone());
         let handover = handover::Handover::new(hypr.clone(), cua.clone(), cfg.state_dir.join("pointer-hidden"), runtime);
         let video = video::Video::new(cfg.wf_recorder.clone(), env.clone());
-        Desktop { cfg, env, hypr, cua, compositor_input, typed_at: Mutex::new(None), idle, events, preview: Mutex::new(None), handover, video }
+        let gnome_control = hypr.gnome().map(gnome_control::GnomeControl::new);
+        let gnome_idle = hypr.gnome().map(|_|gnome_idle::Idle::new(env.clone()));
+        Desktop { cfg, env, hypr, cua, compositor_input, typed_at: Mutex::new(None), idle, events, preview: Mutex::new(None), handover, gnome_control, gnome_idle, native_page:Mutex::new(None), video }
     }
 
     pub fn config(&self) -> &DesktopConfig {
@@ -389,6 +400,7 @@ impl Desktop {
 
     /// Start the Hyprland event-socket task (once, at daemon start).
     pub fn start_watch(&self) -> tokio::task::JoinHandle<()> {
+        if let Some(gnome) = self.hypr.gnome() { return tokio::spawn(gnome.watch(self.events.clone())); }
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_default();
         tokio::spawn(watch::run_watch(self.hypr.clone(), runtime, self.events.clone()))
     }
@@ -489,6 +501,24 @@ impl Desktop {
         if live.title.is_empty() || live.pid <= 0 {
             return Ok(ElementPage::default());
         }
+        if self.gnome_control.is_some() {
+            let tree=if cursor.is_some() {
+                self.native_page.lock().unwrap_or_else(|p|p.into_inner()).as_ref()
+                    .filter(|(window,q,at,_)|window.id()==live.id() && window.geometry()==live.geometry() && window.title==live.title &&
+                        q.as_deref()==query && at.elapsed()<Duration::from_secs(30))
+                    .map(|(_,_,_,tree)|tree.clone()).ok_or_else(||stale("Native observation expired or changed; observe without cursor."))?
+            } else {
+                let tree=native_elements::read(&live,&self.env,None).await?;
+                let after=self.live(surface).await?.ok_or_else(||stale("Native window disappeared during observation."))?;
+                if after.geometry()!=live.geometry() || after.title!=live.title {return Err(stale("Native window changed during observation."));}
+                *self.native_page.lock().unwrap_or_else(|p|p.into_inner())=Some((live.clone(),query.map(str::to_owned),Instant::now(),tree.clone()));
+                tree
+            };
+            let truncated=tree.truncated;
+            let mut page=cua::page(tree,query,limit,cursor);
+            if truncated {page.total=None;}
+            return Ok(page);
+        }
         self.cua.elements(live.pid, cua::window_id(&live.address)?, query, limit, cursor).await
     }
 
@@ -497,6 +527,10 @@ impl Desktop {
     /// none. With none, the screen goes back to the person's pointer within
     /// [`handover::POLL`], and at once through [`Desktop::release_input`].
     pub fn set_agent(&self, label: Option<String>) {
+        if let Some(control) = &self.gnome_control {
+            control.set_agent(label);
+            return;
+        }
         let begins = label.is_some();
         self.cua.set_agent(label);
         if begins {
@@ -507,6 +541,11 @@ impl Desktop {
     /// Whether the surface shows a password field (replay keeps no picture).
     pub async fn has_password_field(&self, surface: &SurfaceId) -> Result<bool> {
         let live = self.live(surface).await?.ok_or_else(|| stale("Surface is gone."))?;
+        if self.gnome_control.is_some() {
+            let tree=native_elements::read(&live,&self.env,None).await?;
+            if tree.truncated {return Err(IbaraError::new("CAPABILITY_UNAVAILABLE","Native password-field presence could not be proved completely.",true));}
+            return Ok(tree.elements.iter().any(|node|node.role.to_lowercase().contains("password")));
+        }
         self.cua.has_password_field(live.pid, cua::window_id(&live.address)?).await
     }
 
@@ -576,25 +615,41 @@ impl Desktop {
     /// Nothing starts once `cancel` has fired (control changed hands). The
     /// screen is the agent's first ([`handover`]): after a person took it,
     /// the agent's input takes it back.
-    pub async fn viewer_turn(&self, person: bool) { self.handover.viewer_turn(person); }
+    pub async fn viewer_turn(&self, person: bool) {
+        if let Some(control) = &self.gnome_control { control.viewer_turn(person); }
+        else { self.handover.viewer_turn(person); }
+    }
 
     async fn effect<T>(&self, cancel: Option<&Cancel>, work: impl Future<Output = Result<T>>) -> Result<T> {
         cua::unless_cancelled(cancel)?;
-        if self.uses_dispatchers().await {
+        if self.gnome_control.is_none() && self.uses_dispatchers().await {
             // The passive seat pointer must exist before hiding it. Launch
             // and window management still work if wheel support is missing.
             let _ = self.prepare_dispatchers().await;
         }
-        self.handover.to_agent().await?;
+        if let Some(control) = &self.gnome_control { control.to_agent().await?; }
+        else { self.handover.to_agent().await?; }
         cua::unless_cancelled(cancel)?;
-        let before = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count());
-        match work.await {
+        let before = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count(), gnome::dispatch_count());
+        let result = if self.gnome_control.is_some() {
+            let cancellation = async {
+                if let Some(cancel) = cancel { cancel.cancelled().await; }
+                else { std::future::pending::<()>().await; }
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation => Err(IbaraError::new("OUTCOME_UNKNOWN", "GNOME action cancelled; reconcile before retry.", false)
+                    .with("execution_not_started", false).requires_reconciliation()),
+                result = work => result,
+            }
+        } else { work.await };
+        match result {
             Ok(value) => Ok(value),
             Err(error) => {
-                if error.details.get("reason").and_then(Value::as_str) == Some("interrupted") {
+                if self.gnome_control.is_none() && error.details.get("reason").and_then(Value::as_str) == Some("interrupted") {
                     self.handover.person_moved().await;
                 }
-                let started = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count()) != before
+                let started = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count(), gnome::dispatch_count()) != before
                     && error.details.get("execution_not_started") != Some(&Value::Bool(true));
                 if let Err(release) = self.release_input().await {
                     return Err(if release.code == "CONTROL_UNSETTLED" {
@@ -604,7 +659,9 @@ impl Desktop {
                             .requires_reconciliation()
                     });
                 }
-                Err(if started { error } else { error.with("execution_not_started", true) })
+                Err(if started || error.details.get("execution_not_started") == Some(&Value::Bool(false)) {
+                    error
+                } else { error.with("execution_not_started", true) })
             }
         }
     }
@@ -625,6 +682,7 @@ impl Desktop {
             // Hyprland may move the pointer onto the window it focuses.
             let motion = self.cua.motion();
             let _moving = motion.begin();
+            if let Some(gnome) = self.hypr.gnome() { return gnome.mutate("Focus", surface).await; }
             self.hypr.focus_address(&surface.address).await
         })
         .await
@@ -673,6 +731,29 @@ impl Desktop {
     /// showing that point, when known (a menu item chosen by keyboard has no
     /// point).
     pub async fn click(&self, target: &ClickTarget, button: Button, double: bool, cancel: Option<&Cancel>) -> Result<Option<(f64, f64)>> {
+        if let Some(control) = &self.gnome_control {
+            return self.effect(cancel, async {
+                self.after_typing().await;
+                let (window,x,y,screens)=match target {
+                    ClickTarget::Point {x,y,surface}=>{
+                        let (window,_,_,screens)=self.window_at(*x,*y,surface.as_ref()).await?;
+                        (window,*x,*y,screens)
+                    },
+                    ClickTarget::Element(element)=>{
+                        let live=self.ensure_focused(&element.surface).await?;
+                        let tree=native_elements::read(&live,&self.env,cancel).await?;
+                        let (x,y)=native_elements::center(tree,&element.selector,&element.role,&element.name,&live)?;
+                        let after=self.ensure_focused(&element.surface).await?;
+                        if after.geometry()!=live.geometry() {return Err(stale("Native window moved before click.").with("execution_not_started",true));}
+                        let screens=self.screens().await;
+                        if !screens.show(x,y) {return Err(stale("Native element is outside the current displays.").with("execution_not_started",true));}
+                        (live,x,y,screens)
+                    },
+                };
+                control.click(&window.id(),x,y,button,double).await?;
+                Ok(screens.fraction(x,y))
+            }).await;
+        }
         self.effect(cancel, async {
             self.after_typing().await;
             match target {
@@ -798,6 +879,16 @@ impl Desktop {
     /// Press at `from`, move to `to` over `duration` (50..3000 ms) and release,
     /// in the window under `from`. Cua releases the button itself.
     pub async fn drag(&self, from: Point, to: Point, duration: Duration, cancel: Option<&Cancel>) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            return self.effect(cancel,async {
+                let (window,_,_,screens)=self.window_at(from.x,from.y,None).await?;
+                if !screens.show(to.x,to.y) {
+                    return Err(invalid("No screen shows the point to drag to.").with("execution_not_started",true));
+                }
+                control.drag(&window.id(),(from.x,from.y),(to.x,to.y),
+                    duration.clamp(Duration::from_millis(50),Duration::from_millis(3000))).await.map(drop)
+            }).await;
+        }
         self.effect(cancel, async {
             let duration = duration.clamp(Duration::from_millis(50), Duration::from_millis(3000));
             let (window, fx, fy, screens) = self.window_at(from.x, from.y, None).await?;
@@ -818,6 +909,20 @@ impl Desktop {
 
     /// Wheel notches (−50..50 each) into the window at `at`, else the focused one.
     pub async fn scroll(&self, at: Option<Point>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            return self.effect(cancel,async {
+                if !(-50..=50).contains(&dx) || !(-50..=50).contains(&dy) {
+                    return Err(invalid("Scroll accepts -50 to 50 wheel notches per axis.").with("execution_not_started",true));
+                }
+                let window=match at {
+                    Some(at)=>self.window_at(at.x,at.y,None).await?.0,
+                    None=>self.hypr.active_window().await?.ok_or_else(||stale("No window has focus."))?,
+                };
+                let point=at.unwrap_or(Point {x:window.at[0] as f64+window.size[0] as f64/2.0,
+                    y:window.at[1] as f64+window.size[1] as f64/2.0});
+                control.scroll(&window.id(),point.x,point.y,dx,dy).await.map(drop)
+            }).await;
+        }
         self.effect(cancel, async {
             if !(-50..=50).contains(&dx) || !(-50..=50).contains(&dy) {
                 return Err(invalid("Scroll dx/dy are wheel notches from -50 to 50, not pixels; for example dy: 3 scrolls down three notches.").with("field", "dx/dy"));
@@ -840,6 +945,13 @@ impl Desktop {
     /// surface's own open menu holds the keyboard, and Cua refuses keys
     /// meanwhile ([`Desktop::key_past_menu`]).
     pub async fn key(&self, surface: &SurfaceId, combo: &str, cancel: Option<&Cancel>) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            return self.effect(cancel, async {
+                self.after_typing().await;
+                self.ensure_focused(surface).await?;
+                control.key(surface,combo).await.map(drop)
+            }).await;
+        }
         self.effect(cancel, async {
             let keys = input::cua_keys(combo)?;
             let live = self.ensure_focused(surface).await?;
@@ -929,7 +1041,76 @@ impl Desktop {
     /// cursor first glides to the field when Cua proves its box
     /// ([`cua::Cua::to_field`]); otherwise it stays. Cua shows its typing
     /// animation on the named cursor while the text goes in.
+    /// Browser field identity and exact text are proved by the page reader.
+    /// This sends one bounded piece through the same native recipient guard.
+    pub async fn browser_native_text(&self, surface: &SurfaceId, text: &str, cancel: Option<&Cancel>) -> Result<()> {
+        let control=self.gnome_control.as_ref().ok_or_else(||IbaraError::new("CAPABILITY_UNAVAILABLE","Native browser text is unavailable.",true))?;
+        input::check_text(text)?;
+        if text.len()>4000 { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE","Native browser text piece exceeds its bound.",true)); }
+        self.effect(cancel,async {
+            cua::unless_cancelled(cancel)?;
+            self.ensure_focused(surface).await?;
+            let transaction=control.begin_input(surface).await?;
+            transaction.text(text).await?;
+            transaction.finish().await?;
+            Ok(())
+        }).await
+    }
+
     pub async fn type_text(&self, surface: &SurfaceId, text: &str, cursor: TypingCursor, cancel: Option<&Cancel>) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            input::check_text(text)?;
+            if text.is_empty() { return Ok(()); }
+            return self.effect(cancel,async {
+                let live=self.ensure_focused(surface).await?;
+                let mut before=native_field::read(&live,&self.env,cancel).await?;
+                before.after_insertion(text)?; // Refuse unprovable offsets/capacity before insertion.
+                if cursor==TypingCursor::ToField {
+                    let [x,y,w,h]=before.frame;
+                    let point=(x as f64+w as f64/2.0,y as f64+h as f64/2.0);
+                    if w>0 && h>0 && point.0>=live.at[0] as f64 && point.1>=live.at[1] as f64 &&
+                        point.0<(live.at[0]+live.size[0]) as f64 && point.1<(live.at[1]+live.size[1]) as f64 {
+                        control.move_to(point.0,point.1).await?;
+                    }
+                }
+                let transaction=control.begin_input(surface).await?;
+                let fresh=native_field::read(&live,&self.env,cancel).await?;
+                if fresh!=before { return Err(stale("The native field changed before insertion.").with("execution_not_started",true)); }
+                let mut admitted=0usize;
+                let mut confirmed=0usize;
+                let result: Result<()>=async {
+                    let mut offset=0;
+                    while offset<text.len() {
+                        cua::unless_cancelled(cancel)?;
+                        self.ensure_focused(surface).await?;
+                        let mut end=(offset+4000).min(text.len());
+                        while !text.is_char_boundary(end) { end-=1; }
+                        let piece=&text[offset..end];
+                        let expected=before.after_insertion(piece)?;
+                        transaction.text(piece).await?;
+                        admitted+=piece.chars().count();
+                        let observed=tokio::time::timeout(Duration::from_secs(3),async {
+                            loop {
+                                let observed=native_field::read(&live,&self.env,cancel).await?;
+                                if expected.confirms_insertion(&observed) { return Ok::<_,IbaraError>(observed); }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted, but exact field/caret/selection readback was not confirmed. Reobserve before retrying.", false)
+                            .with("execution_not_started",false).requires_reconciliation())??;
+                        confirmed+=piece.chars().count();
+                        before=observed;
+                        offset=end;
+                    }
+                    transaction.finish().await?;
+                    Ok(())
+                }.await;
+                *self.typed_at.lock().unwrap_or_else(|p|p.into_inner())=Some(Instant::now());
+                result.map_err(|mut error| {
+                    if admitted>0 { error.retry_safe=false; error=error.with("execution_not_started",false).requires_reconciliation(); }
+                    error.with("text_admitted_codepoints",admitted).with("text_confirmed_codepoints",confirmed)
+                })
+            }).await;
+        }
         self.effect(cancel, async {
             input::check_text(text)?;
             let live = self.ensure_focused(surface).await?;
@@ -979,7 +1160,7 @@ impl Desktop {
                         async {
                             let after = native_field::read(&live, &self.env, cancel).await?;
                             if after.path == before.path && after.role == before.role && after.frame == before.frame && after.value != before.value && after.value.contains(text) { Ok(()) }
-                            else { Err(IbaraError::new("ACTION_UNCONFIRMED", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
+                            else { Err(IbaraError::new("OUTCOME_UNKNOWN", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
                         }.await
                             .map_err(|mut e| { e.retry_safe = false; e.with("execution_not_started", false).requires_reconciliation() })
                     }.await;
@@ -1020,6 +1201,10 @@ impl Desktop {
     /// Once no agent holds control, the screen goes back to the person's
     /// pointer first, or, while Cua's call was in flight, once it has ended.
     pub async fn release_input(&self) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            let release = control.release().await;
+            return release.and(run::wait_for_helpers(run::HELPER_SETTLE).await);
+        }
         let dispatcher_release = self.compositor_input.release().await;
         if !self.cua.has_agent() {
             self.handover.release().await;
@@ -1036,6 +1221,10 @@ impl Desktop {
     /// with it, and draw Hyprland's pointer again. The Hyprland plugin
     /// releases anything it held when the worker's connection closes.
     pub async fn reset_input(&self) -> Result<()> {
+        if let Some(control) = &self.gnome_control {
+            control.set_agent(None);
+            return control.release().await;
+        }
         let dispatcher_release = self.compositor_input.release().await;
         self.cua.stop().await;
         self.handover.reset().await;
@@ -1044,11 +1233,13 @@ impl Desktop {
 
     /// Keep the screen awake while an agent works (§12.1).
     pub async fn set_idle_inhibited(&self, active: bool) -> Result<()> {
+        if let Some(idle)=&self.gnome_idle {return idle.set_inhibited(active).await;}
         self.idle.set_inhibited(active).await
     }
 
     /// Keep this computer awake for good; whether stay-awake was turned on now.
     pub async fn keep_awake(&self) -> Result<bool> {
+        if let Some(idle)=&self.gnome_idle {return idle.keep_awake().await;}
         self.idle.keep_awake().await
     }
 
@@ -1091,6 +1282,13 @@ impl Desktop {
 
     /// A crop of one window as WebP or JPEG within `budget`.
     pub async fn capture_surface(&self, surface: &SurfaceId, budget: &ImageBudget) -> Result<EncodedImage> {
+        if let Some(gnome) = self.hypr.gnome() {
+            let started = Instant::now();
+            let captured_at = crate::ids::now_iso();
+            let window = self.live(surface).await?.ok_or_else(|| stale("Surface is gone."))?;
+            let frame = gnome.capture(Some(surface)).await?;
+            return Self::encode_frame(frame, window.geometry(), budget, started, captured_at).await;
+        }
         let (monitors, windows) = tokio::join!(self.hypr.monitors(), self.hypr.clients());
         let monitors = monitors?;
         let window = windows?.into_iter().find(|w| w.is(surface)).ok_or_else(|| stale("Surface is gone."))?;
@@ -1130,7 +1328,11 @@ impl Desktop {
         let started = Instant::now();
         let captured_at = crate::ids::now_iso();
         let expected = (region.width.max(0) as f64 * scale).ceil() as u64 * (region.height.max(0) as f64 * scale).ceil() as u64;
-        let frame = capture::grab(&self.cfg.grim, &self.env, source, expected, SURFACE_CAPTURE_TIMEOUT, None).await?;
+        let frame = self.grab_frame(source, expected, SURFACE_CAPTURE_TIMEOUT, None).await?;
+        Self::encode_frame(frame, region, budget, started, captured_at).await
+    }
+
+    async fn encode_frame(frame: capture::Frame, region: Rect, budget: &ImageBudget, started: Instant, captured_at: String) -> Result<EncodedImage> {
         let budget = *budget;
         let encoded = tokio::task::spawn_blocking(move || {
             let encoded = capture::encode_within(frame.pixels(), frame.width, frame.height, &budget);
@@ -1152,12 +1354,37 @@ impl Desktop {
         })
     }
 
+    async fn grab_frame(&self, source: capture::Source<'_>, expected: u64, timeout: Duration, cancel: Option<&Cancel>) -> Result<capture::Frame> {
+        if let Some(gnome) = self.hypr.gnome() {
+            cua::unless_cancelled(cancel)?;
+            let state = gnome.state().await?;
+            if state.monitors.len() != 1 { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME stage capture requires one output.", true)); }
+            let monitor = &state.monitors[0];
+            let frame = gnome.capture(None).await?;
+            cua::unless_cancelled(cancel)?;
+            if i64::from(frame.width) != monitor.width || i64::from(frame.height) != monitor.height {
+                return Err(IbaraError::new("DISPLAY_CHANGED", "GNOME capture pixels do not match the observed output; reobserve.", true));
+            }
+            return match source {
+                capture::Source::Output(name) if name == monitor.name => Ok(frame),
+                capture::Source::Output(_) => Err(IbaraError::new("STALE_TARGET", "GNOME output changed.", true)),
+                capture::Source::Region(rect) => {
+                    let x = ((f64::from(rect.x) - monitor.x as f64) * monitor.scale).round();
+                    let y = ((f64::from(rect.y) - monitor.y as f64) * monitor.scale).round();
+                    if x < 0.0 || y < 0.0 { return Err(invalid("Capture region is outside the output.")); }
+                    frame.crop(x as u32, y as u32, (f64::from(rect.width) * monitor.scale).round() as u32, (f64::from(rect.height) * monitor.scale).round() as u32)
+                }
+            };
+        }
+        capture::grab(&self.cfg.grim, &self.env, source, expected, timeout, cancel).await
+    }
+
     /// FNV-1a hash (hex) of a logical region's pixels, for change detection.
     pub async fn region_hash(&self, rect: Rect) -> Result<String> {
         let scale = self.hypr.monitors().await?.iter().map(|m| m.scale).fold(1.0f64, f64::max);
         let expected = (rect.width.max(0) as f64 * scale).ceil() as u64 * (rect.height.max(0) as f64 * scale).ceil() as u64;
         let source = capture::Source::Region(rect);
-        let frame = capture::grab(&self.cfg.grim, &self.env, source, expected, SURFACE_CAPTURE_TIMEOUT, None).await?;
+        let frame = self.grab_frame(source, expected, SURFACE_CAPTURE_TIMEOUT, None).await?;
         Ok(format!("{:x}", capture::fnv1a32(frame.pixels())))
     }
 
@@ -1244,7 +1471,7 @@ impl Desktop {
         }
         let captured_at = crate::ids::now_iso();
         let source = capture::Source::Output(display);
-        let frame = capture::grab(&self.cfg.grim, &self.env, source, pixels, PREVIEW_DEADLINE, Some(cancel)).await?;
+        let frame = self.grab_frame(source, pixels, PREVIEW_DEADLINE, Some(cancel)).await?;
         let after = self.hypr.monitors_quick().await.map_err(|_| discovery())?;
         if after.iter().find(|m| m.name == display).map(hyprland::display_revision) != Some(revision.clone()) {
             return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Display changed during capture.", true)
@@ -1312,6 +1539,24 @@ impl Desktop {
             };
             Capability { name, status, backend, last_tested_at: tested.clone(), reason }
         };
+        if let Some(gnome) = self.hypr.gnome() {
+            let state = gnome.state().await;
+            let ready = state.as_ref().map(|s| !s.locked).map_err(Clone::clone);
+            return vec![
+                row("native.gnome", "gnome-shell+ibara-identity".into(), state.as_ref().map(|_|true).map_err(Clone::clone)),
+                row("session", "gnome-session-mode".into(), ready),
+                row("native.input", "mutter-ibara-guard+gnome-shell".into(), state.as_ref().map_err(Clone::clone).and_then(|s| {
+                    if s.input_readiness_api!=1 { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME input readiness helper needs a session reload.", true)); }
+                    if s.shell_input_blocked { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any secure prompt before agent work.", true)); }
+                    Ok(!s.locked && s.guarded_input_api==1 && s.cursor_api==1 && s.monitors.len()==1 && s.monitors[0].scale==1.0)
+                })),
+                row("native.capture", "gnome-shell+ibara-snapshot".into(), state.as_ref().map(|s|
+                    !s.locked && s.capture_api==1 && s.monitors.len()==1 && s.monitors[0].scale==1.0).map_err(Clone::clone)),
+                row("native.atspi", "ibara-readonly-atspi".into(), native_elements::probe(self.env.clone()).await),
+                row("native.idle", "gnome-session-idle-cookie".into(), match &self.gnome_idle {
+                    Some(idle)=>idle.status().await.map(|_|true),None=>Ok(false)}),
+            ];
+        }
         let (monitors, plugin, hypoland, idle_status) = tokio::join!(self.hypr.monitors(), self.hypr.cua_status(), self.hypr.hypoland_version(), self.idle.status());
         let hypr_ok = monitors.as_ref().map(|m| !m.is_empty()).map_err(Clone::clone);
         let cua_present = on_path(&self.cfg.cua);

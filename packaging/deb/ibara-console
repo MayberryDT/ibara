@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+umask 077
+# Standalone GNOME uses the Console's own window controls. Qt Wayland's
+# client decorations otherwise disagree with its accessibility coordinates.
+export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+binary=/usr/lib/ibara/quickshell/bin/quickshell
+config=/usr/share/ibara/console/shell.qml
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/ibara" "${XDG_STATE_HOME:-$HOME/.local/state}/ibara"
+# Quickshell's per-config lock and IPC keep subsequent launches in one window.
+if "$binary" -p "$config" ipc call ibara open '{}' >/dev/null 2>&1; then exit 0; fi
+exec "$binary" -p "$config"

@@ -101,6 +101,36 @@ pub fn parse_ppm(bytes: Vec<u8>) -> Result<Frame> {
     Ok(Frame { bytes, offset: pos, width: width as u32, height: height as u32 })
 }
 
+/// Decode a compositor's PNG with the same geometry bound as the grim path.
+pub fn from_png(bytes: Vec<u8>) -> Result<Frame> {
+    let reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+    let (width, height) = reader.into_dimensions().map_err(|_| not_ppm())?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(IbaraError::new("BUDGET_EXCEEDED", "Capture exceeds the 16 MP geometry limit.", true));
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let rgb = reader.decode().map_err(|_| not_ppm())?.into_rgb8();
+    Ok(Frame { bytes: rgb.into_raw(), offset: 0, width, height })
+}
+
+impl Frame {
+    pub fn crop(self, x: u32, y: u32, width: u32, height: u32) -> Result<Self> {
+        if width == 0 || height == 0 || x.checked_add(width).is_none_or(|end| end > self.width)
+            || y.checked_add(height).is_none_or(|end| end > self.height) {
+            return Err(invalid("Capture region is outside the output."));
+        }
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 3);
+        for row in y..y + height {
+            let start = (row as usize * self.width as usize + x as usize) * 3;
+            bytes.extend_from_slice(&self.pixels()[start..start + width as usize * 3]);
+        }
+        Ok(Frame { bytes, offset: 0, width, height })
+    }
+}
+
 /// What to capture.
 #[derive(Debug, Clone, Copy)]
 pub enum Source<'a> {

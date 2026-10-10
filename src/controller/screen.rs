@@ -8,6 +8,7 @@ use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::{Child, Ch
 struct State {
     ready: Option<Value>,
     encoder: Option<String>,
+    capture: Option<String>,
     status: Option<Value>,
     failure: Option<String>,
     settled: Option<bool>,
@@ -35,7 +36,11 @@ impl ScreenStream {
             dir: state_dir.join("screen"), child: RefCell::new(None), stdin: Mutex::new(None), state: Rc::new(RefCell::new(State::default())), reader: RefCell::new(None) }
     }
     // Retain the capability receipt when an unused sender stops. A new start replaces it.
-    pub fn hardware_encoder(&self) -> Option<bool> { self.state.borrow().encoder.as_deref().map(|e| e == "h264_vaapi") }
+    pub fn automatic_encoder(&self) -> Option<bool> {
+        let state = self.state.borrow();
+        state.encoder.as_deref().map(|encoder| encoder == "h264_vaapi" ||
+            (encoder == "openh264" && state.capture.as_deref() == Some("gnome-pipewire-bgrx")))
+    }
     pub fn encoder(&self) -> Option<String> { self.state.borrow().encoder.clone() }
     pub fn available(&self) -> bool { self.program.is_file() }
     pub fn events(&self) -> Vec<Value> { self.state.borrow_mut().events.drain(..).collect() }
@@ -105,6 +110,7 @@ impl ScreenStream {
                 match value["t"].as_str().or_else(|| value["type"].as_str()) {
                     Some("ready") => {
                         state.encoder = Some(value["encoder"].as_str().unwrap_or("").to_owned());
+                        state.capture = value["capture"].as_str().map(str::to_owned);
                         state.ready = Some(value);
                     },
                     Some("status") => state.status = Some(value),

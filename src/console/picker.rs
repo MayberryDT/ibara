@@ -24,12 +24,16 @@ pub async fn pick_local(ctx: &Ctx) -> Handled {
         return Err(Fault::plain("The file chooser takes no arguments."));
     }
     let folder = ctx.head.command == "pick-folder";
-    let chooser = which("omarchy-file-select").or_else(|| Path::new(FILE_SELECT).exists().then(|| PathBuf::from(FILE_SELECT)));
+    let gnome = crate::desktop::gnome::Gnome::selected(&std::env::vars_os().collect::<Vec<_>>());
+    let chooser = if gnome { which("zenity") } else {
+        which("omarchy-file-select").or_else(|| Path::new(FILE_SELECT).exists().then(|| PathBuf::from(FILE_SELECT)))
+    };
     let Some(chooser) = chooser else {
-        let message = "The desktop file chooser (omarchy-file-select) is unavailable.";
+        let message = if gnome { "The desktop file chooser (zenity) is unavailable." } else { "The desktop file chooser (omarchy-file-select) is unavailable." };
         return Ok(ctx.failure("MISSING_DEPENDENCY", message, "missing-dependency", true));
     };
     let mut args = vec!["--title", if folder { "Choose a folder" } else { "Choose a file to send" }];
+    if gnome { args.push("--file-selection"); }
     if folder {
         args.push("--directory");
     }

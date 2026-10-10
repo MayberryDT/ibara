@@ -1,0 +1,7 @@
+{
+  "uuid": "ibara@zet.io",
+  "name": "ibara desktop identity",
+  "description": "Session and window identity for ibara. Does not inject global input.",
+  "shell-version": ["50"],
+  "version": 1
+}

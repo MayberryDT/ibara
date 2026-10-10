@@ -154,7 +154,7 @@ impl Controller {
         // only to one that may answer them (see `attention` below).
         let capability = match op.as_str() {
             "access_set"|"access_remove"|"access_unpair"|"answer_attention"=>Some("administer"),
-            "join" | "viewer_ticket" if self.own_screen() => Some("watch"),
+            "join" | "viewer_ticket" if self.own_screen() || self.native_screen_only => Some("watch"),
             "join" => Some("control"),
             "observe"|"observe_video"|"task_status"=>Some("watch"), "take_control"|"pause"|"resume"=>Some("control"),
             op if FILE_OPS.contains(&op)=>Some("files"),
@@ -290,9 +290,7 @@ impl Controller {
                 self.require_access(operator_id, "watch")?;
                 let reason = self.fallback_reason.borrow().clone().unwrap_or_else(|| action["reason"].as_str().unwrap_or("No first frame within 3 seconds.").into());
                 self.screen_fallback(&reason).await;
-                Ok(json!({"endpoint_id":self.endpoint_id,"controller_epoch":self.epoch,"authorization_generation":grant.generation,
-                    "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
-                    "screen_engine":"sunshine","fallback_reason":self.fallback_reason.borrow().clone(),"fallback_required":true}))
+                self.screen_fallback_reply(&grant.generation)
             }
             "handback" if self.own_screen() => {
                 let _lock = self.viewer_lock.lock().await;
@@ -312,7 +310,7 @@ impl Controller {
                 value.as_object_mut().unwrap().extend(identity(&grant.generation));
                 Ok(value)
             },
-            "viewer_ticket" if self.own_screen() => self.join_screen(operator_id, &action, &authorize).await,
+            "viewer_ticket" if self.own_screen() || self.native_screen_only => self.join_screen(operator_id, &action, &authorize).await,
             "viewer_ticket" => self.viewer_ticket(operator_id, &authorize).await,
             // The server saves the certificate once this has authorized it.
             "viewer_register" => {
@@ -457,7 +455,7 @@ impl Controller {
         };
         let control_allowed=crate::access::Access::load(&self.journal)?.is_none_or(|a|a.rule(operator_id,"control",self.now_ms())!=super::Rule::Deny);
         let stream = self.stream.as_ref().is_some_and(|s| s.available()) || self.screen.as_ref().is_some_and(|s| s.available());
-        let interactive = if (control_allowed || (self.own_screen() && current.observe)) && stream && !fault {
+        let interactive = if (control_allowed || ((self.own_screen() || self.native_screen_only) && current.observe)) && stream && !fault {
             "available_if_exclusive"
         } else {
             "unsupported_without_verified_viewer_adapter"

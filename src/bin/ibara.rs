@@ -49,7 +49,7 @@ fn main() -> ExitCode {
 const USAGE: &str = "Usage: ibara COMMAND …
 
 Commands:
-  setup             Set ibara up for you on this computer (run after installing or updating)
+  setup             Set ibara up (--role operator|target|both)
   update            Install the latest ibara release
   rollback          Go back to the release installed before this one
   uninstall         Remove ibara (--delete-data also removes its data)

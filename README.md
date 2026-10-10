@@ -8,14 +8,13 @@ ibara gives your agents computer use across the Omarchy machines you own. Put a 
 
 [![CI](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml/badge.svg)](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/mayberrydt/ibara)
 
 ![Your agent works there, you keep working here: your computer and a spare joined over Tailscale, with Claude Code on yours and the agent using the spare's desktop](docs/media/what-it-is.webp)
 
 Every computer you add shows up as a live picture in a console on the others, where you can watch it, send it files and take control of it.
 Your agents work on those computers' real desktops, with their own cursor, while you approve what matters and step in whenever you like.
 
-ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland), and your computers reach each other only over your own [Tailscale](https://tailscale.com) network. It is free and open source.
+ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland). Ubuntu 26.04 amd64 has separate standalone Console and GNOME target packages; see [Ubuntu installation and compatibility](packaging/deb/README.md). Your computers reach each other over your own [Tailscale](https://tailscale.com) network. It is free and open source.
 
 Want it set up for you? [Cirlet](https://cirlet.com/any-agent) offers paid setup and support.
 

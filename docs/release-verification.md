@@ -4,7 +4,7 @@ Every ibara release is signed. The one-line installer and `ibara update` check t
 
 ## What a release contains
 
-Each release on the [releases page](https://github.com/MayberryDT/ibara/releases) has exactly 7 files:
+The [releases page](https://github.com/MayberryDT/ibara/releases) carries signed platform channels. The Omarchy channel contains these files:
 
 | File | What it is |
 |---|---|
@@ -15,6 +15,8 @@ Each release on the [releases page](https://github.com/MayberryDT/ibara/releases
 | `ibara-stream-VERSION-x86_64.pkg.tar.zst` | The streaming host for Take Control |
 | `ibara-view-VERSION-x86_64.pkg.tar.zst` | The viewer for Take Control |
 | `ibara-VERSION-source.tar.gz` | The full source of all 3 packages |
+
+Ubuntu uses `stable-ubuntu-26.04-amd64-operator.json` or `stable-ubuntu-26.04-amd64-target.json`, each with its `.sig`. The operator manifest binds one operator DEB; the target manifest binds the target DEB and all four matching Mutter components. `install-ubuntu` verifies the selected role and complete package set. Corresponding ibara, Mutter and Quickshell source archives accompany the Ubuntu assets. Check each package's recorded SHA-256 and size before installation. The latest Ubuntu release retains the existing Omarchy manifest and package bytes; its Ubuntu version does not imply an Omarchy update.
 
 ## The release key
 

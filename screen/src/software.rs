@@ -159,6 +159,19 @@ impl Encoder {
         );
         self.encode_yuv(&yuv, keyframe)
     }
+    pub fn encode_rgba(&mut self, pixels:&[u8], width:u32, height:u32, keyframe:bool)->Result<Vec<(bool,Vec<u8>)>> {
+        ensure!(width>=2 && height>=2 && width<=4096 && height<=4096 &&
+            pixels.len()==width as usize*height as usize*4,"Invalid CPU capture pixels");
+        let mut rgba=vec![0u8;self.width as usize*self.height as usize*4];
+        for y in 0..self.height as usize {for x in 0..self.width as usize {
+            let src=((y*height as usize/self.height as usize)*width as usize+x*width as usize/self.width as usize)*4;
+            let dst=(y*self.width as usize+x)*4;
+            rgba[dst..dst+4].copy_from_slice(&pixels[src..src+4]);
+        }}
+        let yuv=openh264::formats::YUVBuffer::from_rgb_source(
+            openh264::formats::RgbaSliceU8::new(&rgba,(self.width as usize,self.height as usize)));
+        self.encode_yuv(&yuv,keyframe)
+    }
     fn encode_yuv(&mut self, yuv: &openh264::formats::YUVBuffer, keyframe: bool) -> Result<Vec<(bool, Vec<u8>)>> {
         if keyframe || self.reset {
             self.encoder.force_intra_frame();

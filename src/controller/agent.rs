@@ -1535,6 +1535,7 @@ impl Controller {
         let mut stop = false;
         let mut attention: Option<(usize, String)> = None;
         let mut touched_desktop = false;
+        let mut late_windows: Option<(WinKey, Vec<Win>)> = None;
         // A step's "after" picture is the next step's "before" when both show
         // the same window: nothing acts in between.
         let mut last_after: Option<(WinKey, Image)> = None;
@@ -1778,6 +1779,12 @@ impl Controller {
                 receipt0 = receipt.clone();
             }
             self.track_new_windows(ctx.task_ref, &windows, &resolved, focused_before.as_ref(), launched).await;
+            let late_owner=if matches!(&resolved.plan,Planned::Desktop(effect) if matches!(effect.as_ref(),Effect::Launch{..})) {
+                if let (Some(owner),Ok(after))=(step_owner(&resolved,focused_before.as_ref(),launched),self.desktop.windows().await) {
+                    after.iter().find(|w|self.claims(&owner,&windows,w) && w.process_start_ticks.is_some()).map(Win::key)
+                } else {None}
+            } else {step_surface(&resolved,focused_before.as_ref())};
+            late_windows = late_owner.map(|owner| (owner, windows.clone()));
             self.timeline("step", Some(ctx.task_ref), &ctx.lease.principal, &clip(&text, 200), json!({ "op": op_ref, "outcome": outcome_name(outcome), "effect_class": resolved.class, "replay": replay }));
             results.push(step_result(i, outcome, text, Some(&op_ref)));
         }
@@ -1787,6 +1794,22 @@ impl Controller {
             let expect = Expectation::Settled(crate::contract::SettledExpect { quiet_ms: 100, within_ms: Some(800) });
             Some(self.await_expectation(ctx.task_ref, &expect, &[], None, None, ctx.gone).await)
         } else { None };
+        // Native dialog replacement can land during the final quiet check.
+        // Claim only the acted-on process incarnation, while this task still
+        // has authority, and never a window already present before the step.
+        if quiet.is_some() && self.assert_authority(ctx.lease).is_ok()
+            && let Some((owner, before)) = late_windows
+            && let Some(start) = owner.process_start_ticks
+            && let Ok(after) = self.desktop.windows().await
+        {
+            for window in after.iter().filter(|window| window.pid == owner.pid
+                && window.process_start_ticks == Some(start)
+                && !before.iter().any(|old| old.address == window.address)) {
+                self.record_window(self.journal.own_window(ctx.task_ref, &window.address,
+                    window.pid, &window.class, &window.title, window.process_start_ticks,
+                    &window.compositor_instance));
+            }
+        }
         let frame = if touched_desktop || results.iter().any(|r| r.outcome != StepOutcome::NotRun) {
             let task = self.task(ctx.task_ref)?;
             let spec = FrameSpec { view: View::Elements, ..FrameSpec::default() };
@@ -2339,7 +2362,9 @@ impl Controller {
 
     /// Replace the text of the field just clicked, once the page reader says
     /// that field has the keyboard focus: text is never aimed at the address
-    /// bar or wherever else the focus is. ASCII is typed with Cua's keyboard.
+    /// bar or wherever else the focus is. GNOME uses guarded native UTF-8
+    /// input with native and page readback, preserving clipboard contents.
+    /// Other environments type ASCII with Cua's keyboard.
     /// Other characters, which Cua cannot type, are pasted: the person's
     /// clipboard is set aside first (every type) and watched, holds each such
     /// piece for one Ctrl+V whose arrival the page reader confirms, and is put
@@ -2356,7 +2381,7 @@ impl Controller {
                 .with("clicked", true)
                 .with("execution_not_started", true));
         }
-        if text.is_ascii() {
+        if text.is_ascii() || self.desktop.native_unicode_typing() {
             return self.replace_text(step, target, text, cancel).await;
         }
         self.desktop.clipboard_set_aside().await.map_err(|e| {
@@ -2416,6 +2441,24 @@ impl Controller {
         act(key("ctrl+a")).await.map_err(stopped(0))?;
         if text.is_empty() {
             return act(key("BackSpace")).await.map_err(|e| e.with("execution_not_started", false));
+        }
+        if self.desktop.native_unicode_typing() {
+            let mut offset=0;
+            while offset<text.len() {
+                let mut end=(offset+4000).min(text.len());
+                while !text.is_char_boundary(end) { end-=1; }
+                let before=text[..offset].chars().count();
+                let focused=self.desktop.browser_call("field",target.clone(),false).await?;
+                if focused.get("focused").and_then(Value::as_bool)!=Some(true) {
+                    return Err(stopped(before)(fail("STALE_TARGET","The browser field lost focus before native text.",true).with("execution_not_started",true)));
+                }
+                crate::desktop::cua::unless_cancelled(Some(cancel)).map_err(stopped(before))?;
+                self.turns.borrow_mut().before_action()?;
+                self.desktop.browser_native_text(&step.window,&text[offset..end],cancel).await.map_err(stopped(before))?;
+                self.field_shows(target,&text[..end]).await?;
+                offset=end;
+            }
+            return Ok(Done::default());
         }
         let runs = text_runs(text);
         let mut shown = String::with_capacity(text.len());

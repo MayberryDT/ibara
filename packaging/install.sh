@@ -30,7 +30,19 @@ fetch() {
 main() {
   set -eu
   [ "$(id -u)" -ne 0 ] || die "run it as yourself, not as root. It asks for your password when it needs it."
-  command -v pacman >/dev/null 2>&1 || die "ibara needs Arch Linux with Omarchy."
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    if [ "${ID:-}" = ubuntu ]; then
+      command -v curl >/dev/null 2>&1 || die "install curl first: sudo apt-get install curl"
+      command -v bash >/dev/null 2>&1 || die "bash is required for the Ubuntu installer."
+      ubuntu_installer=$(mktemp)
+      trap 'rm -f "$ubuntu_installer"' EXIT INT TERM
+      fetch install-ubuntu "$ubuntu_installer"
+      bash "$ubuntu_installer" "$@"
+      return
+    fi
+  fi
+  command -v pacman >/dev/null 2>&1 || die "ibara supports Arch with Omarchy and Ubuntu 26.04 amd64."
   for tool in curl jq sha256sum sudo; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is missing. Install it with: sudo pacman -S $tool"
   done

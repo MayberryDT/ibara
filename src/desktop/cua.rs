@@ -247,6 +247,7 @@ fn unavailable(message: impl Into<String>) -> IbaraError {
 
 /// A Cua window id is the Hyprland window address as an integer.
 pub fn window_id(address: &str) -> Result<u64> {
+    if let Some(id) = address.strip_prefix("gnome:") { return id.parse::<u32>().map(u64::from).map_err(|_| invalid("Invalid GNOME window token.")); }
     u64::from_str_radix(address.trim_start_matches("0x"), 16).map_err(|_| invalid("Invalid window address."))
 }
 
@@ -1397,7 +1398,7 @@ fn tree_from_snapshot(pid: i64, window: u64, snapshot: &Value) -> Tree {
 }
 
 /// Query filter, ranking and paging over a whole snapshot.
-fn page(tree: Tree, query: Option<&str>, limit: u32, cursor: Option<u32>) -> ElementPage {
+pub(super) fn page(tree: Tree, query: Option<&str>, limit: u32, cursor: Option<u32>) -> ElementPage {
     if !tree.available {
         return ElementPage::default();
     }

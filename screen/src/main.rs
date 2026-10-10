@@ -1,4 +1,7 @@
 mod capture;
+#[cfg(feature="qualification")]
+mod transport_probe;
+mod gnome_capture;
 mod codec;
 mod nvenc;
 mod nvenc_egl;
@@ -16,9 +19,17 @@ fn now_us() -> u64 {
 fn now_ms() -> u64 {
     ibara_screen::now_ms()
 }
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create screen runtime");
+    let result = runtime.block_on(run());
+    // Sender cleanup has settled input and joined capture before returning.
+    // Tokio's blocking stdin read cannot be cancelled while its parent pipe
+    // stays open; it must not keep the finished process alive.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    if let Err(e) = result {
         eprintln!("ibara-screen: {e:#}");
         std::process::exit(1);
     }
@@ -27,6 +38,37 @@ async fn run() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let home = std::path::PathBuf::from(std::env::var("HOME")?);
     match args.first().map(String::as_str) {
+        #[cfg(feature = "qualification")]
+        Some("capture-boundary-proof") => {
+            let root=args.get(1).ok_or_else(||anyhow::anyhow!("Expected boundary fixture root"))?.clone();
+            tokio::task::spawn_blocking(move ||gnome_capture::boundary_proof(std::path::Path::new(&root))).await?
+        },
+        #[cfg(feature = "qualification")]
+        Some("capture-revocation-proof") => {
+            let path=args.get(1).ok_or_else(||anyhow::anyhow!("Expected revocation receipt output"))?.clone();
+            tokio::task::spawn_blocking(move ||gnome_capture::revocation_proof(std::path::Path::new(&path))).await?
+        },
+        #[cfg(feature = "qualification")]
+        Some("capture-stream-proof") => {
+            let path=args.get(1).ok_or_else(||anyhow::anyhow!("Expected synthetic stream output"))?;
+            gnome_capture::stream_proof(std::path::Path::new(path)).await
+        },
+        #[cfg(feature = "qualification")]
+        Some("capture-proof") => {
+            let path=args.get(1).ok_or_else(||anyhow::anyhow!("Expected synthetic fixture PPM output"))?.clone();
+            tokio::task::spawn_blocking(move ||gnome_capture::proof(std::path::Path::new(&path))).await?
+        },
+        #[cfg(feature = "qualification")]
+        Some("transport-proof") => {
+            let dir=args.get(1).ok_or_else(||anyhow::anyhow!("Expected private receiver directory"))?;
+            let output=args.get(2).ok_or_else(||anyhow::anyhow!("Expected H.264 output"))?;
+            transport_probe::run(std::path::Path::new(dir),std::path::Path::new(output)).await
+        },
+        #[cfg(feature = "qualification")]
+        Some("send-proof") => {
+            let dir=args.get(1).ok_or_else(||anyhow::anyhow!("Expected private state directory"))?;
+            sender::proof_run(std::path::Path::new(dir)).await
+        },
         Some("send") => {
             let dir = args
                 .windows(2)

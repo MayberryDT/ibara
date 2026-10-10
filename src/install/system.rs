@@ -32,9 +32,10 @@ const LEGACY_UNITS: [&str; 4] =
     ["ibara-viewer-control.socket", "ibara-viewer-control@.service", "ibara-viewer-enroll.socket", "ibara-viewer-enroll@.service"];
 
 /// The agent entry, the pairing listener and streaming, on the tailnet interface only.
-pub const FIREWALL_RULES: [(&str, &str, &str); 4] = [
+pub const FIREWALL_RULES: [(&str, &str, &str); 5] = [
     ("2222", "tcp", "ibara agent entry"),
     ("24247", "tcp", "ibara pairing"),
+    ("47910", "udp", "ibara screen"),
     ("47984,47989,48010", "tcp", "ibara streaming"),
     ("47998,47999,48000,48002", "udp", "ibara streaming"),
 ];
@@ -46,6 +47,15 @@ pub fn main(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["setup", user] => setup(&Account::desktop(user)?),
+        ["uninstall-operator", user] => {
+            let _desktop = Account::desktop(user)?;
+            if super::package::Kind::host()? != super::package::Kind::Ubuntu || super::gnome::target_package() {
+                return Err("Operator-only removal is available only for an Ubuntu operator installation without a target foundation.".into());
+            }
+            let kind = super::package::Kind::host()?;
+            let packages: Vec<&str> = super::update::PACKAGES.iter().copied().filter(|name| kind.version(name).is_some()).collect();
+            if packages.is_empty() { Ok(()) } else { kind.remove(&packages) }
+        }
         ["refresh"] => refresh(),
         ["rebuild-cua"] => rebuild_cua(),
         ["uninstall", user, rest @ ..] => {
@@ -86,21 +96,23 @@ pub fn setup(desktop: &Account) -> Result<(), String> {
 /// Setup's steps. `by_person`: the person ran `ibara setup`, so Tailscale's
 /// daemon is turned on; the pacman hook leaves it as the person left it.
 fn set_up(desktop: &Account, by_person: bool) -> Result<(), String> {
+    let gnome=super::package::Kind::host()? == super::package::Kind::Ubuntu;
+    if gnome {super::gnome::require_desktop_session(desktop)?;}
     println!("Setting up this computer for {} (as root):", desktop.name);
-    super::omarchy_update::clear_leftover_sudoers();
+    if !gnome {super::omarchy_update::clear_leftover_sudoers();}
     step("Checking this computer", || preconditions(desktop))?;
     step("Accounts", accounts)?;
     step("Folders", || folders(desktop))?;
     step("Keys and policy", || keys(desktop))?;
     step("Agent entry (SSH on port 2222)", || gateway(desktop))?;
     step("System services", || services(desktop))?;
-    step("Firewall", firewall)?;
+    step("Firewall", ||firewall(gnome))?;
     if by_person {
         step("Tailscale", || tailscale(desktop))?;
     }
     step("Browser page reader", || browser(desktop))?;
     step("Take Control input", uinput)?;
-    step("Desktop input and virtual screen", || cua_plugin(desktop))?;
+    if !gnome {step("Desktop input and virtual screen", || cua_plugin(desktop))?;}
     Ok(())
 }
 
@@ -125,6 +137,7 @@ fn refresh() -> Result<(), String> {
     if std::env::var_os("IBARA_INSTALLER").is_some() {
         return Ok(());
     }
+    if super::package::Kind::host()? == super::package::Kind::Ubuntu && !super::gnome::target_package() { return Ok(()); }
     let Some(owner) = station_owner() else { return Ok(()) };
     set_up(&Account::desktop(&owner)?, false)
 }
@@ -138,11 +151,18 @@ fn rebuild_cua() -> Result<(), String> {
     step("Desktop input and virtual screen", || cua_plugin(&desktop))
 }
 
+fn sshd_path() -> Result<&'static str, String> {
+    Ok(match super::package::Kind::host()? {
+        super::package::Kind::Ubuntu => "/usr/sbin/sshd",
+        super::package::Kind::Arch => "/usr/bin/sshd",
+    })
+}
+
 fn preconditions(desktop: &Account) -> Result<(), String> {
     if !Path::new(LIB).join("bin/ibara").is_file() {
         return Err(format!("The ibara package is not installed ({LIB} is missing)."));
     }
-    for (program, package) in [("/usr/bin/sshd", "openssh"), ("/usr/bin/setfacl", "acl"), ("/usr/bin/openssl", "openssl")] {
+    for (program, package) in [(sshd_path()?, if super::package::Kind::host()? == super::package::Kind::Ubuntu {"openssh-server"} else {"openssh"}), ("/usr/bin/setfacl", "acl"), ("/usr/bin/openssl", "openssl")] {
         if !Path::new(program).is_file() {
             return Err(format!("{program} is missing; install the {package} package."));
         }
@@ -332,7 +352,7 @@ fn gateway(desktop: &Account) -> Result<(), String> {
     create_root(&ssh.join("authorized_keys"), b"", 0o644)?;
     let config = ssh.join("sshd_config");
     write_root(&config, sshd_config().as_bytes(), 0o600)?;
-    run("/usr/bin/sshd", &["-t", "-f", &config.to_string_lossy()])?;
+    run(sshd_path()?, &["-t", "-f", &config.to_string_lossy()])?;
     // Seal the access projection's inventory for this desktop account once.
     if std::fs::symlink_metadata(Path::new(CONFIG_DIR).join("access-transport.json")).is_err() {
         output(Command::new(Path::new(LIB).join("bin/ibara")).args(["access-system", "init", &desktop.name]))?;
@@ -464,7 +484,7 @@ pub fn ibara_rules(status_numbered: &str, all: bool) -> Vec<u32> {
 }
 
 fn ufw_active() -> Option<bool> {
-    if !Path::new("/usr/bin/ufw").is_file() {
+    if super::program("ufw").is_none() {
         return None;
     }
     Some(run("ufw", &["status"]).is_ok_and(|s| s.lines().any(|l| l.trim() == "Status: active")))
@@ -473,7 +493,7 @@ fn ufw_active() -> Option<bool> {
 /// Open the agent entry, pairing and streaming to the tailnet only. Tailscale
 /// has already authenticated every computer there; SSH still needs an enrolled
 /// key, pairing another person's Accept, and streaming a paired viewer.
-fn firewall() -> Result<(), String> {
+fn firewall(gnome:bool) -> Result<(), String> {
     match ufw_active() {
         None => {
             println!("    No ufw on this computer; nothing to open.");
@@ -489,6 +509,7 @@ fn firewall() -> Result<(), String> {
         run("ufw", &["--force", "delete", &number.to_string()])?;
     }
     for (ports, proto, comment) in FIREWALL_RULES {
+        if gnome && !["2222","24247","47910"].contains(&ports) {continue;}
         run("ufw", &["allow", "in", "on", "tailscale0", "to", "any", "port", ports, "proto", proto, "comment", comment])?;
     }
     Ok(())
@@ -682,13 +703,13 @@ fn uninstall(desktop: &Account, delete_data: bool) -> Result<(), String> {
         println!("  Kept: this computer's keys and identity ({CONFIG_DIR}, {OPERATOR_PUBLIC}, {STATION}) for a later install.");
     }
     step("The ibara packages", || {
+        let kind = super::package::Kind::host()?;
         let installed: Vec<&str> =
-            super::update::PACKAGES.iter().copied().filter(|name| run("pacman", &["-Q", name]).is_ok()).collect();
+            super::update::PACKAGES.iter().copied().filter(|name| kind.version(name).is_some()).collect();
         if installed.is_empty() {
             return Ok(());
         }
-        let status = Command::new("pacman").args(["-R", "--noconfirm"]).args(&installed).status().map_err(|e| format!("pacman: {e}"))?;
-        if status.success() { Ok(()) } else { Err(format!("pacman could not remove {}.", installed.join(", "))) }
+        kind.remove(&installed)
     })?;
     Ok(())
 }

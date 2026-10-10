@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/MayberryDT/ibara/security/advisories/new
+    about: Report vulnerabilities privately, not as issues.
+  - name: Installing, agents, pairing or Take Control
+    url: https://github.com/MayberryDT/ibara/issues
+    about: Most problems outside the console itself belong in ibara's core.

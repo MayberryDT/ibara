@@ -13,7 +13,7 @@ use serde_json::Value;
 pub const MAX_LIMIT: u32 = 100;
 
 /// One element before compaction.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RawElement {
     pub selector: Value,
@@ -26,7 +26,7 @@ pub struct RawElement {
 }
 
 /// A window's elements.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Tree {
     pub available: bool,
     pub truncated: bool,

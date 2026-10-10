@@ -24,7 +24,7 @@
 
 use super::user::as_root;
 use super::{
-    Account, LIB, PACKAGE_CACHE, USER_UNITS, installed_version, interactive, is_root, output, root_dir, sha256_hex, vercmp,
+    Account, LIB, PACKAGE_CACHE, USER_UNITS, installed_version, is_root, output, root_dir, sha256_hex, vercmp,
     write_root,
 };
 use serde_json::{Map, Value, json};
@@ -42,6 +42,30 @@ const MAX_MANIFEST: usize = 256 * 1024;
 const KEEP_RELEASES: usize = 3;
 /// The packages of every release, installed, kept and gone back to together.
 pub const PACKAGES: [&str; 3] = ["ibara", "ibara-stream", "ibara-view"];
+
+const GNOME_PACKAGES: [&str; 4] = ["libmutter-18-0", "mutter-common", "mutter-common-bin", "gir1.2-mutter-18"];
+const NATIVE_VERSION: &str = "50.1-0ubuntu2.4+ibara2";
+
+fn host_packages() -> Result<Vec<&'static str>, String> {
+    match super::package::Kind::host()? {
+        super::package::Kind::Arch => Ok(PACKAGES.to_vec()),
+        super::package::Kind::Ubuntu => {
+            let mut names=vec!["ibara"];
+            if Path::new(LIB).join("gnome-target.json").exists() { names.extend(GNOME_PACKAGES); }
+            Ok(names)
+        }
+    }
+}
+
+fn complete_set(files: &[(&str, String)]) -> Result<String, String> {
+    let names=host_packages()?;
+    let version=files.iter().find(|f|f.0=="ibara").map(|f|f.1.clone()).ok_or("Missing ibara package.")?;
+    if files.len()!=names.len() || names.iter().any(|name|files.iter().filter(|f|f.0==*name).count()!=1) ||
+        files.iter().any(|(name,v)|v!=if GNOME_PACKAGES.contains(name) {NATIVE_VERSION} else {&version}) {
+        return Err(format!("An update requires the complete matching host-role set: {}.",names.join(", ")));
+    }
+    Ok(version)
+}
 
 /// Where releases come from and the key they must be signed with.
 #[derive(Debug, Clone)]
@@ -148,12 +172,20 @@ pub fn verify(manifest: &[u8], signature: &[u8], key: &str, dir: &Path) -> Resul
     let text = |v: &Value| v.as_str().map(str::to_string);
     let version = text(&value["version"]).unwrap_or_default();
     let version_ok = !version.is_empty() && version.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-:".contains(&b));
-    if value["schema_version"] != json!(2) || value["name"] != json!("ibara") || !version_ok {
-        return Err(incomplete());
-    }
-    let listed = value["packages"].as_array().filter(|list| list.len() == PACKAGES.len()).ok_or_else(incomplete)?;
-    let mut packages = Vec::with_capacity(PACKAGES.len());
-    for name in PACKAGES {
+    if value["name"] != json!("ibara") || !version_ok { return Err(incomplete()); }
+    let names=if value["schema_version"]==json!(3) {
+        if super::package::Kind::host()?!=super::package::Kind::Ubuntu || value["platform"]!=json!({"os":"ubuntu","version":"26.04","architecture":"amd64"}) { return Err("The signed release is for a different environment.".into()); }
+        let names=host_packages()?;
+        let target=names.len()>1;
+        if value["role"]!=json!(if target {"target"} else {"operator"}) ||
+            (target && value["native"]!=json!({"version":NATIVE_VERSION,"mutter_abi":18,"guard_api":1,"helper_api":1})) ||
+            (!target && !value["native"].is_null()) { return Err("The signed release has a different role or native ABI.".into()); }
+        names
+    } else if value["schema_version"]==json!(2) && super::package::Kind::host()?==super::package::Kind::Arch { PACKAGES.to_vec() }
+    else { return Err(incomplete()); };
+    let listed = value["packages"].as_array().filter(|list| list.len() == names.len()).ok_or_else(incomplete)?;
+    let mut packages = Vec::with_capacity(names.len());
+    for name in names {
         let entry = listed.iter().find(|p| p["name"] == json!(name)).ok_or_else(incomplete)?;
         let package = Package {
             name: name.to_string(),
@@ -162,7 +194,7 @@ pub fn verify(manifest: &[u8], signature: &[u8], key: &str, dir: &Path) -> Resul
             size: entry["size"].as_u64().unwrap_or(0),
         };
         // This package, at this release's version, and nothing that could be a path.
-        let file_ok = package_version(name, &package.file).as_deref() == Some(version.as_str())
+        let file_ok = package_version(name, &package.file).as_deref() == Some(if GNOME_PACKAGES.contains(&name) { NATIVE_VERSION } else { version.as_str() })
             && package.file.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
         let sha_ok = package.sha256.len() == 64 && package.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
         if !file_ok || !sha_ok || package.size == 0 {
@@ -189,10 +221,16 @@ pub(crate) fn scratch() -> Result<PathBuf, String> {
 pub(crate) fn latest(channel: &Channel, dir: &Path) -> Result<Release, String> {
     let manifest = dir.join("download.json");
     let signature = dir.join("download.json.sig");
-    channel.fetch_manifest("stable.json", &manifest)?;
-    channel.fetch_manifest("stable.json.sig", &signature)?;
+    let kind = super::package::Kind::host()?;
+    let file = kind.manifest();
+    channel.fetch_manifest(file, &manifest)?;
+    channel.fetch_manifest(&format!("{file}.sig"), &signature)?;
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
-    verify(&read(&manifest)?, &read(&signature)?, &channel.key, dir)
+    let release = verify(&read(&manifest)?, &read(&signature)?, &channel.key, dir)?;
+    if release.packages.iter().any(|p| kind.file_version(&p.name, &p.file).as_deref() != Some(if GNOME_PACKAGES.contains(&p.name.as_str()) { NATIVE_VERSION } else { &release.version })) {
+        return Err("The signed release contains a package for a different environment; nothing was installed.".into());
+    }
+    Ok(release)
 }
 
 pub fn update(args: &[String]) -> Result<(), String> {
@@ -258,7 +296,9 @@ pub fn check(args: &[String]) -> Result<bool, String> {
 /// Download the packages of a verified release into `dir`, each checked
 /// against the manifest: `PATH SHA256` pairs for [`system_update`].
 fn download(channel: &Channel, release: &Release, dir: &Path) -> Result<Vec<String>, String> {
-    let mut pairs = Vec::new();
+    let mut pairs = if super::package::Kind::host()? == super::package::Kind::Ubuntu {
+        vec!["--signed-set".into(), dir.join("download.json").to_string_lossy().into_owned(), dir.join("download.json.sig").to_string_lossy().into_owned()]
+    } else { Vec::new() };
     for package in &release.packages {
         let path = dir.join(&package.file);
         channel.fetch(&package.file, &path)?;
@@ -470,16 +510,24 @@ fn become_account(desktop: &Account, name: &std::ffi::CStr) -> Result<(), String
 
 fn restart_services() -> Result<(), String> {
     output(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-    output(Command::new("systemctl").args(["--user", "restart", USER_UNITS[0], USER_UNITS[1]]))?;
+    if super::package::Kind::host()?==super::package::Kind::Ubuntu {
+        for unit in USER_UNITS {
+            if Command::new("systemctl").args(["--user","is-enabled","--quiet",unit]).status().is_ok_and(|s|s.success()) {
+                output(Command::new("systemctl").args(["--user","restart",unit]))?;
+            }
+        }
+    } else { output(Command::new("systemctl").args(["--user", "restart", USER_UNITS[0], USER_UNITS[1]]))?; }
     Ok(())
 }
 
 /// Whether an agent task holds this computer, from its controller (`ibara admin status`).
 fn busy() -> Result<Option<String>, String> {
+    if super::package::Kind::host()?==super::package::Kind::Ubuntu && !super::gnome::target_package() { return Ok(None); }
     let status = output(Command::new(Path::new(LIB).join("bin/ibara")).args(["admin", "status"]))?;
     let status: Value = serde_json::from_str(&status).map_err(|_| "Could not check whether this computer is busy.")?;
     let result = status.get("result").filter(|r| r.is_object()).ok_or("Could not check whether this computer is busy.")?;
-    if result["control"]["human_control"] == true && result["control"]["pause_origin"] == "person" {
+    if result["control"]["unsettled"]==true { return Ok(Some("Earlier work is still settling. Retry when it is settled.".into())); }
+    if result["control"]["human_control"] == true {
         return Ok(Some("A person holds control. Try again after Hand Back.".into()));
     }
     Ok(result.get("lease").filter(|l| !l.is_null()).map(|l| format!("{} is working on this computer. Try again once it has finished.", l["client_name"].as_str().or(l["principal"].as_str()).unwrap_or("An agent"))))
@@ -495,20 +543,36 @@ pub(super) fn refuse_while_busy() -> Result<(), String> {
 /// The version in a package file name of `name` (`ibara-0.2.0-1-x86_64.pkg.tar.zst`
 /// → `0.2.0-1` for `ibara`; `ibara-stream-…` is not an `ibara` package).
 pub fn package_version(name: &str, file: &str) -> Option<String> {
-    let rest = file.strip_prefix(name)?.strip_prefix('-')?.strip_suffix(".pkg.tar.zst")?;
-    let (version, arch) = rest.rsplit_once('-')?;
-    let starts = version.bytes().next().is_some_and(|b| b.is_ascii_digit());
-    (starts && !arch.is_empty() && version.contains('-')).then(|| version.to_string())
+    super::package::Kind::Arch.file_version(name, file)
+        .or_else(|| super::package::Kind::Ubuntu.file_version(name, file))
 }
 
 /// Which of [`PACKAGES`] a file is, and its version.
 fn release_file(file: &str) -> Option<(&'static str, String)> {
-    PACKAGES.iter().find_map(|name| Some((*name, package_version(name, file)?)))
+    let kind = super::package::Kind::host().ok()?;
+    host_packages().ok()?.into_iter().find_map(|name| Some((name, kind.file_version(name, file)?)))
 }
 
 /// Root: install the three packages of one release the person's `ibara
 /// update` verified, given as `PACKAGE SHA256` pairs.
 pub fn system_update(desktop: &Account, pairs: &[&str]) -> Result<(), String> {
+    let ubuntu = super::package::Kind::host()? == super::package::Kind::Ubuntu;
+    let signed = if ubuntu {
+        let ["--signed-set", manifest, signature, ..] = pairs else { return Err("Ubuntu installation requires its signed coordinated manifest.".into()); };
+        let read = |path: &str, max: u64| -> Result<Vec<u8>, String> {
+            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+            if !meta.is_file() || meta.len() > max { return Err("Invalid signed release file.".into()); }
+            std::fs::read(path).map_err(|e| e.to_string())
+        };
+        let body = read(manifest, MAX_MANIFEST as u64)?;
+        let signature = read(signature, 16384)?;
+        let channel = Channel::built_in().ok_or("This build has no release signing key.")?;
+        let dir = scratch()?;
+        let release = verify(&body, &signature, &channel.key, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        Some((body, signature, release?))
+    } else { None };
+    let pairs = if ubuntu { &pairs[3..] } else { pairs };
     let mut files = Vec::new();
     for pair in pairs.chunks(2) {
         let [package, sha256] = pair else { return Err("Expected each package with its SHA-256.".into()) };
@@ -526,23 +590,52 @@ pub fn system_update(desktop: &Account, pairs: &[&str]) -> Result<(), String> {
         }
         files.push((name, version, file, bytes));
     }
-    let version = files.first().map(|f| f.1.clone()).unwrap_or_default();
-    let complete = PACKAGES.iter().all(|name| files.iter().filter(|f| f.0 == *name).count() == 1);
-    if files.len() != PACKAGES.len() || !complete || files.iter().any(|f| f.1 != version) {
-        return Err(format!("An update installs {} of one release together.", PACKAGES.join(", ")));
+    let version=complete_set(&files.iter().map(|f|(f.0,f.1.clone())).collect::<Vec<_>>())?;
+    if let Some((_, _, release)) = &signed {
+        if release.version != version || release.packages.len() != files.len() || release.packages.iter().any(|package|
+            !files.iter().any(|(name, _, file, bytes)| *name == package.name && *file == package.file && bytes.len() as u64 == package.size && sha256_hex(bytes) == package.sha256)) {
+            return Err("Root package bytes do not match the signed coordinated release; nothing was installed.".into());
+        }
     }
     refuse_while_busy()?;
     root_dir(Path::new(PACKAGE_CACHE), 0o755)?;
+    // Digest-addressed sets preserve older native bytes even when development
+    // bundles reused a component filename/version.
+    let cache = if let Some((body, _, _)) = &signed {
+        Path::new(PACKAGE_CACHE).join(format!("set-{}", sha256_hex(body)))
+    } else { PathBuf::from(PACKAGE_CACHE) };
+    root_dir(&cache, 0o755)?;
     let mut kept = Vec::new();
     for (_, _, file, bytes) in &files {
-        let path = Path::new(PACKAGE_CACHE).join(file);
+        let path = cache.join(file);
         write_root(&path, bytes, 0o644)?;
         kept.push(path);
+    }
+    if super::package::Kind::host()?==super::package::Kind::Ubuntu {
+        for ((name,version,_,_),path) in files.iter().zip(&kept) {
+            let metadata=output(Command::new("dpkg-deb").args(["-f"]).arg(path).args(["Package","Version","Architecture"]))?;
+            let fields:std::collections::HashMap<_,_>=metadata.lines().filter_map(|line|line.split_once(": ")).collect();
+            if fields.get("Package")!=Some(name) || fields.get("Version")!=Some(&version.as_str()) || fields.get("Architecture")!=Some(&if *name=="mutter-common" {"all"} else {"amd64"}) {
+                return Err("The DEB control metadata does not match the coordinated release; nothing was installed.".into());
+            }
+        }
+        let ibara=kept.iter().find(|p|p.file_name().is_some_and(|n|super::package::Kind::Ubuntu.file_version("ibara",&n.to_string_lossy()).is_some())).ok_or("Missing ibara DEB.")?;
+        let contents=output(Command::new("dpkg-deb").arg("-c").arg(ibara))?;
+        let target=contents.lines().any(|line|line.split_whitespace().last()==Some("./usr/lib/ibara/gnome-target.json"));
+        if target!=(host_packages()?.len()>1) { return Err("The DEB role does not match this installation; nothing was installed.".into()); }
+        write_root(&ibara.with_extension("role"),if target {b"target"} else {b"operator"},0o644)?;
+    }
+    if let Some((body, signature, _)) = &signed {
+        write_root(&cache.join("manifest.json.sig"), signature, 0o644)?;
+        write_root(&cache.join("manifest.json"), body, 0o644)?;
     }
     let from = installed_version().unwrap_or_else(|| "none".into());
     backup_journals(desktop, &from)?;
     println!("Installing ibara {version}…");
-    interactive(Command::new("pacman").args(["-U", "--noconfirm"]).args(&kept))?;
+    super::package::Kind::host()?.install(&kept)?;
+    if super::package::Kind::host()?==super::package::Kind::Ubuntu && super::gnome::target_package() && super::system::station_owner().is_some() {
+        output(Command::new(Path::new(LIB).join("bin/ibara")).args(["system","refresh"]))?;
+    }
     prune_cache();
     Ok(())
 }
@@ -572,6 +665,37 @@ fn safe(version: &str) -> String {
 
 /// Kept releases, newest first: each version with the files of its packages.
 fn cached() -> Vec<(String, Vec<PathBuf>)> {
+    if super::package::Kind::host().ok()==Some(super::package::Kind::Ubuntu) {
+        let mut sets=Vec::new();
+        let Some(channel)=Channel::built_in() else { return sets; };
+        for entry in std::fs::read_dir(PACKAGE_CACHE).into_iter().flatten().flatten() {
+            let dir=entry.path();
+            if !entry.file_name().to_string_lossy().starts_with("set-") || !dir.is_dir() {continue;}
+            let checked=(|| -> Result<(String,Vec<PathBuf>),String> {
+                let body=std::fs::read(dir.join("manifest.json")).map_err(|e|e.to_string())?;
+                let signature=std::fs::read(dir.join("manifest.json.sig")).map_err(|e|e.to_string())?;
+                if body.len()>MAX_MANIFEST || signature.len()>16384 {return Err("Oversized cached manifest.".into());}
+                if entry.file_name().to_string_lossy()!=format!("set-{}",sha256_hex(&body)) {return Err("Cached set identity changed.".into());}
+                let scratch=scratch()?;
+                let release=verify(&body,&signature,&channel.key,&scratch);
+                let _=std::fs::remove_dir_all(scratch);
+                let release=release?;
+                let mut files=Vec::new();
+                for package in &release.packages {
+                    let path=dir.join(&package.file);
+                    let metadata=std::fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
+                    if !metadata.is_file() || metadata.len()!=package.size || metadata.len()>MAX_PACKAGE {return Err("Cached package size changed.".into());}
+                    let bytes=std::fs::read(&path).map_err(|e|e.to_string())?;
+                    if sha256_hex(&bytes)!=package.sha256 {return Err("Cached package digest changed.".into());}
+                    files.push(path);
+                }
+                Ok((release.version,files))
+            })();
+            if let Ok(set)=checked {sets.push(set);}
+        }
+        sets.sort_by(|a,b|vercmp(&b.0,&a.0).unwrap_or(0).cmp(&0));
+        return sets;
+    }
     let mut releases: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for entry in std::fs::read_dir(PACKAGE_CACHE).into_iter().flatten().flatten() {
         let Some((_, version)) = release_file(&entry.file_name().to_string_lossy()) else { continue };
@@ -585,9 +709,17 @@ fn cached() -> Vec<(String, Vec<PathBuf>)> {
 }
 
 fn prune_cache() {
-    for (_, files) in cached().into_iter().skip(KEEP_RELEASES) {
+    let sets=cached();
+    let mut versions=Vec::new();
+    for (version, _) in &sets {
+        if !versions.contains(version) && versions.len()<KEEP_RELEASES {
+            versions.push(version.clone());
+        }
+    }
+    let retained:Vec<_>=sets.iter().filter(|(version,_)|versions.contains(version)).flat_map(|(_,files)|files.iter().cloned()).collect();
+    for (_, files) in sets.into_iter().filter(|(version,_)|!versions.contains(version)) {
         for path in files {
-            let _ = std::fs::remove_file(path);
+            if !retained.contains(&path) { let _ = std::fs::remove_file(path); }
         }
     }
 }
@@ -624,7 +756,7 @@ pub fn system_rollback(desktop: &Account) -> Result<(), String> {
     // The controller stops, so its journals can be swapped if they must be.
     let _ = output(&mut desktop.userctl(&["stop", USER_UNITS[0]]));
     println!("Installing ibara {version}…");
-    interactive(Command::new("pacman").args(["-U", "--noconfirm"]).args(&files))
+    super::package::Kind::host()?.install(&files)
 }
 
 /// The newest kept release older than `installed` that has the ibara package.
@@ -772,7 +904,7 @@ fn whats_new_path() -> PathBuf {
 fn record_whats_new(version: &str, notes: &[String], from: Option<&str>) -> Result<(), String> {
     let path = whats_new_path();
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        super::user::private_directory(dir)?;
     }
     let record = json!({"version": version, "from": from, "notes": notes, "installed_at": crate::ids::now_iso(), "seen": false});
     std::fs::write(&path, format!("{record:#}\n")).map_err(|e| format!("{}: {e}", path.display()))

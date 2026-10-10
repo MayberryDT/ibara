@@ -271,6 +271,8 @@ pub struct Controller {
     desktop: Rc<dyn DesktopPort>,
     stream: Option<Rc<dyn StreamPort>>,
     screen: Option<Rc<screen::ScreenStream>>,
+    /// Routing policy survives missing target metadata; eligibility still revalidates it.
+    native_screen_only: bool,
     turns: RefCell<turns::Turns>,
     fallback_reason: RefCell<Option<String>>,
     fallback_until: Cell<i64>,
@@ -390,6 +392,8 @@ impl Controller {
             desktop: options.desktop,
             stream: options.stream,
             screen: options.screen,
+            native_screen_only: crate::install::gnome::target_package()
+                || crate::desktop::gnome::Gnome::selected(&std::env::vars_os().collect::<Vec<_>>()),
             turns: RefCell::new(turns::Turns::default()),
             fallback_reason: RefCell::new(None),
             fallback_until: Cell::new(0),
@@ -474,7 +478,7 @@ impl Controller {
         // This computer takes agent work: its screensaver and idle lock must
         // never shut agents (or a person taking control) out.
         match self.desktop.keep_awake().await {
-            Ok(true) => log_event("stay_awake_on", "Turned on Omarchy's Stay Awake so this computer never locks agents out."),
+            Ok(true) => log_event("stay_awake_on", "Started ibara's owned idle inhibition for this desktop session."),
             Ok(false) => {}
             Err(e) => log_event("stay_awake_failed", &e.to_string()),
         }

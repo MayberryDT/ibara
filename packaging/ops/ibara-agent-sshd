@@ -11,4 +11,6 @@ if (( ${#addresses[@]} == 0 )); then
   echo "Tailscale has no address yet (not signed in); trying again shortly." >&2
   exit 75
 fi
-exec /usr/bin/sshd -D -e -f /etc/agent-computer/ssh/sshd_config "${addresses[@]}"
+sshd=/usr/bin/sshd
+[[ -x $sshd ]] || sshd=/usr/sbin/sshd
+exec "$sshd" -D -e -f /etc/agent-computer/ssh/sshd_config "${addresses[@]}"

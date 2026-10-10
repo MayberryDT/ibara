@@ -23,6 +23,8 @@
 //! release tree keeps its `previous` release for going back.
 
 pub mod omarchy_update;
+pub mod package;
+pub mod gnome;
 pub mod system;
 pub mod unattended_boot;
 pub mod update;
@@ -365,10 +367,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The installed package version (`0.2.0-1`), if the package is installed.
 pub fn installed_version() -> Option<String> {
-    run("pacman", &["-Q", "ibara"]).ok()?.split_whitespace().nth(1).map(str::to_string)
+    package::Kind::host().ok()?.version("ibara")
 }
 
 /// pacman's own version order (`vercmp`): negative, zero or positive.
 pub fn vercmp(a: &str, b: &str) -> Result<i32, String> {
-    run("vercmp", &[a, b])?.trim().parse().map_err(|_| "vercmp gave no answer.".to_string())
+    package::Kind::host()?.compare(a, b)
 }

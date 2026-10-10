@@ -648,14 +648,14 @@ impl Controller {
     /// only when it is not installed for any supported browser.
     pub(crate) fn browser_row(&self) -> Value {
         let (status, reason) = if self.desktop.browser_connected() {
-            ("available", "The focused tab's top frame is read by ibara's page reader; Cua clicks and types with real input.")
+            ("available", "The focused tab's top frame is read by ibara's page reader; ibara clicks and types with guarded native input.")
         } else if self.desktop.browser_reader_installed() {
             (
                 "not_open",
                 "No browser is open yet. ibara's page reader is installed and connects when Chromium or Google Chrome opens; a browser that was already open when it was installed needs a restart.",
             )
         } else {
-            ("unavailable", "ibara's page reader is not installed for Chromium or Google Chrome on this computer; installing ibara sets it up.")
+            ("unavailable", "A supported Chromium or Google Chrome package with ibara's page reader is required on this computer.")
         };
         json!({ "name": "browser_semantics", "status": status, "backend": "chrome-extension", "reason": reason })
     }
@@ -1219,6 +1219,9 @@ impl Controller {
                 Ok(_) => self.screen.as_ref().unwrap().stop().await,
                 Err(e) => self.screen_fallback(&e.message).await,
             }
+        }
+        if self.native_screen_only {
+            return self.screen_fallback_reply(&Value::Null);
         }
         let stream = self.usable_stream()?;
         if !self.desktop.session_available() {

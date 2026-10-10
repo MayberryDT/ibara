@@ -337,6 +337,9 @@ pub fn run(
     ready: std::sync::mpsc::Sender<Result<(u32, u32, u32, String, String)>>,
     start: std::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
+    if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d|d.eq_ignore_ascii_case("GNOME")) {
+        return crate::gnome_capture::run(tx,health,ready,start);
+    }
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<Capture>();
     let q = queue.handle();

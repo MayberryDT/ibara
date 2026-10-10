@@ -1711,7 +1711,7 @@ mv "$dir/elements.new" "$dir/elements"
     }
 
     /// A Save As path into a folder of tasks, 99 characters.
-    const SAVE_AS: &str = "/home/nova/.local/share/agent-computer/workspaces/task_1258d4784f5d4357a35f0ab3c64b3969/dogfood.txt";
+    const SAVE_AS: &str = "/tmp/ibara-synthetic-save/dogfood.txt";
 
     #[tokio::test]
     async fn typing_goes_on_where_it_stopped_when_a_display_change_ends_cuas_input_connection() {

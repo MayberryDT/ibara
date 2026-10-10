@@ -29,8 +29,9 @@ const TITLE_CHARS: usize = 60;
 fn window_fields(action: &Value) -> Result<(String, i64)> {
     let address = action.get("address").and_then(Value::as_str).unwrap_or("");
     let hex = address.strip_prefix("0x").unwrap_or("");
-    if !(1..=16).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(invalid("Expected a window address such as 0x1a2b."));
+    let gnome = address.strip_prefix("gnome:").is_some_and(|id| !id.is_empty() && id.len() <= 10 && id.bytes().all(|b| b.is_ascii_digit()) && id.parse::<u32>().is_ok());
+    if !gnome && (!(1..=16).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+        return Err(invalid("Expected the exact window address from the current window list."));
     }
     let pid = number(action, "pid").filter(|p| *p > 0).ok_or_else(|| invalid("Expected the window's process id."))?;
     Ok((address.to_string(), pid))

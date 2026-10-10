@@ -49,7 +49,7 @@ pub fn lock_state(monitors: &[Monitor]) -> LockState {
 /// `assertSessionReady`: unlocked, or the reason work cannot start.
 pub fn require_unlocked(monitors: Result<Vec<Monitor>>) -> Result<()> {
     let monitors = monitors.map_err(|_| {
-        IbaraError::new("SESSION_UNAVAILABLE", "Hyprland session lock state could not be read.", true)
+        IbaraError::new("SESSION_UNAVAILABLE", "The graphical session lock state could not be read.", true)
             .with("recovery", "Inspect the graphical session, then retry computer_begin.")
     })?;
     match lock_state(&monitors) {

@@ -4,7 +4,7 @@
 
 use super::{Account, LIB, PLUGIN, PLUGIN_ID, USER_UNITS, interactive, is_root, output, program, sha256_hex};
 use std::io::{BufRead, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -37,11 +37,25 @@ pub(super) fn as_root(args: &[&str]) -> Result<(), String> {
 }
 
 pub fn setup(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("Usage: ibara setup".into());
+    let kind = super::package::Kind::host()?;
+    if args==["--check-target"] && kind==super::package::Kind::Ubuntu {return super::gnome::require_session();}
+    let target_only=matches!(args,[flag,role] if flag=="--role" && role=="target");
+    let operator_only = match args {
+        [] => kind == super::package::Kind::Ubuntu,
+        [flag, role] if flag == "--role" && role == "operator" => true,
+        [flag, role] if flag == "--role" && role == "both" => false,
+        [flag, role] if flag == "--role" && role == "target" && kind==super::package::Kind::Ubuntu => false,
+        [flag, role] if flag == "--role" && role == "target" => return Err("Target-only setup is not available for this platform candidate. Use operator or both.".into()),
+        _ => return Err("Usage: ibara setup [--role operator|target|both]".into()),
+    };
+    if !operator_only && kind == super::package::Kind::Ubuntu {
+        super::gnome::require_session()?;
     }
     let me = person()?;
     installed()?;
+    private_directory(&me.home.join(".config/ibara"))?;
+    private_directory(&crate::operator::directory::operator_state_dir())?;
+    if operator_only { return setup_operator(&me, kind); }
     let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
     println!("Setting up ibara on {host} for {}.", me.name);
     println!("This computer becomes a console for your other computers and a computer they (and your agents) can use.\n");
@@ -58,19 +72,68 @@ pub fn setup(args: &[String]) -> Result<(), String> {
 
     println!("\nStarting ibara:");
     services(&["daemon-reload"])?;
-    services(&["reenable", USER_UNITS[0], USER_UNITS[1]])?;
-    services(&["restart", USER_UNITS[0], USER_UNITS[1]])?;
-    println!("  {} and {} are running.", USER_UNITS[0], USER_UNITS[1]);
+    if target_only {
+        services(&["reenable",USER_UNITS[0]])?;services(&["restart",USER_UNITS[0]])?;
+    } else {
+        services(&["reenable", USER_UNITS[0], USER_UNITS[1]])?;
+        services(&["restart", USER_UNITS[0], USER_UNITS[1]])?;
+    }
+    if target_only {println!("  {} is running.",USER_UNITS[0]);}
+    else {println!("  {} and {} are running.", USER_UNITS[0], USER_UNITS[1]);}
 
-    println!("\nThe ibara bar icon:");
-    let changed = link_plugin(&me)? || plugin_digest() != plugin_before;
-    show_plugin(changed)?;
+    if kind==super::package::Kind::Arch && !target_only {println!("\nThe ibara bar icon:");}
+    if kind==super::package::Kind::Arch && !target_only {
+        let changed = link_plugin(&me)? || plugin_digest() != plugin_before;
+        show_plugin(changed)?;
+    }
 
     println!("\nTailscale:");
     println!("  {}", tailscale_line());
-    println!("\nibara is set up. Open it from its icon in the bar; Add Computer lists your other computers.");
+    if target_only {println!("\nibara target is set up; its operator Console was not started.");}
+    else if kind==super::package::Kind::Ubuntu {println!("\nibara is set up. Open its Console from Applications.");}
+    else {println!("\nibara is set up. Open it from its icon in the bar; Add Computer lists your other computers.");}
     println!("To add this computer from another one, install ibara there too.");
     println!("To connect an agent, copy the prompt from Connect an Agent in the console and paste it to your agent; it connects itself.");
+    Ok(())
+}
+
+fn setup_operator(me: &Account, kind: super::package::Kind) -> Result<(), String> {
+    println!("Setting up the ibara Console for {}.", me.name);
+    runtime()?.block_on(crate::console::pairing::operator_key()).map_err(|e| format!("Your ibara key: {e}"))?;
+    services(&["daemon-reload"])?;
+    services(&["enable", "--now", USER_UNITS[1]])?;
+    if kind == super::package::Kind::Arch {
+        let changed = link_plugin(me)?;
+        show_plugin(changed)?;
+    }
+    println!("The operator service is running. Open ibara from Applications.");
+    println!("Operator setup creates no local target accounts, input permissions or compositor integration.");
+    Ok(())
+}
+
+/// Repair only our own final directory; never trust a writable ancestor or link.
+pub(super) fn private_directory(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() { return Err("Private directory path must be absolute.".into()); }
+    let uid = unsafe { libc::geteuid() };
+    let mut current = PathBuf::from("/");
+    for component in path.components().skip(1) {
+        let std::path::Component::Normal(name) = component else { return Err("Invalid private directory path.".into()); };
+        current.push(name);
+        if !current.exists() {
+            std::fs::DirBuilder::new().mode(0o700).create(&current).map_err(|e| format!("{}: {e}", current.display()))?;
+        }
+        let meta = std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || (meta.uid() != uid && meta.uid() != 0) {
+            return Err(format!("Unsafe private directory: {}", current.display()));
+        }
+        if current == path {
+            if meta.uid() != uid { return Err("Private directory must belong to this user.".into()); }
+            let directory = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY).open(&current).map_err(|e| e.to_string())?;
+            directory.set_permissions(std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        } else if meta.mode() & 0o022 != 0 && !(meta.uid() == 0 && meta.mode() & 0o1000 != 0) {
+            return Err(format!("Writable private directory ancestor: {}", current.display()));
+        }
+    }
     Ok(())
 }
 
@@ -447,12 +510,31 @@ pub fn uninstall(args: &[String]) -> Result<(), String> {
         }
     }
     let me = person()?;
+    let gnome=super::package::Kind::host()? == super::package::Kind::Ubuntu;
+    if gnome && !super::gnome::target_package() {
+        if !yes && !confirm("Remove the ibara Console? Keys, pairings and history are kept unless --delete-data was supplied.")? {
+            println!("Nothing was removed.");
+            return Ok(());
+        }
+        let _ = services(&["disable", "--now", USER_UNITS[1]]);
+        as_root(&["uninstall-operator", &me.name])?;
+        if delete_data {
+            for relative in [".local/state/ibara", ".config/ibara", ".ssh/ibara_agent_ed25519", ".ssh/ibara_agent_ed25519.pub", ".ssh/known_hosts_ibara"] {
+                let path = me.home.join(relative);
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                if meta.is_dir() && !meta.file_type().is_symlink() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) }.map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+        println!("The Console was removed; downloaded files and unrelated configuration remain.");
+        return Ok(());
+    }
     if let Some(owner) = super::system::station_owner().filter(|o| *o != me.name) {
         return Err(format!("ibara on this computer belongs to {owner}; run ibara uninstall as {owner}."));
     }
     println!("This removes ibara from this computer: its services, the bar icon, access for your paired computers,");
     println!("the ibara, ibara-stream and ibara-view packages and setup's ibara and ibarad links in ~/.local/bin.");
-    println!("Files you received stay in ~/Downloads/Ibara. cua-driver-bin stays installed, since other software may use it.");
+    if gnome {println!("Files you received stay in ~/Downloads/Ibara; stock Mutter rollback is a separate explicit operation.");}
+    else {println!("Files you received stay in ~/Downloads/Ibara. cua-driver-bin stays installed, since other software may use it.");}
     if delete_data {
         println!("With --delete-data it also deletes this computer's ibara keys, identity, pairings and history, and the viewer's settings and cache.");
     } else {
@@ -466,10 +548,12 @@ pub fn uninstall(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("\nThe ibara bar icon:");
-    unlink_plugin(&me);
+    if !gnome {println!("\nThe ibara bar icon:");unlink_plugin(&me);}
     let _ = services(&["disable", "--now", USER_UNITS[0], USER_UNITS[1]]);
-    remove_hyprland_include(&me)?;
+    if gnome {
+        output(Command::new("gnome-extensions").args(["disable","ibara@zet.io"]))
+            .map_err(|e|format!("Could not disable ibara’s GNOME helper before removal: {e}"))?;
+    } else {remove_hyprland_include(&me)?;}
 
     println!("\nThe next part needs your password once (sudo).");
     let mut root_args = vec!["uninstall", me.name.as_str()];

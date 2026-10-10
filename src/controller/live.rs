@@ -237,6 +237,9 @@ impl DesktopPort for LiveDesktop {
     }
 
     fn browser_reader_installed(&self) -> bool {
+        if crate::desktop::gnome::Gnome::selected(&std::env::vars_os().collect::<Vec<_>>()) {
+            return crate::desktop::apps::gnome_browser_reader_installed();
+        }
         crate::entry::browser_setup::reader_installed(std::path::Path::new("/"))
     }
 
@@ -420,6 +423,14 @@ impl DesktopPort for LiveDesktop {
 
     fn clipboard_watch(&self) -> Result<tokio::sync::mpsc::Receiver<()>> {
         desktop::clipboard::watch()
+    }
+
+    fn browser_native_text<'a>(&'a self, key: &'a WinKey, text: &'a str, cancel: &'a Cancel) -> LocalFuture<'a, Result<()>> {
+        Box::pin(async move { self.desktop.browser_native_text(&surface(key), text, Some(cancel)).await })
+    }
+
+    fn native_unicode_typing(&self) -> bool {
+        self.desktop.hyprland().gnome().is_some()
     }
 
     fn clipboard_set_aside(&self) -> LocalFuture<'_, Result<()>> {

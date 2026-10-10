@@ -298,7 +298,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         }
     }
     let mut view = if ["join", "take_control", "screen_failed"].contains(&op) {
-        if engine == "ibara" { super::viewer::ibara_screen() } else { ibara_view() }
+        if matches!(engine.as_str(), "ibara" | "unavailable") { super::viewer::ibara_screen() } else { ibara_view() }
     } else { None };
     if view.is_some() {
         // Viewer setup overlaps registration, stream startup and agent settlement.
@@ -317,7 +317,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         false
     };
     let call = async {
-        if op == "join" && engine == "ibara" {
+        if op == "join" && matches!(engine.as_str(), "ibara" | "unavailable") {
             ctx.console.sessions.join_observation(&computer, Some(&epoch), fields).await
         } else {
             ctx.console.sessions.call(&computer, Some(&epoch), op, fields).await
@@ -537,7 +537,7 @@ pub async fn open_viewer(ctx: &Ctx) -> Handled {
         return Ok(ctx.failure("IDENTITY_MISMATCH", "The selected viewer endpoint could not be revalidated.", "failed", false));
     };
     let status = tokio::time::timeout(ctx.timeout, ctx.console.sessions.call(&computer, Some(&epoch), "status", Value::Null)).await;
-    let own = matches!(status, Ok(Ok(ref data)) if data["result"]["screen_engine"] == "ibara");
+    let own = matches!(status, Ok(Ok(ref data)) if matches!(data["result"]["screen_engine"].as_str(), Some("ibara" | "unavailable")));
     let view = if own { super::viewer::ibara_screen() } else { ibara_view() };
     if let Some(bin) = &view
         && let Err(refusal) = register_viewer(ctx, &computer, &epoch, bin).await

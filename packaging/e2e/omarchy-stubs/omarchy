@@ -1,3 +1,0 @@
-#!/bin/bash
-# Stand-in for the `omarchy` command in the E2E container.
-printf 'omarchy %s\n' "$*" >>"$HOME/omarchy-stub.log"

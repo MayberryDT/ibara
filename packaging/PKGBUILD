@@ -20,7 +20,7 @@ _core=${IBARA_CORE_DIR:-$startdir/..}
 _plugin=${IBARA_PLUGIN_DIR:-}
 
 pkgname=ibara
-pkgver=0.2.1
+pkgver=0.3.0
 pkgrel=${IBARA_PKGREL:-1}
 pkgdesc='Use your computers from any other, by you and your agents'
 arch=('x86_64')
@@ -28,7 +28,7 @@ arch=('x86_64')
 url=$(. "$_core/packaging/release.env" && printf '%s' "${IBARA_BASE_URL%/releases/latest/download}")
 license=('MIT')
 depends=(
-  'glibc' 'gcc-libs' 'libva'
+  'glibc' 'gcc-libs' 'libva' 'libpipewire'
   'hyprland' 'grim' 'at-spi2-core'
   'cua-driver-bin>=0.28.2'
   'openssh' 'openssl' 'acl' 'sudo' 'curl' 'jq' 'pacman'

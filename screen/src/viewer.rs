@@ -220,6 +220,7 @@ struct View {
     seat: Option<wl_seat::WlSeat>,
     modifiers: Modifiers,
     grab: bool,
+    inhibit_shortcuts: bool,
     focus: bool,
     events: mpsc::UnboundedSender<Value>,
     shared: Arc<Shared>,
@@ -232,7 +233,7 @@ impl View {
         }
     }
     fn grab(&mut self, q: &QueueHandle<Self>) {
-        if self.grab && self.focus && self.inhibitor.is_none() {
+        if self.grab && self.focus && self.inhibit_shortcuts && self.inhibitor.is_none() {
             if let (Some(m), Some(seat)) = (&self.manager, &self.seat) {
                 self.inhibitor = Some(m.inhibit_shortcuts(self.window.wl_surface(), seat, q, ()));
             }
@@ -249,6 +250,7 @@ impl View {
         if down && event.keysym == Keysym::Escape && self.modifiers.logo && self.modifiers.alt {
             self.input(json!({"release_all":true}));
             self.grab = !self.grab;
+            if self.grab { self.inhibit_shortcuts = true; }
             self.grab(q);
             return;
         }
@@ -404,6 +406,10 @@ fn window(
         seat: None,
         modifiers: Modifiers::default(),
         grab: true,
+        // GNOME asks for secure consent when inhibition is requested. Watch
+        // starts with ordinary focused input; explicit capture toggling opts in.
+        inhibit_shortcuts: !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
+            .split(':').any(|desktop| desktop.eq_ignore_ascii_case("GNOME")),
         focus: false,
         events,
         shared: shared.clone(),

@@ -110,6 +110,9 @@ use std::time::Duration;
 
 impl Controller {
     pub(crate) fn own_screen(&self) -> bool {
+        if self.native_screen_only {
+            return self.fallback_reason.borrow().is_none();
+        }
         // Keep the active Sunshine takeover on its existing ticket/Hand Back path.
         if self.screen_generation.get() == 0 && self.viewer_state.borrow().owner.is_some()
             && self.journal.get_control().is_ok_and(|control| control.human_control) { return false; }
@@ -119,16 +122,17 @@ impl Controller {
         }
         let setting = crate::settings::current().text("screen_stream");
         (setting.as_deref() == Some("ibara") || (setting.as_deref() == Some("auto")
-            && self.screen.as_ref().is_some_and(|s| s.hardware_encoder() != Some(false))))
+            && self.screen.as_ref().is_some_and(|s| s.automatic_encoder() != Some(false))))
             && self.fallback_reason.borrow().is_none()
     }
     pub(crate) fn screen_fallback_reason(&self) -> Option<String> {
+        if self.native_screen_only { return self.fallback_reason.borrow().clone(); }
         let setting = crate::settings::current().text("screen_stream");
         if setting.as_deref() == Some("auto") && self.screen.is_none() {
             return Some("ibara's screen sender isn't installed on this computer, so Join uses Sunshine.".into());
         }
         if setting.as_deref() == Some("auto")
-            && self.screen.as_ref().is_some_and(|s| s.hardware_encoder() == Some(false)) {
+            && self.screen.as_ref().is_some_and(|s| s.automatic_encoder() == Some(false)) {
             if self.screen.as_ref().is_some_and(|s| s.encoder().as_deref() == Some("nvenc")) {
                 return Some("NVIDIA encoding is still in testing, so Join uses Sunshine. Choose ibara in Screen Stream to try it.".into());
             }
@@ -141,12 +145,18 @@ impl Controller {
                 .then(|| "Sunshine is already open on this computer.".into())
         })
     }
-    fn screen_fallback_reply(&self, generation: &Value) -> Result<Value> {
+    pub(crate) fn screen_fallback_reply(&self, generation: &Value) -> Result<Value> {
+        if self.native_screen_only {
+            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", self.fallback_reason.borrow().clone().unwrap_or_else(|| "Ubuntu native screen sharing is unavailable. Restore target eligibility, then choose Join again.".into()), true));
+        }
         Ok(json!({"endpoint_id":self.endpoint_id,"controller_epoch":self.epoch,"authorization_generation":generation,
             "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
             "screen_engine":"sunshine","fallback_reason":self.screen_fallback_reason(),"fallback_required":true}))
     }
-    pub(crate) fn screen_engine(&self) -> &'static str { if self.own_screen() { "ibara" } else { "sunshine" } }
+    pub(crate) fn screen_engine(&self) -> &'static str {
+        if self.native_screen_only && self.fallback_reason.borrow().is_some() { "unavailable" }
+        else if self.own_screen() { "ibara" } else { "sunshine" }
+    }
 
     pub(crate) fn screen_input_allowed(&self, operator: &str) -> bool {
         crate::access::Access::load(&self.journal).ok().is_some_and(|access| {
@@ -183,7 +193,12 @@ impl Controller {
     pub(crate) async fn join_screen(&self, operator: &str, action: &Value, authorize: &dyn Fn() -> Result<super::OperatorGrant>) -> Result<Value> {
         let started = std::time::Instant::now();
         let grant = authorize()?;
-        if !self.own_screen() {
+        if self.native_screen_only {
+            self.desktop.control_ready().await?;
+            // An explicit retry revalidates the repaired native target first.
+            self.fallback_reason.borrow_mut().take();
+        }
+        if !self.own_screen() && !self.native_screen_only {
             let mut reply = self.operator_control(operator, true, action, authorize).await?;
             reply["screen_engine"] = json!("sunshine");
             reply["fallback_reason"] = json!(self.screen_fallback_reason());

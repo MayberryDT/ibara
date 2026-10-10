@@ -12,6 +12,12 @@ The root crate builds the controller and client; the workspace screen crate buil
 
 ibara was first written in TypeScript for Node, then ported to Rust before its first public release. That earlier version was never published. This reference still names what each module replaced, and lists where the Rust deliberately behaves differently, because those notes explain behavior a newcomer might otherwise take for a mistake. Where a doc comment cites a section (§) of a map of the old system, the map itself is not published either.
 
+## Ubuntu GNOME integration
+
+The Ubuntu GNOME Desktop uses the Shell-owned identity helper and maintained Mutter guard for exact-window key, point, text, wheel and drag input, with connection-owned named cursor handover. It sends no GNOME application input through Cua. Target setup requires the complete supported native tuple and an eligible graphical session; the operator-only package grants no target access. Native text commits contain at most 4,000 UTF-8 bytes; Desktop verifies value, caret and selection after each chunk. The native field helper accepts GTK’s editable/SENSITIVE state without requiring ENABLED, while retaining unique focused-window and field checks. See [Ubuntu installation and compatibility](../packaging/deb/README.md) for the supported environment and remaining limits.
+
+The active `screen/src/capture.rs` selects `gnome_capture.rs` for GNOME. It matches Shell/DisplayConfig/ScreenCast owners and monitor geometry, copies bounded BGRx PipeWire buffers before requeue, and feeds CPU RGBA to the existing capped OpenH264 encoder. Capture pauses with no viewers, requires a fresh resumed keyframe, and refuses after session Closed or trusted session/geometry loss. Existing viewer admission and turn control remain in the sender. Native failure reports unavailable and preserves its reason; explicit Join revalidates recovery. Watch-only permission permits passive native Join and retry. Ubuntu never falls through to Sunshine, including background warming. See [maintained native integration](../packaging/mutter/README.md).
+
 ## Rules
 
 - **No Node and no Python at run time.** On the desktop, shell out only to these programs: `hyprctl`, `grim`, `cua-driver` (a private MCP child for input and accessibility), `omarchy-toggle-idle` (keeping the computer awake while an agent holds it), `ibara-screen` (the own-screen sender child and console viewer), `ibara-stream` (the fallback stream Take Control opens, a child of `ibarad`), `wl-paste`/`wl-copy` for the clipboard shared during Take Control, and `wf-recorder` for Live Video (Preview). Everything else ibara runs is a system tool such as `tailscale`, `ssh-keygen`, `setfacl`, `journalctl` or `ip`.
@@ -741,3 +747,19 @@ The sender tries VA-API on the capture session's advertised render device, then 
 NVENC uses H.264 P1 with ultra-low-latency tuning, CBR, one-frame VBV, no B-frames/lookahead, infinite GOP and requested IDRs with repeated SPS/PPS. The existing bitrate ladder reconfigures the encoder and scales VBV. CUDA and NVIDIA encode libraries load at runtime; machines without them can start normally.
 
 NVIDIA-owned RGB dmabufs import through EGL and `cuGraphicsEGLRegisterImage`, then register the mapped CUDA array directly with NVENC. Native upright capture at the encoded dimensions (up to 1920×1080) stays on the GPU. Larger or vertically inverted NVIDIA captures use CUDA readback, CPU scaling/orientation correction and pitched upload instead. Other compositor transforms remain unsupported by capture. Hybrid Intel capture uses synchronized linear RGB readback, scaling and a pitched NVENC input upload. NVIDIA driver/context RSS exceeds the Stage 1 sender memory budget in the RTX 3050 proof; see the Run N report. No FFmpeg or GPL code is linked into the screen binary.
+
+GNOME semantic elements use isolated read-only AT-SPI observation bound to the
+accessibility bus GUID, application owner/PID, exact top-level and object ancestry.
+Element clicks resolve a fresh tree and pass validated WINDOW coordinates through
+the Mutter guard. Text field geometry also uses WINDOW extents plus trusted
+compositor origin because GTK Wayland SCREEN coordinates omit title-bar offsets.
+Private qualification CLI commands require the `qualification` Cargo feature;
+normal screen builds expose only the existing sender/viewer commands. GNOME idle
+capture clears the published frame so resumed viewers wait for fresh encoding.
+
+The GNOME app catalog uses standalone Text Editor and Ptyxis, Nautilus new-window
+and Gio for the current default browser. It changes no default app/settings.
+GNOME idle inhibition uses SessionManager flag8 on a private connection, bound to
+the same UID and installed root-owned gnome-session-service. Lease inhibition is
+released explicitly; runtime keep-awake lasts until daemon disconnect. Neither
+path alters persistent idle preferences or inhibits explicit logout/suspend.

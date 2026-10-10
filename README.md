@@ -8,6 +8,7 @@ ibara gives your agents computer use across the Omarchy machines you own. Put a 
 
 [![CI](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml/badge.svg)](https://github.com/MayberryDT/ibara/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/mayberrydt/ibara)
 
 ![Your agent works there, you keep working here: your computer and a spare joined over Tailscale, with Claude Code on yours and the agent using the spare's desktop](docs/media/what-it-is.webp)
 

@@ -84,6 +84,8 @@ api! {
  init:"atspi_init"=>unsafe extern "C" fn()->i32,
  timeout:"atspi_set_timeout"=>unsafe extern "C" fn(i32,i32),
  iteration:"g_main_context_iteration"=>unsafe extern "C" fn(Obj,i32)->i32,
+ name:"atspi_accessible_get_name"=>unsafe extern "C" fn(Obj,ErrPtr)->*mut libc::c_char,
+ free:"g_free"=>unsafe extern "C" fn(Obj),
  desktop:"atspi_get_desktop"=>unsafe extern "C" fn(i32)->Obj,
  children:"atspi_accessible_get_child_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
  child:"atspi_accessible_get_child_at_index"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->Obj,
@@ -113,6 +115,9 @@ impl Api {
             if started.elapsed()>=Duration::from_millis(200) {
                 return Err("Native child count is invalid.".into());
             }
+            // A metadata query initiates the lazy application cache fetch.
+            let mut e=std::ptr::null_mut();let name=unsafe{(self.name)(node,&mut e)};valid(e)?;
+            if !name.is_null(){unsafe{(self.free)(name.cast());}}
             unsafe{(self.iteration)(std::ptr::null_mut(),0);}
             std::thread::sleep(Duration::from_millis(10));
         }

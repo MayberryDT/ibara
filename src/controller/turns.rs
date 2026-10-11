@@ -398,6 +398,10 @@ pub(crate) async fn screen_watch(me: Weak<Controller>) {
             if last_status.elapsed() >= Duration::from_secs(1) {
                 last_status = std::time::Instant::now();
                 let _ = screen.command(json!({"t":"status"})).await;
+                // Zero can arrive before explicit takeover; reconcile it after admission too.
+                if screen.status().is_some_and(|s| s["viewers"] == 0) {
+                    controller.turns.borrow_mut().viewers(0, controller.now_ms());
+                }
                 if screen.status().is_some_and(|s| s["viewers"] == 0) && controller.stream_warm_until.get() <= controller.now_ms() {
                     screen.stop().await;
                     controller.screen_generation.set(0);

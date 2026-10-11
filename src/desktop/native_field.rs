@@ -10,13 +10,14 @@ pub struct Field {
     pub path: Vec<i32>, pub value: String, pub role: String, pub frame: [i32;4],
     #[serde(default)] pub caret: Option<i32>,
     #[serde(default)] pub selections: Option<Vec<[i32;2]>>,
+    #[serde(default)] pub paragraphs: Option<Vec<String>>,
 }
 impl Field {
     /// Application relayout may change the rectangle after insertion. The
     /// isolated reader validates that fresh rectangle before returning it.
     pub fn confirms_insertion(&self, observed: &Field) -> bool {
         self.path == observed.path && self.role == observed.role && self.value == observed.value &&
-            self.caret == observed.caret && self.selections == observed.selections
+            self.caret == observed.caret && self.selections == observed.selections && self.paragraphs == observed.paragraphs
     }
     pub fn after_insertion(&self, text: &str) -> Result<Field> {
         let count=self.value.chars().count();
@@ -34,6 +35,29 @@ impl Field {
         if after.value.chars().count()>131072 {return Err(refused("Resulting text exceeds native readback capacity."));}
         after.caret=Some(start+text.chars().count() as i32);
         after.selections=Some(Vec::new());
+        if let Some(paragraphs)=&mut after.paragraphs {
+            let index=*self.path.last().ok_or_else(||refused("Native paragraph path is unavailable."))? as usize;
+            if paragraphs.get(index)!=Some(&self.value) {return Err(refused("Native paragraph context is inconsistent."));}
+            paragraphs[index]=after.value.clone();
+        }
+        Ok(after)
+    }
+    /// Clipboard newlines split Writer paragraphs; direct native text may
+    /// insert soft line breaks. Prove the entire bounded sibling context.
+    pub fn after_paste(&self, text: &str) -> Result<Field> {
+        let mut after=self.after_insertion(text)?;
+        if self.role=="paragraph" && text.contains('\n') {
+            let paragraphs=after.paragraphs.as_mut().ok_or_else(||refused("Complete native paragraph context is required for multiline paste."))?;
+            let index=*self.path.last().ok_or_else(||refused("Native paragraph path is unavailable."))? as usize;
+            let parts:Vec<String>=after.value.split('\n').map(str::to_owned).collect();
+            let caret=after.caret.unwrap() as usize;
+            let prefix:String=after.value.chars().take(caret).collect();
+            let next=index+prefix.matches('\n').count();
+            after.caret=Some(prefix.rsplit('\n').next().unwrap().chars().count() as i32);
+            paragraphs.splice(index..=index,parts);
+            after.value=paragraphs[next].clone();
+            *after.path.last_mut().unwrap()=next as i32;
+        }
         Ok(after)
     }
 }
@@ -86,6 +110,7 @@ api! {
  desktop:"atspi_get_desktop"=>unsafe extern "C" fn(i32)->Obj,
  children:"atspi_accessible_get_child_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
  child:"atspi_accessible_get_child_at_index"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->Obj,
+ parent:"atspi_accessible_get_parent"=>unsafe extern "C" fn(Obj,ErrPtr)->Obj,
  pid:"atspi_accessible_get_process_id"=>unsafe extern "C" fn(Obj,ErrPtr)->u32,
  states:"atspi_accessible_get_state_set"=>unsafe extern "C" fn(Obj)->Obj,
  has:"atspi_state_set_contains"=>unsafe extern "C" fn(Obj,i32)->i32,
@@ -108,6 +133,31 @@ impl Api {
     }
     fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
         let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)
+    }
+    fn paragraph_context(&self,node:Obj,path:&[i32],value:&str)->std::result::Result<Option<Vec<String>>,String>{
+        let mut e=std::ptr::null_mut();let parent=unsafe{(self.parent)(node,&mut e)};valid(e)?;
+        if parent.is_null(){return Ok(None);}
+        let mut e=std::ptr::null_mut();let role=unsafe{(self.role)(parent,&mut e)};valid(e)?;present(role.cast())?;
+        if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"document text" {return Ok(None);}
+        let count=self.child_count(parent)?;
+        if !(1..=512).contains(&count){return Ok(None);}
+        let mut values=Vec::new();let mut chars=0usize;
+        for i in 0..count {
+            let child=self.child_at(parent,i)?;
+            let mut e=std::ptr::null_mut();let role=unsafe{(self.role)(child,&mut e)};valid(e)?;present(role.cast())?;
+            if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"paragraph" {return Ok(None);}
+            let text=unsafe{(self.text)(child)};if text.is_null(){return Ok(None);}
+            let mut e=std::ptr::null_mut();let n=unsafe{(self.count)(text,&mut e)};valid(e)?;
+            if n<0 || n>131072 {return Ok(None);}
+            chars+=n as usize;if chars>131072{return Ok(None);}
+            let mut e=std::ptr::null_mut();let text=unsafe{(self.value)(text,0,n,&mut e)};valid(e)?;present(text.cast())?;
+            let text=unsafe{CStr::from_ptr(text)}.to_str().map_err(|_|"Invalid native paragraph text.")?.to_owned();
+            if text.chars().count()!=n as usize{return Err("Native paragraph text changed during observation.".into());}
+            values.push(text);
+        }
+        let index=*path.last().ok_or("Native paragraph path is unavailable.")?;
+        if index<0 || values.get(index as usize).map(String::as_str)!=Some(value){return Err("Native paragraph context is inconsistent.".into());}
+        Ok(Some(values))
     }
     fn frame(&self,node:Obj)->std::result::Result<[i32;4],String>{self.frame_at(node,0)}
     fn frame_at(&self,node:Obj,coordinate:i32)->std::result::Result<[i32;4],String>{
@@ -158,7 +208,8 @@ impl Api {
                 frame[1]=frame[1].checked_add(window[1]).ok_or("Invalid native field Y")?;
                 frame
             } else {self.frame(node)?};
-            found.push(Field{path:path.clone(),value,role,frame,caret:Some(caret),selections:Some(selections)});
+            let paragraphs=if role=="paragraph" {self.paragraph_context(node,path,&value)?}else{None};
+            found.push(Field{path:path.clone(),value,role,frame,caret:Some(caret),selections:Some(selections),paragraphs});
             }
             }
         }

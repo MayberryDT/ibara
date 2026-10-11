@@ -1136,7 +1136,7 @@ impl Desktop {
                         cua::unless_cancelled(cancel)?;
                     }
                     let before = native_field::read(&live, &self.env, cancel).await?;
-                    let expected=before.after_insertion(text)?;
+                    let expected=before.after_paste(text)?;
                     let display = selection::display()?;
                     let mut saved = tokio::task::spawn_blocking(move || selection::set_aside(&display)).await
                         .map_err(|e| crate::error::internal(format!("clipboard: {e}")))??;

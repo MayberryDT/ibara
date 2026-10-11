@@ -83,6 +83,7 @@ macro_rules! api {
 api! {
  init:"atspi_init"=>unsafe extern "C" fn()->i32,
  timeout:"atspi_set_timeout"=>unsafe extern "C" fn(i32,i32),
+ iteration:"g_main_context_iteration"=>unsafe extern "C" fn(Obj,i32)->i32,
  desktop:"atspi_get_desktop"=>unsafe extern "C" fn(i32)->Obj,
  children:"atspi_accessible_get_child_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
  child:"atspi_accessible_get_child_at_index"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->Obj,
@@ -103,8 +104,18 @@ fn valid(error:Obj)->std::result::Result<(),String> { if error.is_null(){Ok(())}
 fn present(obj:Obj)->std::result::Result<Obj,String>{if obj.is_null(){Err("Native accessibility returned no object.".into())}else{Ok(obj)}}
 impl Api {
     fn child_count(&self,node:Obj)->std::result::Result<i32,String>{
-        let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
-        if n<0{return Err("Native child count is invalid.".into());}Ok(n)
+        let started=std::time::Instant::now();
+        loop {
+            let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
+            if n>=0 { return Ok(n); }
+            // A cold AT-SPI application cache reports -1 without GError.
+            // Process its pending cache callbacks; never treat -1 as empty.
+            if started.elapsed()>=Duration::from_millis(200) {
+                return Err("Native child count is invalid.".into());
+            }
+            unsafe{(self.iteration)(std::ptr::null_mut(),0);}
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
         let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)
@@ -127,7 +138,10 @@ impl Api {
             // GTK4 reports SENSITIVE without ENABLED on its editable text view.
             if unsafe{(self.has)(states,7)}!=0 &&
                 (unsafe{(self.has)(states,8)}!=0 || unsafe{(self.has)(states,24)}!=0) {
-            let text=present(unsafe{(self.text)(node)})?;
+            // Editable focused containers (Calc table) need not expose Text.
+            // Continue to their real editor rather than accepting the container.
+            let text=unsafe{(self.text)(node)};
+            if !text.is_null() {
             let mut e=std::ptr::null_mut();let count=unsafe{(self.count)(text,&mut e)};valid(e)?;
             if !(0..=131072).contains(&count){return Err("Native field text exceeds the verification limit.".into());}
             let mut e=std::ptr::null_mut();let s=unsafe{(self.value)(text,0,count,&mut e)};valid(e)?;present(s.cast())?;
@@ -157,11 +171,12 @@ impl Api {
             } else {self.frame(node)?};
             found.push(Field{path:path.clone(),value,role,frame,caret:Some(caret),selections:Some(selections)});
             }
+            }
         }
         // Writer exposes focused paragraphs beneath small virtual containers.
         // Calc's virtual table can contain millions of cells. Search only a
         // bounded child list; large virtual containers cannot be enumerated.
-        let count=self.child_count(node)?;
+        let count=self.child_count(node).map_err(|e|format!("{e} at native path {path:?}"))?;
         if count>4096 {
             if unsafe{(self.has)(states,31)}!=0 { return Ok(()); }
             return Err("Native field traversal exceeds its limit.".into());
@@ -173,12 +188,12 @@ impl Api {
         if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
         unsafe{(self.timeout)(500,500)};
         let root=present(unsafe{(self.desktop)(0)})?;let mut windows=Vec::new();
-        let applications=self.child_count(root)?;
+        let applications=self.child_count(root).map_err(|e|format!("{e} at desktop root"))?;
         if applications>4096{return Err("Native application count exceeds its limit.".into());}
         for i in 0..applications {
             let app=self.child_at(root,i)?;let mut e=std::ptr::null_mut();let got=unsafe{(self.pid)(app,&mut e)};
             if !e.is_null() || got!=pid {continue;}
-            let children=self.child_count(app)?;
+            let children=self.child_count(app).map_err(|e|format!("{e} at selected application"))?;
             if children>4096{return Err("Native window count exceeds its limit.".into());}
             for j in 0..children {
                 let w=self.child_at(app,j)?;

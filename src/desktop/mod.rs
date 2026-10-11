@@ -102,7 +102,8 @@ impl DesktopConfig {
             hyprctl: tool("IBARA_TEST_HYPRCTL", "hyprctl"),
             hyprland_instance: "0".into(),
             grim: tool("IBARA_TEST_GRIM", "/usr/bin/grim"),
-            cua: tool("IBARA_TEST_CUA", "/usr/bin/cua-driver"),
+            cua: std::env::var_os("IBARA_CUA_DRIVER").filter(|p| !p.is_empty()).map(PathBuf::from)
+                .unwrap_or_else(|| tool("IBARA_TEST_CUA", "/usr/bin/cua-driver")),
             idle_binary: tool("IBARA_TEST_IDLE", "/usr/bin/omarchy-toggle-idle"),
             wf_recorder: tool("IBARA_TEST_WF_RECORDER", "/usr/bin/wf-recorder"),
             idle_state: state_dir.join("idle-owned.json"),

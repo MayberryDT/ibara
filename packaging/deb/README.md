@@ -14,6 +14,21 @@ The first Ubuntu delivery has no published Ubuntu predecessor. Update/rollback p
 
 The rendered `install-ubuntu` downloads a signed role manifest, verifies every package digest/size and actual DEB name/version/architecture/role, then installs and caches the complete signed set. Operator is the default. Explicit `target` installs maintained Mutter; it never enrolls Tailscale, enables the helper, restarts GNOME or creates target accounts from package hooks. Preserve an administrative SSH route and stock native packages before installing target support. Enable `ibara@zet.io`, sign out and back in, then run `ibara setup --role both` in the GNOME session. Use `--role target` to omit the operator service. Existing network enrollment remains yours to authorize.
 
+## Install the published Ubuntu release
+
+Run as your desktop user on Ubuntu26.04 amd64:
+
+```bash
+curl -fsSL https://github.com/MayberryDT/ibara/releases/download/v0.3.0-1/install-ubuntu -o install-ubuntu
+bash install-ubuntu operator
+```
+
+For a computer agents will operate, select `target` instead of `operator`. Read the native tuple and recovery requirements above first. The signed installer installs the role's complete set; target activation still requires enabling `ibara@zet.io`, signing out/in and running `ibara setup --role both` inside the GNOME session. Pair from the Console with Add Computer after setup. Tailscale enrollment is separate.
+
+Published0.3.0-1 has a fresh-target bootstrap defect: after apt installs the first complete set, its busy check can ask for an admin key that setup has not created yet. The verified recovery is to run `ibara setup --role both` in the actual GNOME session, then rerun the pinned target installer; retain the first failure receipt. The private frame-peer repair permits the signed fresh path only when all four setup markers are genuinely absent. Any existing or partial setup retains the authenticated busy gate. That repair has not yet been released.
+
+Ubuntu uses the standalone Console rather than the Omarchy bar/widget. Browser/native control, Watch/Take Control, requests and file transfer have scoped E2E evidence; physical GPUs, fractional/multiple outputs and signed-in profiles do not. The private reader comparison uses Chrome155 initially fullscreen; ordinary-window and F11-resize geometry refusals remain separate limitations. A passing synthetic profile does not qualify a user's signed-in profile.
+
 Initial installation from private native +ibara1 to shipping +ibara2 is explicit; channel update/rollback across those different pins is unsupported. `ibara update` and `ibara rollback` require complete signed sets for the installed role, supported platform and native pin. Cache retention counts distinct release versions so duplicate candidate sets cannot evict the predecessor. Retained identity after target removal does not grant target capability to an operator-only package. An absent/incorrect marker or unsettled ibara/native package tuple refuses desktop input, capture and active streaming. Keep retained identity and authority for explicit target reinstall; do not delete data to work around role selection.
 
 For interrupted apt/dpkg installation, preserve the update receipt, run `sudo dpkg --configure -a`, then install the complete verified supported set again. Confirm all four native versions and the ibara version before graphical activation. A running session may still have an older library loaded: sign out/in explicitly after native changes. Package scripts never restart your desktop. Ubuntu target streaming remains native-only: an unavailable or failed native stream reports its reason and refuses Join; explicit Join revalidates repaired eligibility. It does not automatically switch to Sunshine. Signed exact-set installation uses apt --reinstall so equal-version components are installed from their verified DEBs. A failed signature, wrong role or missing component requires correcting the set, not disabling verification.

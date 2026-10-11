@@ -112,7 +112,7 @@ impl Api {
             if n>=0 { return Ok(n); }
             // A cold AT-SPI application cache reports -1 without GError.
             // Process its pending cache callbacks; never treat -1 as empty.
-            if started.elapsed()>=Duration::from_millis(200) {
+            if started.elapsed()>=Duration::from_secs(1) {
                 return Err("Native child count is invalid.".into());
             }
             // A metadata query initiates the lazy application cache fetch.

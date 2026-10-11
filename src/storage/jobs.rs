@@ -780,6 +780,28 @@ impl StorageService {
         Ok(Some(record))
     }
 
+    /// Current process identities of live jobs of this task. Never adopt an
+    /// app merely by class or PID: group ownership and start ticks are rechecked.
+    pub fn task_processes(&self, task_ref: &str) -> Result<Vec<(i64, u64)>> {
+        self.ensure_open()?;
+        let identities: Vec<ProcessIdentity> = self.with_db(|db| {
+            let mut stmt = db.prepare("SELECT boot_id, pid, pgid, starttime FROM jobs WHERE task_ref=?1 AND state IN ('running','unknown') AND boot_id IS NOT NULL AND pid IS NOT NULL AND pgid IS NOT NULL AND starttime IS NOT NULL")?;
+            Ok(stmt.query_map([task_ref], |r| Ok(ProcessIdentity { boot_id:r.get(0)?, pid:r.get(1)?, pgid:r.get(2)?, starttime:r.get(3)? }))?.collect::<rusqlite::Result<_>>()?)
+        })?;
+        let mut processes = Vec::new();
+        for identity in identities {
+            for pid in owned_process_ids(Some(&identity)) {
+                if let Some(stat) = read_process_stat(pid)
+                    && live(&stat) && stat.pgrp == identity.pgid && stat.starttime >= identity.starttime
+                    && stat.starttime > 0
+                {
+                    processes.push((pid, stat.starttime as u64));
+                }
+            }
+        }
+        Ok(processes)
+    }
+
     /// storage.ts:1090-1096 `taskJobs`.
     pub fn task_jobs(&self, task_ref: &str, principal: Option<&str>) -> Result<Vec<Value>> {
         self.ensure_open()?;

@@ -806,7 +806,7 @@ impl Controller {
         } else if reference.starts_with("op_") {
             self.op_status(principal, &reference)?
         } else if reference.starts_with("att_") {
-            self.attention_status(principal, &reference)?
+            self.attention_status(principal, agent, &reference)?
         } else if reference.starts_with("art_") || reference.starts_with("artifact_") {
             self.artifact_status(principal, &reference)?
         } else if reference.starts_with("frame_") {
@@ -966,9 +966,9 @@ impl Controller {
         ))
     }
 
-    fn attention_status(&self, principal: &str, reference: &str) -> Result<(RefStatus, Option<String>)> {
+    fn attention_status(&self, principal: &str, agent: &str, reference: &str) -> Result<(RefStatus, Option<String>)> {
         let item = self.journal.get_attention(reference)?;
-        let Some(item) = item.filter(|i| self.require_readable_task(principal, &i.task_ref).is_ok()) else {
+        let Some(item) = item.filter(|i| (i.principal == agent && i.task_ref == format!("access:{agent}")) || self.require_readable_task(principal, &i.task_ref).is_ok()) else {
             return Ok((self.ended(reference, "attention", "No such attention item."), None));
         };
         let summary = match &item.answer {
@@ -999,7 +999,7 @@ impl Controller {
                 children: item.operation_ref.iter().cloned().collect(),
                 next,
             },
-            Some(item.task_ref),
+            (!item.task_ref.starts_with("access:")).then_some(item.task_ref),
         ))
     }
 
@@ -2021,8 +2021,9 @@ impl Controller {
             }
             Action::Close(s) => {
                 let win = self.resolve_surface(frame, windows, &s.surface)?;
+                self.track_job_windows(task_ref, windows).map_err(|e| e.with("execution_not_started", true))?;
                 let owned = self.journal.task_windows(task_ref).map_err(|e| e.with("execution_not_started", true))?;
-                if !(self.disposable_desktop)() && !owned.iter().any(|o| o.address == win.address && o.pid == win.pid) {
+                if !(self.disposable_desktop)() && !owned.iter().any(|o| o.address == win.address && o.pid == win.pid && o.process_start_ticks == win.process_start_ticks && o.compositor_instance == win.compositor_instance) {
                     return Err(denied(format!("surface: close only closes windows this task opened; {} was not", s.surface)).with("execution_not_started", true));
                 }
                 let describe = format!("close {} \"{}\"", win.class, squash(&win.title, 40));
@@ -3114,7 +3115,9 @@ impl Controller {
                 }
             }
             WaitFor::Attention(att) => {
-                let item = self.journal.get_attention(att.as_str())?.filter(|a| a.task_ref == task.task_ref);
+                let subject = self.task_subject(&task.task_ref, principal);
+                let item = self.journal.get_attention(att.as_str())?.filter(|a| a.task_ref == task.task_ref
+                    || a.principal == subject && a.task_ref == format!("access:{subject}"));
                 if item.is_none() {
                     return Err(invalid(format!("for.attention: {att} is not an attention item of this task")));
                 }

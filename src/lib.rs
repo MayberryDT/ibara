@@ -11,6 +11,7 @@ pub mod ids;
 pub mod install;
 pub mod harness;
 pub mod mcp;
+pub mod facts;
 pub mod operator;
 pub mod server;
 pub mod storage;

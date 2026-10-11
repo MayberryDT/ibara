@@ -1135,6 +1135,7 @@ impl Desktop {
                         cua::unless_cancelled(cancel)?;
                     }
                     let before = native_field::read(&live, &self.env, cancel).await?;
+                    let expected=before.after_insertion(text)?;
                     let display = selection::display()?;
                     let mut saved = tokio::task::spawn_blocking(move || selection::set_aside(&display)).await
                         .map_err(|e| crate::error::internal(format!("clipboard: {e}")))??;
@@ -1159,7 +1160,7 @@ impl Desktop {
                         }
                         async {
                             let after = native_field::read(&live, &self.env, cancel).await?;
-                            if after.path == before.path && after.role == before.role && after.frame == before.frame && after.value != before.value && after.value.contains(text) { Ok(()) }
+                            if expected.confirms_insertion(&after) { Ok(()) }
                             else { Err(IbaraError::new("OUTCOME_UNKNOWN", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
                         }.await
                             .map_err(|mut e| { e.retry_safe = false; e.with("execution_not_started", false).requires_reconciliation() })

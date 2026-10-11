@@ -281,6 +281,7 @@ impl Controller {
     /// runs to completion and the outcome is stored as usual. Keep polling the
     /// future to completion rather than dropping it.
     pub async fn call(&self, principal: &str, connection_id: &str, client_name: &str, tool: &str, args: Value, cancel: Cancel) -> CallOutcome {
+        let recording_started = std::time::Instant::now();
         let agent = agent_label(client_name, principal);
         let outcome = self.dispatch(principal, connection_id, client_name, &agent, tool, &args, &cancel).await;
         let hint = match &outcome {
@@ -307,6 +308,9 @@ impl Controller {
             .map(|i| crate::mcp::Image { mime: i.mime, base64: base64::engine::general_purpose::STANDARD.encode(&i.bytes) })
             .collect();
         budget::fit(&mut envelope, &mut images, budget::MAX_RESULT_BYTES);
+        self.record_fact("call", task.as_ref().map(|t| t.task_ref.as_str()).unwrap_or(connection_id), principal, "bot",
+            json!({"tool": if crate::contract::tool_definitions().iter().any(|t| t.name == tool) { tool } else { "unknown" },
+                "status": envelope.to_value()["status"], "duration_ms": recording_started.elapsed().as_millis() as u64}), tool == "computer_finish" && envelope.to_value()["status"] == "ok");
         CallOutcome { envelope: envelope.to_value(), images }
     }
 
@@ -541,6 +545,11 @@ impl Controller {
     }
 
     pub(super) fn timeline(&self, kind: &str, task_ref: Option<&str>, actor: &str, summary: &str, data: Value) {
+        self.record_fact("transition", task_ref.unwrap_or("system"), "system", "system",
+            json!({"event":kind,
+                "outcome": data.get("outcome").and_then(Value::as_str).filter(|v| matches!(*v,"done"|"unknown"|"failed"|"completed"|"partial"|"cancelled"|"verified"|"refused")),
+                "effect_class": data.get("effect_class").and_then(Value::as_str).filter(|v| matches!(*v,"observe"|"change"|"send"|"spend"|"destructive"|"access")),
+                "replay":data.get("replay").and_then(Value::as_bool), "complete":data.get("complete").and_then(Value::as_bool)}), kind == "task_finished");
         let at = self.now_iso();
         if let Err(e) = self.journal.append_event(NewEvent { at: &at, kind, task_ref, actor, summary, data: &data }) {
             super::log_event("timeline_write_failed", &e.to_string());

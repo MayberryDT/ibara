@@ -88,6 +88,10 @@ export default class IbaraIdentity extends Extension {
     }
     _locked() { return Main.sessionMode.isLocked || Main.sessionMode.isGreeter; }
     _shellInputBlocked() {
+        if (typeof global.display.ibara_input_state === 'function') {
+            const state = JSON.parse(global.display.ibara_input_state());
+            if (typeof state.shell_blocked === 'boolean') return state.shell_blocked;
+        }
         return typeof global.stage.get_grab_actor !== 'function' ||
             !!global.stage.get_grab_actor() || !!global.stage.get_key_focus();
     }

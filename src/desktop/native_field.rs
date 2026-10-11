@@ -104,7 +104,7 @@ fn present(obj:Obj)->std::result::Result<Obj,String>{if obj.is_null(){Err("Nativ
 impl Api {
     fn child_count(&self,node:Obj)->std::result::Result<i32,String>{
         let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
-        if !(0..=4096).contains(&n){return Err("Native field traversal exceeds its limit.".into());}Ok(n)
+        if n<0{return Err("Native child count is invalid.".into());}Ok(n)
     }
     fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
         let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)
@@ -117,6 +117,8 @@ impl Api {
     fn walk(&self,node:Obj,path:&mut Vec<i32>,visited:&mut usize,found:&mut Vec<Field>,origin:Option<[i32;4]>)->std::result::Result<(),String>{
         *visited+=1;if *visited>4096 || path.len()>40{return Err("Native field traversal was incomplete.".into());}
         let states=present(unsafe{(self.states)(node)})?;
+        // Hidden/defunct branches cannot contain the current visible edit target.
+        if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 { return Ok(()); }
         if unsafe{(self.has)(states,12)}!=0 { // ATSPI_STATE_FOCUSED
             let mut e=std::ptr::null_mut();let r=unsafe{(self.role)(node,&mut e)};valid(e)?;present(r.cast())?;
             let role=unsafe{CStr::from_ptr(r)}.to_str().map_err(|_|"Invalid native field role.")?.to_owned();
@@ -156,17 +158,29 @@ impl Api {
             found.push(Field{path:path.clone(),value,role,frame,caret:Some(caret),selections:Some(selections)});
             }
         }
-        for i in 0..self.child_count(node)? {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
+        // Writer exposes focused paragraphs beneath small virtual containers.
+        // Calc's virtual table can contain millions of cells. Search only a
+        // bounded child list; large virtual containers cannot be enumerated.
+        let count=self.child_count(node)?;
+        if count>4096 {
+            if unsafe{(self.has)(states,31)}!=0 { return Ok(()); }
+            return Err("Native field traversal exceeds its limit.".into());
+        }
+        for i in 0..count {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
         Ok(())
     }
     fn read(&self,pid:u32,rect:[i32;4],window_local:bool)->std::result::Result<Field,String>{
         if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
         unsafe{(self.timeout)(500,500)};
         let root=present(unsafe{(self.desktop)(0)})?;let mut windows=Vec::new();
-        for i in 0..self.child_count(root)? {
+        let applications=self.child_count(root)?;
+        if applications>4096{return Err("Native application count exceeds its limit.".into());}
+        for i in 0..applications {
             let app=self.child_at(root,i)?;let mut e=std::ptr::null_mut();let got=unsafe{(self.pid)(app,&mut e)};
             if !e.is_null() || got!=pid {continue;}
-            for j in 0..self.child_count(app)? {
+            let children=self.child_count(app)?;
+            if children>4096{return Err("Native window count exceeds its limit.".into());}
+            for j in 0..children {
                 let w=self.child_at(app,j)?;
                 let frame=self.frame(w)?;
                 let states=present(unsafe{(self.states)(w)})?;

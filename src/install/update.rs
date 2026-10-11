@@ -44,7 +44,7 @@ const KEEP_RELEASES: usize = 3;
 pub const PACKAGES: [&str; 3] = ["ibara", "ibara-stream", "ibara-view"];
 
 const GNOME_PACKAGES: [&str; 4] = ["libmutter-18-0", "mutter-common", "mutter-common-bin", "gir1.2-mutter-18"];
-const NATIVE_VERSION: &str = "50.1-0ubuntu2.4+ibara2";
+const NATIVE_VERSION: &str = "50.1-0ubuntu2.4+ibara3";
 
 fn host_packages() -> Result<Vec<&'static str>, String> {
     match super::package::Kind::host()? {

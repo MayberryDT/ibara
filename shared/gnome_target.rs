@@ -1,5 +1,5 @@
 use std::{path::Path,os::unix::fs::MetadataExt};
-const NATIVE_VERSION:&str="50.1-0ubuntu2.4+ibara2";
+const NATIVE_VERSION:&str="50.1-0ubuntu2.4+ibara3";
 pub fn require_manifest(version:&str)->Result<(),String> {
     let path=Path::new("/usr/lib/ibara").join("gnome-target.json");
     let metadata=std::fs::symlink_metadata(&path).map_err(|_|"Ubuntu target setup is unavailable in this operator-only package.".to_owned())?;

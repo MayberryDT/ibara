@@ -302,6 +302,7 @@ impl Controller {
                     "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
                     "screen_engine":"ibara","turn":"agent","agent_resumed":self.journal.get_active_lease()?.is_some()}))
             }
+            "take_control" if self.own_screen() || self.native_screen_only => self.take_screen_control(operator_id, &action, &authorize).await,
             "take_control" | "handback" => self.operator_control(operator_id, op == "take_control", &action, &authorize).await,
             // Only the holder, who was allowed control when taking it.
             "warm" => {

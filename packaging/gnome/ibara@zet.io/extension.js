@@ -105,10 +105,12 @@ export default class IbaraIdentity extends Extension {
         const windows = global.display.sort_windows_by_stacking(global.get_window_actors().map(actor => actor.meta_window).filter(Boolean)).map(window => {
             const frame = window.get_frame_rect();
             const client = window.get_client_content_rect();
+            const buffer = window.get_buffer_rect();
             return { address: `gnome:${window.get_stable_sequence()}`, pid: window.get_pid(),
                 class: window.get_wm_class() || window.get_gtk_application_id() || '', title: window.get_title() || '',
                 at: [frame.x, frame.y], size: [frame.width, frame.height], monitor: window.get_monitor(),
                 clientRect: [client.x, client.y, client.width, client.height],
+                bufferRect: [buffer.x, buffer.y, buffer.width, buffer.height],
                 workspace: { id: (window.get_workspace()?.index() ?? -1) + 1 },
                 mapped: true, hidden: window.minimized || !window.showing_on_its_workspace(),
                 visible: window.showing_on_its_workspace() && !window.minimized,

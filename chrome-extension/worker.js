@@ -20,6 +20,18 @@ let port;
 let busy=false;
 // Bounded by open tabs. No cookie is persisted by the extension.
 const navigation=new Map();
+const frameEpoch=new Map(),pendingFrames=new Map();
+chrome.webNavigation.onBeforeNavigate.addListener(d=>{
+  frameEpoch.set(d.tabId,(frameEpoch.get(d.tabId)||0)+1);
+  let frames=pendingFrames.get(d.tabId);if(!frames){frames=new Set();pendingFrames.set(d.tabId,frames);}frames.add(d.frameId);
+});
+const frameSettled=d=>{const frames=pendingFrames.get(d.tabId);frames?.delete(d.frameId);if(!frames?.size)pendingFrames.delete(d.tabId);};
+// Navigation stops blocking discovery once the new document has committed.
+// Captures and input still bind its document ID and the navigation epoch.
+chrome.webNavigation.onCommitted.addListener(frameSettled);
+chrome.webNavigation.onCompleted.addListener(frameSettled);
+chrome.webNavigation.onErrorOccurred.addListener(frameSettled);
+chrome.tabs.onRemoved.addListener(id=>{frameEpoch.delete(id);pendingFrames.delete(id);for(const [key,value] of captures)if(value.tabId===id)captures.delete(key);});
 chrome.webNavigation.onBeforeNavigate.addListener(d=>{
   if(d.frameId!==0)return;
   const old=navigation.get(d.tabId)||{};
@@ -116,7 +128,7 @@ function validCookie(c,site){
 let armed=null;
 chrome.runtime.onConnect.addListener(p=>{
   const a=armed,s=p.sender;
-  if(!a||a.port||p.name!=='press:'+a.watch||s?.id!==chrome.runtime.id||s.tab?.id!==a.tabId||s.frameId!==0||s.documentId!==a.documentId){p.disconnect();return;}
+  if(!a||a.port||p.name!=='press:'+a.watch||s?.id!==chrome.runtime.id||s.tab?.id!==a.tabId||s.documentId!==a.documentId){p.disconnect();return;}
   a.port=p;
   p.onMessage.addListener(m=>{
     if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true};a.pressedAt=Date.now();}
@@ -130,6 +142,100 @@ const refused=()=>({error:{execution_not_started:true}});
 const web=url=>/^https?:/.test(url||'');
 const sleep=ms=>new Promise(done=>setTimeout(done,ms));
 async function until(test,ms){const end=Date.now()+ms;while(!test()&&Date.now()<end)await sleep(20);return test();}
+// Captures retain child attribution privately while the public protocol stays stable.
+const captures=new Map();
+function embedding(url,point,scroll,token,index) {
+  const roots=[document];for(let i=0;i<roots.length;i++)for(const el of roots[i].querySelectorAll('*'))if(el.shadowRoot)roots.push(el.shadowRoot);
+  const bindings=globalThis.__ibaraFrameBindingsV1 ||= {ids:new WeakMap(),targets:new Map()};
+  const matches=roots.flatMap(root=>[...root.querySelectorAll('iframe,frame')]).filter(el=>el.src===url);
+  if(matches.length!==1)return {refused:true,reason:'ambiguous or redirected frame embedding'};
+  const el=matches[0];
+  if(el.hasAttribute("srcdoc")||!Number.isSafeInteger(index)||index<0||el.contentWindow!==window.frames[index])return {refused:true,reason:"frame document attribution changed"};
+  if(token&&bindings.targets.get(token)!==el)return {refused:true,reason:'frame embedding changed'};
+  if(!token){token=bindings.ids.get(el)||crypto.randomUUID();bindings.ids.set(el,token);bindings.targets.set(token,el);while(bindings.targets.size>128)bindings.targets.delete(bindings.targets.keys().next().value);}
+  if(!el.isConnected)return {refused:true};
+  const parent=p=>p.assignedSlot||p.parentElement||p.getRootNode()?.host||null;
+  const contains=(root,node)=>{for(let p=node;p;p=parent(p))if(p===root)return true;return false;};
+  const visible=node=>{for(let p=node;p;p=parent(p))if(p.matches('[hidden],[aria-hidden="true"],[inert]'))return false;return node.checkVisibility({visibilityProperty:true});};
+  const dialogs=roots.flatMap(root=>[...root.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"]')]).filter(visible);
+  let focus=document.activeElement;while(focus?.shadowRoot?.activeElement)focus=focus.shadowRoot.activeElement;
+  let focusedDialog=null;for(let p=focus;p;p=parent(p))if(dialogs.includes(p)){focusedDialog=p;break;}
+  const modals=dialogs.filter(p=>p.matches(':modal,[aria-modal="true"]'));
+  const activeDialog=modals.includes(focusedDialog)?focusedDialog:modals.at(-1)||(dialogs.includes(focusedDialog)?focusedDialog:null);
+  if(activeDialog&&!contains(activeDialog,el))return {refused:true,reason:'frame outside active dialog'};
+  for(let p=el;p;p=parent(p)){
+    const style=getComputedStyle(p);
+    if(p.matches('[hidden],[aria-hidden="true"],[inert]')||style.transform!=='none'||style.translate!=='none'||style.rotate!=='none'||style.scale!=='none'||style.zoom!=='1')return {refused:true,reason:'hidden or transformed frame embedding'};
+  }
+  const style=getComputedStyle(el);
+  if(['paddingLeft','paddingRight','paddingTop','paddingBottom'].some(k=>parseFloat(style[k])!==0))return {refused:true,reason:'padded frame embedding'};
+  if(!el.checkVisibility({visibilityProperty:true}))return {refused:true,reason:'hidden frame embedding'};
+  if(scroll)el.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});
+  const r=el.getBoundingClientRect();
+  if(!r.width||!r.height)return {refused:true};
+  if(!point)return {ready:true,token};
+  const x=r.left+el.clientLeft+point.x,y=r.top+el.clientTop+point.y;
+  if(point.x<0||point.y<0||point.x>=el.clientWidth||point.y>=el.clientHeight)return {covered:true};
+  let hit=document.elementFromPoint(x,y);while(hit?.shadowRoot){const next=hit.shadowRoot.elementFromPoint(x,y);if(!next||next===hit)break;hit=next;}
+  return hit===el?{x,y,outer:[outerWidth,outerHeight],inner:[innerWidth,innerHeight]}:{covered:true};
+}
+async function framePath(tabId,documentId,rootId) {
+  const frames=await chrome.webNavigation.getAllFrames({tabId});
+  const current=frames?.find(f=>f.documentId===documentId),root=frames?.find(f=>f.frameId===0);
+  if(!current||root?.documentId!==rootId)return null;
+  const path=[];let child=current;
+  while(child.frameId!==0){
+    if(path.length>=16)return null;
+    const parent=frames.find(f=>f.frameId===child.parentFrameId);
+    if(!parent||frames.filter(f=>f.parentFrameId===child.parentFrameId&&f.url===child.url).length!==1)return null;
+    path.push({child,parent});child=parent;
+  }
+  return path;
+}
+async function mapPoint(tabId,path,point,scroll=false) {
+  for(const step of path){
+    const {child,parent}=step;
+    const childReply=await chrome.scripting.executeScript({target:{tabId,documentIds:[child.documentId]},world:'ISOLATED',func:()=>{for(let i=0;i<window.parent.length;i++)if(window.parent[i]===window)return i;return -1;}});
+    const index=childReply.find(r=>r.documentId===child.documentId)?.result;
+    if(!Number.isSafeInteger(index)||index<0)return {refused:true};
+    const reply=await chrome.scripting.executeScript({target:{tabId,documentIds:[parent.documentId]},world:'ISOLATED',func:embedding,args:[child.url,point,scroll,step.token??null,index]});
+    const result=reply.find(r=>r.documentId===parent.documentId)?.result;
+    if(!result||result.refused||result.covered)return result||{refused:true};
+    if(result.token)step.token=result.token;
+    if(point)point=result;
+  }
+  return point||{ready:true};
+}
+async function observeFrames(m,tab,rootId) {
+  let snapshot;
+  if(m.args.capture){
+    snapshot=captures.get(m.args.capture);
+    if(pendingFrames.has(tab.id)||snapshot?.epoch!==(frameEpoch.get(tab.id)||0)||!snapshot||snapshot.tabId!==tab.id||snapshot.rootId!==rootId||snapshot.query!==(m.args.query||'')||Date.now()-snapshot.at>30000||!Number.isSafeInteger(m.args.offset)||m.args.offset<0||m.args.offset>=snapshot.nodes.length)return {result:{refused:true}};
+  }else{
+    const epoch=frameEpoch.get(tab.id)||0;
+    if(pendingFrames.has(tab.id))return {result:{refused:true}};
+    const responses=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[{...m,args:{...m.args,limit:1000}}],injectImmediately:true});
+    const root=responses.find(r=>r.frameId===0);
+    if(root?.documentId!==rootId||!root.result?.capture)return {result:{refused:true}};
+    const capture=crypto.randomUUID(),nodes=[],routes=new Map();let truncated=false;
+    for(const frame of responses.sort((a,b)=>a.frameId-b.frameId)){
+      if(!frame.result?.capture)continue;
+      const path=await framePath(tab.id,frame.documentId,rootId);
+      if(!path||!(await mapPoint(tab.id,path,null)).ready)continue;
+      for(const node of frame.result.nodes||[]){
+        if(nodes.length>=1000){truncated=true;break;}
+        const token=crypto.randomUUID();routes.set(token,{documentId:frame.documentId,capture:frame.result.capture,token:node.token,path});
+        nodes.push({...node,token,elementId:frame.documentId+':'+node.elementId});
+      }
+      if(frame.result.truncated)truncated=true;
+    }
+    snapshot={...root.result,capture,tabId:tab.id,rootId,at:Date.now(),epoch,query:m.args.query||'',nodes,routes,truncated};
+    if(pendingFrames.has(tab.id)||(frameEpoch.get(tab.id)||0)!==epoch)return {result:{refused:true}};
+    captures.set(capture,snapshot);while(captures.size>8)captures.delete(captures.keys().next().value);
+  }
+  const offset=m.args.offset||0,nodes=snapshot.nodes.slice(offset,offset+m.args.limit),next=offset+nodes.length<snapshot.nodes.length?offset+nodes.length:null;
+  return {result:{...snapshot,routes:undefined,nodes,count:snapshot.nodes.length,documentId:rootId,next_offset:next,truncated:snapshot.truncated||next!==null}};
+}
 async function focusedTab(tabId) {
   const tab=await chrome.tabs.get(tabId);
   const win=await chrome.windows.get(tab.windowId);
@@ -234,7 +340,7 @@ async function handle(m,jobs) {
     if(!PAGE_OPS.includes(m.op))return refused();
     if(m.op==='verify') {
       const a=armed;
-      if(a&&a.tabId===m.args.tabId&&a.documentId===m.args.documentId) {
+      if(a&&a.tabId===m.args.tabId&&a.rootId===m.args.documentId) {
         armed=null;
         const answer=await pressed(a,m.args.navigation===true);
         if(answer)return {result:answer};
@@ -242,20 +348,51 @@ async function handle(m,jobs) {
     }
     const tab=await focusedTab(m.args.tabId);
     if(!tab||!fresh(m))return {result:{refused:true}};
-    // Observe and keys read the top frame; the rest act on the exact document observed.
-    const target=['observe','check','keys'].includes(m.op)?{tabId:tab.id,frameIds:[0]}:{tabId:tab.id,documentIds:[m.args.documentId]};
+    const inventory=await chrome.webNavigation.getAllFrames({tabId:tab.id});
+    const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
+    if(!rootId)return refused();
+    if(m.op==='observe')return await observeFrames(m,tab,rootId);
+    if(['check','keys'].includes(m.op)){
+      const epoch=frameEpoch.get(tab.id)||0;
+      if(pendingFrames.has(tab.id))return {result:{refused:true}};
+      const replies=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[m]});
+      const results=[];
+      for(const reply of replies){
+        const path=await framePath(tab.id,reply.documentId,rootId);
+        if(path&&(await mapPoint(tab.id,path,null)).ready)results.push(reply);
+      }
+      if(pendingFrames.has(tab.id)||(frameEpoch.get(tab.id)||0)!==epoch)return {result:{refused:true}};
+      return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
+    }
+    const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);
+    if(pendingFrames.has(tab.id)||snapshot?.epoch!==(frameEpoch.get(tab.id)||0))return {result:{refused:true}};
+    if(!route||snapshot.tabId!==tab.id||snapshot.rootId!==rootId||m.args.documentId!==rootId)return {result:{refused:true}};
+    const path=await framePath(tab.id,route.documentId,rootId);
+    if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return {result:{refused:true}};
+    for(let i=0;i<path.length;i++)path[i].token=route.path[i].token;
     const zoom=m.op==='locate'?await chrome.tabs.getZoom(tab.id):undefined;
     if(!fresh(m))return refused();
     dispatching=EFFECTS.includes(m.op);
-    if(m.op==='locate') {
-      armed={watch:crypto.randomUUID(),tabId:tab.id,documentId:m.args.documentId,port:null,press:null,submit:null,leaving:false,gone:false};
+    if(['locate','reveal'].includes(m.op)){
+      const ready=await mapPoint(tab.id,[...path].reverse(),null,true);
+      if(!ready.ready)return {result:ready};
+    }
+    if(m.op==='locate'){
+      armed={watch:crypto.randomUUID(),tabId:tab.id,documentId:route.documentId,rootId,port:null,press:null,submit:null,leaving:false,gone:false};
       m.watch=armed.watch;
     }
-    const result=await chrome.scripting.executeScript({target,world:'ISOLATED',func:documentOperation,args:[m],injectImmediately:true});
-    const frame=result.find(r=>r.frameId===0);
+    const result=await chrome.scripting.executeScript({target:{tabId:tab.id,documentIds:[route.documentId]},world:'ISOLATED',func:documentOperation,args:[{...m,args:{...m.args,documentId:route.documentId,capture:route.capture,token:route.token}}],injectImmediately:true});
+    const frame=result.find(r=>r.documentId===route.documentId);
     if(m.op==='locate'&&!frame?.result?.watch)armed=null;
     if(!frame?.result)return {error:{execution_not_started:!dispatching}};
-    return {result:{...frame.result,documentId:frame.documentId,...(zoom!==undefined?{zoom}:{})}};
+    let answer=frame.result;
+    if(m.op==='locate'&&answer.watch){
+      const freshPath=await framePath(tab.id,route.documentId,rootId);
+      if(freshPath?.length===path.length)for(let i=0;i<path.length;i++)freshPath[i].token=path[i].token;
+      answer=freshPath&&!pendingFrames.has(tab.id)&&snapshot.epoch===(frameEpoch.get(tab.id)||0)?{...answer,...await mapPoint(tab.id,freshPath,answer)}:{refused:true};
+      if(answer.refused||answer.covered)armed=null;
+    }
+    return {result:{...answer,documentId:rootId,...(zoom!==undefined?{zoom}:{})}};
   } catch {return {error:{execution_not_started:!dispatching}};}
   finally {busy=false;}
 }

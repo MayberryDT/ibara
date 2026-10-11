@@ -260,6 +260,41 @@ impl Controller {
                 "ticket":ticket,"input":input,"expires_in_ms":60_000}}))
     }
 
+    pub(crate) async fn take_screen_control(&self, operator: &str, action: &Value, authorize: &dyn Fn() -> Result<super::OperatorGrant>) -> Result<Value> {
+        authorize()?;
+        if !self.screen_input_allowed(operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "This operator may watch but may not take control.", false));
+        }
+        if action["expected_owner"].as_str() != Some(self.viewer_owner_name()?.as_str())
+            || action["expected_ownership_revision"].as_str() != Some(self.viewer_revision_name()?.as_str()) {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Desktop owner changed; refresh explicit confirmation.", true));
+        }
+        if self.turns.borrow().person.as_ref().is_some_and(|p| p.operator != operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "Another person already controls this computer.", true));
+        }
+        let mut reply = self.join_screen(operator, action, authorize).await?;
+        let _lock = self.viewer_lock.lock().await;
+        let grant = authorize()?;
+        if !self.screen_input_allowed(operator)
+            || !self.screen_admissions.borrow().get(operator).is_some_and(|(_, generation)| *generation == grant.generation)
+            || action["expected_owner"].as_str() != Some(self.viewer_owner_name()?.as_str())
+            || action["expected_ownership_revision"].as_str() != Some(self.viewer_revision_name()?.as_str()) {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Control authorization or ownership changed during admission.", true));
+        }
+        let cert = self.viewer_identity(operator, &grant).ok_or_else(|| IbaraError::new("ACCESS_DENIED", "Viewer identity changed during admission.", false))?;
+        if let Err(error) = self.sender_event(json!({"t":"turn_request","operator_cert_sha256":cert})).await {
+            self.screen_fallback(&error.message).await;
+            return Err(error.requires_reconciliation());
+        }
+        if !self.turns.borrow().person.as_ref().is_some_and(|p| p.operator == operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "The person turn was not admitted.", true));
+        }
+        reply["owner"] = json!(self.viewer_owner_name()?);
+        reply["ownership_revision"] = json!(self.viewer_revision_name()?);
+        reply["turn"] = json!("person");
+        Ok(reply)
+    }
+
     async fn sender_event(&self, event: Value) -> Result<()> {
         let screen = self.screen.as_ref().unwrap();
         match event["t"].as_str().or_else(|| event["type"].as_str()) {

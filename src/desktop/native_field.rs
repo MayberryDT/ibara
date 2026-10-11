@@ -39,11 +39,12 @@ impl Field {
 }
 fn refused(message: impl Into<String>) -> IbaraError { IbaraError::new("CAPABILITY_UNAVAILABLE", message, true).with("execution_not_started", true) }
 pub async fn read(window: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>) -> Result<Field> {
-    let rect=window.client_rect.map(|[x,y,width,height]|super::hyprland::Rect{x,y,width,height}).unwrap_or_else(||window.geometry());
+    let buffer=if window.address.starts_with("gnome:") && window.buffer_rect.is_some() {Some(super::native_elements::buffer_rect(window).map_err(refused)?)} else {None};
+    let rect=buffer.or(window.client_rect).map(|[x,y,width,height]|super::hyprland::Rect{x,y,width,height}).unwrap_or_else(||window.geometry());
     let frame=window.geometry();
-    if rect.width<=0 || rect.height<=0 || rect.x<frame.x || rect.y<frame.y ||
+    if buffer.is_none() && (rect.width<=0 || rect.height<=0 || rect.x<frame.x || rect.y<frame.y ||
         rect.x.checked_add(rect.width).is_none_or(|end|frame.x.checked_add(frame.width).is_none_or(|right|end>right)) ||
-        rect.y.checked_add(rect.height).is_none_or(|end|frame.y.checked_add(frame.height).is_none_or(|bottom|end>bottom)) {
+        rect.y.checked_add(rect.height).is_none_or(|end|frame.y.checked_add(frame.height).is_none_or(|bottom|end>bottom))) {
         return Err(refused("Invalid compositor client rectangle."));
     }
     let exe=std::env::current_exe().map_err(|e|refused(e.to_string()))?;

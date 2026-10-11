@@ -58,10 +58,10 @@ pub fn default_catalog(release_root: &Path) -> Vec<App> {
 pub fn gnome_browser() -> App {
     if Path::new("/usr/bin/google-chrome-stable").is_file() {
         App { id:"browser".into(), program:"/usr/bin/google-chrome-stable".into(),
-            args:vec!["--new-window".into(),"about:blank".into()], class:Some("google-chrome".into()) }
+            args:vec!["--ozone-platform=wayland".into(),"--new-window".into(),"about:blank".into()], class:Some("google-chrome".into()) }
     } else {
         App { id:"browser".into(), program:"/usr/lib/chromium/chromium".into(),
-            args:vec!["--new-window".into(),"about:blank".into()], class:Some("chromium".into()) }
+            args:vec!["--ozone-platform=wayland".into(),"--new-window".into(),"about:blank".into()], class:Some("chromium".into()) }
     }
 }
 

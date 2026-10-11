@@ -89,6 +89,8 @@ pub struct Window {
     pub size: [i32; 2],
     /// Trusted compositor content bounds for AT-SPI WINDOW coordinates.
     pub client_rect: Option<[i32; 4]>,
+    /// GNOME surface buffer including client-side shadows, for GTK WINDOW coordinates.
+    pub buffer_rect: Option<[i32; 4]>,
     pub workspace: WorkspaceRef,
     pub floating: bool,
     pub monitor: i64,

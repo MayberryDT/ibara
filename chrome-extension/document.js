@@ -24,6 +24,16 @@
 //   keys     whether a key pressed now (args.key: enter or space) submits a
 //            form in this page
 export async function documentOperation(message) {
+  // Traverse only open shadow roots; closed roots remain opaque.
+  const all=(selector,root=document)=>{
+    const result=[...root.querySelectorAll(selector)];
+    for(const host of root.querySelectorAll('*'))if(host.shadowRoot)result.push(...all(selector,host.shadowRoot));
+    return result;
+  };
+  const active=()=>{let el=document.activeElement;while(el?.shadowRoot?.activeElement)el=el.shadowRoot.activeElement;return el;};
+  const hitAt=(x,y)=>{let hit=document.elementFromPoint(x,y);while(hit?.shadowRoot){const next=hit.shadowRoot.elementFromPoint(x,y);if(!next||next===hit)break;hit=next;}return hit;};
+  const parent=el=>el.assignedSlot||el.parentElement||el.getRootNode()?.host||null;
+  const contains=(root,el)=>{for(let p=el;p;p=parent(p))if(p===root)return true;return false;};
   // The submit button of a form that posts, and a field Return in which
   // submits such a form (implicit submission: through the form's first submit
   // button while it is enabled, from a text field, a checkbox or a radio
@@ -44,14 +54,15 @@ export async function documentOperation(message) {
     return TYPING.includes(el.type) && posts(el.form, null) && fields.filter(f => f instanceof HTMLInputElement && TYPING.includes(f.type)).length === 1;
   };
   const visible = (el) => {
+      for(let host=el;host;host=parent(host))if(host.matches('[hidden],[aria-hidden="true"],[inert]'))return false;
       if (el.closest('[hidden],[aria-hidden="true"],[inert]'))
           return false;
       // Closed disclosures can retain descendant layout boxes. Only their
       // first summary is available until the person/agent opens them.
-      for (let p = el.parentElement; p; p = p.parentElement) {
+      for (let p = parent(el); p; p = parent(p)) {
           if (p.tagName === 'DETAILS' && !p.open) {
               const summary = p.querySelector(':scope > summary');
-              if (!summary || !(summary === el || summary.contains(el))) return false;
+              if (!summary || !(summary === el || contains(summary,el))) return false;
           }
       }
       if (el.checkVisibility && !el.checkVisibility({visibilityProperty:true})) return false;
@@ -82,7 +93,7 @@ export async function documentOperation(message) {
     const explicitName = (el) => {
         const refs = normalize(el.getAttribute('aria-labelledby')).split(' ').filter(Boolean);
         if (refs.length) {
-            const value = refs.map(ref => document.getElementById(ref)).filter(Boolean).map(n => content(n)).join(' ');
+            const value = refs.map(ref => el.getRootNode().getElementById(ref)).filter(Boolean).map(n => content(n)).join(' ');
             if (normalize(value))
                 return normalize(value);
         }
@@ -187,7 +198,7 @@ export async function documentOperation(message) {
     };
     const containers = new Set(['form', 'group', 'region', 'dialog', 'navigation', 'main', 'complementary', 'row', 'listitem']);
     const needle = normalize(query).toLowerCase();
-    const elements = document.querySelectorAll('button,summary,input,textarea,select,a[href],fieldset,form,section,dialog,nav,main,aside,img,h1,h2,h3,h4,h5,h6,[role]');
+    const elements = all('button,summary,input,textarea,select,a[href],fieldset,form,section,dialog,nav,main,aside,img,h1,h2,h3,h4,h5,h6,[role]');
     const nodes = [];
     for (const el of elements) {
         if (!visible(el))
@@ -202,7 +213,7 @@ export async function documentOperation(message) {
         // div cards have no ARIA role; inventing one would break role-based locators.
         let context = '';
         let contextGuard = '';
-        for (let p = el.parentElement; p; p = p.parentElement) {
+        for (let p = parent(el); p; p = parent(p)) {
             const pr = role(p);
             if (containers.has(pr)) {
                 const pn = name(p);
@@ -224,7 +235,7 @@ export async function documentOperation(message) {
             states.push('context_truncated');
         const disabled = el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true';
         states.push(disabled ? 'disabled' : 'enabled');
-        if (document.activeElement === el)
+        if (active() === el)
             states.push('focused');
         if (el.tagName === 'SUMMARY' && el.parentElement?.tagName === 'DETAILS')
             states.push(el.parentElement.open ? 'expanded' : 'collapsed');
@@ -275,7 +286,7 @@ export async function documentOperation(message) {
   // This global belongs only to the extension's isolated world, not page
   // scripts. An updated extension can meet the state and press listener its
   // previous copy left in an open page, so the key changes whenever they do.
-  const key='__ibaraPageReaderV5';
+  const key='__ibaraPageReaderV6';
   const state=globalThis[key] ||= {captures:new Map(),identities:new WeakMap(),watch:null,listening:false,selecting:null,located:null,port:null};
   if(!state.listening){
     // Which element the next trusted press reached, whether it submitted a
@@ -288,7 +299,7 @@ export async function documentOperation(message) {
     addEventListener('pointerdown',e=>{
       const w=state.watch;
       if(!w||w.result||!e.isTrusted)return;
-      w.result={hit:reaches(w.el,e.target)};
+      w.result={hit:reaches(w.el,e.composedPath()[0])};
       post({press:{watch:w.id,hit:w.result.hit}});
     },true);
     addEventListener('submit',e=>{
@@ -340,7 +351,7 @@ export async function documentOperation(message) {
       if(right-left<1||bottom-top<1)continue;
       for(const [fx,fy] of [[.5,.5],[.3,.5],[.7,.5],[.5,.3],[.5,.7],[.2,.2],[.8,.8]]){
         const x=left+(right-left)*fx,y=top+(bottom-top)*fy;
-        if(reaches(el,document.elementFromPoint(x,y)))return {x:Math.round(x*100)/100,y:Math.round(y*100)/100};
+        if(reaches(el,hitAt(x,y)))return {x:Math.round(x*100)/100,y:Math.round(y*100)/100};
       }
     }
     return null;
@@ -352,7 +363,7 @@ export async function documentOperation(message) {
   if(message.op==='keys') {
     // Not when the keyboard is elsewhere (the address bar). A form inside a
     // frame is not seen: the focus is then the frame itself.
-    const el=document.hasFocus()?document.activeElement:null;
+    const el=document.hasFocus()?active():null;
     return {page:!!el,submits:!!el&&(submitter(el)||(args.key==='enter'&&enterSubmits(el)))};
   }
   if(message.op==='check') {
@@ -369,7 +380,7 @@ export async function documentOperation(message) {
     const el=selection?.el;
     if(!el||!el.isConnected||selection.capture!==args.capture||selection.token!==args.token||find()!==el)return refuse();
     const stable=selection.signature===selectSignature(el);
-    return {ready:stable&&document.hasFocus()&&document.activeElement===el,
+    return {ready:stable&&document.hasFocus()&&active()===el,
       ...(CSS.supports('selector(:open)')?{open:el.matches(':open')} : {}),
       matches:stable&&el.options[el.selectedIndex]===selection.option,
       text:normalize(el.selectedOptions[0]?.text),value:el.value,index:el.selectedIndex};
@@ -380,9 +391,9 @@ export async function documentOperation(message) {
     const el=located&&located.capture===args.capture&&located.token===args.token?located.el:null;
     if(!el||!el.isConnected)return refuse();
     const text=el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement;
-    const active=document.activeElement;
+    const focusedElement=active();
     // document.hasFocus() is false while the address bar or another window has the keyboard.
-    const focused=document.hasFocus()&&(text?active===el:el.isContentEditable&&(active===el||el.contains(active)));
+    const focused=document.hasFocus()&&(text?focusedElement===el:el.isContentEditable&&(focusedElement===el||el.contains(focusedElement)));
     if(typeof args.expected!=='string')return {focused};
     // Only whether the field holds what ibara typed: its value (a password,
     // a large text) never leaves the page. Text areas turn line ends into \n.
@@ -428,7 +439,7 @@ export async function documentOperation(message) {
       await frame();
       if(!safe()||!el.isConnected)return refuse();
       const after=centre(el);
-      rest=Math.abs(after[0]-before[0])<=1&&Math.abs(after[1]-before[1])<=1&&(!point||reaches(el,document.elementFromPoint(point.x,point.y)));
+      rest=Math.abs(after[0]-before[0])<=1&&Math.abs(after[1]-before[1])<=1&&(!point||reaches(el,hitAt(point.x,point.y)));
     }
     if(!rest)return {moving:true};
     if(!point)return {covered:true};
@@ -453,9 +464,8 @@ export async function documentOperation(message) {
   }
   const targets=new Map();const nodes=[];const equivalentLinks=new Set();
   const dialogSelector='dialog,[role="dialog"],[role="alertdialog"]';
-  const dialogs=[...document.querySelectorAll(dialogSelector)].filter(el=>
-    !el.closest('[hidden],[aria-hidden="true"],[inert]') && el.checkVisibility({visibilityProperty:true}));
-  const focusedDialog=document.activeElement?.closest(dialogSelector);
+  const dialogs=all(dialogSelector).filter(visible);
+  let focusedDialog=null;for(let p=active();p;p=parent(p))if(p.matches(dialogSelector)){focusedDialog=p;break;}
   const modals=dialogs.filter(el=>el.matches(':modal,[aria-modal="true"]'));
   const activeDialog=modals.includes(focusedDialog)?focusedDialog:
     modals.at(-1)||(dialogs.includes(focusedDialog)?focusedDialog:null);
@@ -485,7 +495,7 @@ export async function documentOperation(message) {
     // Keep an application's warning and controls inside that warning together.
     // This is relevance ordering only: never choose or execute its recovery.
     const urgent=el.closest('[role="alert"],[aria-live="assertive"]');
-    const rank=activeDialog && (el===activeDialog || activeDialog.contains(el))?0:
+    const rank=activeDialog && (el===activeDialog || contains(activeDialog,el))?0:
       urgent?1:el.closest(dialogSelector)?2:el.closest('main,[role="main"]')?3:4;
     // Full context is an isolated-world guard, never observation payload.
     const {contextGuard:privateGuard,...publicNode}=packed;
@@ -505,11 +515,11 @@ export async function documentOperation(message) {
   let omittedBackground=0;
   if(modalScope)for(let i=nodes.length-1;i>=0;i--){
     const el=targets.get(nodes[i].token).el;
-    if(el!==activeDialog && !activeDialog.contains(el)){nodes.splice(i,1);omittedBackground++;}
+    if(el!==activeDialog && !contains(activeDialog,el)){nodes.splice(i,1);omittedBackground++;}
   }
   // A small excerpt of visible static context, separate from the control budget.
   // Never read field values/editable content or copy a whole DOM subtree.
-  const main=document.activeElement?.closest('main,[role="main"]') ||
+  const main=active()?.closest('main,[role="main"]') ||
     [...document.querySelectorAll('main,[role="main"]')].find(visible);
   const scope=activeDialog || main || document.body;
   const parts=[];let remaining=800,contextTruncated=false;

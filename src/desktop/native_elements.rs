@@ -38,6 +38,7 @@ pub async fn probe(env:std::sync::Arc<[(OsString,OsString)]>)->Result<bool> {
 struct Reader {connection:Connection,guid:String,owner:String,root:OwnedObjectPath,window:Window,screen_coords:bool}
 impl Reader {
     fn client_rect(&self)->std::result::Result<[i32;4],String> {
+        if !self.screen_coords && self.window.buffer_rect.is_some() { return buffer_rect(&self.window); }
         let [x,y,w,h]=self.window.client_rect.unwrap_or([self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]]);
         let frame=self.window.geometry();
         if w<=0 || h<=0 || x<frame.x || y<frame.y ||
@@ -157,7 +158,7 @@ impl Reader {
             }
             let frame=if interfaces.iter().any(|i|i=="org.a11y.atspi.Component") {Some(self.bounds(&path).await?)} else {None};
             let selector=json!({"backend":"gnome-atspi","bus_guid":self.guid,"owner":self.owner,"window_path":self.root.as_str(),
-                "object_path":path.as_str(),"chain":chain,"pid":self.window.pid,"window_rect":[self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]],"client_rect":self.client_rect()?,"local_frame":frame,"coordinate_basis":if self.screen_coords {"screen_top_level"} else {"window"}});
+                "object_path":path.as_str(),"chain":chain,"pid":self.window.pid,"window_rect":[self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]],"client_rect":self.client_rect()?,"local_frame":frame,"coordinate_basis":if self.screen_coords {"screen_top_level"} else if self.window.buffer_rect.is_some() {"window_buffer"} else {"window"}});
             observed_bytes+=selector.to_string().len()+ancestor.len()+name.len()+role.len()+text.len()+actions.iter().map(String::len).sum::<usize>();
             if observed_bytes>900000 {return Err("Native observation exceeds its byte limit".into());}
             tree.elements.push(RawElement {selector,role:role.clone(),name:name.clone(),states,ancestor:ancestor.clone(),actions,text});
@@ -197,7 +198,21 @@ pub fn center(tree:Tree,selector:&Value,role:&str,name:&str,window:&Window)->Res
     let frame: [i32;4]=serde_json::from_value(selector["local_frame"].clone()).map_err(|_|gone())?;
     let [x,y,w,h]=frame;
     let client: [i32;4]=serde_json::from_value(selector["client_rect"].clone()).map_err(|_|gone())?;
-    if client!=window.client_rect.unwrap_or([window.at[0],window.at[1],window.size[0],window.size[1]]) {return Err(gone());}
+    let current=if selector["coordinate_basis"]=="window_buffer" {buffer_rect(window).map_err(|_|gone())?} else {window.client_rect.unwrap_or([window.at[0],window.at[1],window.size[0],window.size[1]])};
+    if client!=current {return Err(gone());}
     if x<0 || y<0 || w<=0 || h<=0 || x.checked_add(w).is_none_or(|end|end>client[2]) || y.checked_add(h).is_none_or(|end|end>client[3]) {return Err(gone());}
     Ok((client[0] as f64+x as f64+w as f64/2.0,client[1] as f64+y as f64+h as f64/2.0))
+}
+
+// Only a trusted GNOME compositor response supplies this optional rectangle.
+pub(super) fn buffer_rect(window:&Window)->std::result::Result<[i32;4],String> {
+    let rect=window.buffer_rect.ok_or("Missing compositor buffer rectangle")?;
+    let [x,y,w,h]=rect;
+    let frame=window.geometry();
+    if w<=0 || h<=0 || w>8192 || h>8192 || x>frame.x || y>frame.y ||
+        x.checked_add(w).is_none_or(|right|frame.x.checked_add(frame.width).is_none_or(|end|end>right)) ||
+        y.checked_add(h).is_none_or(|bottom|frame.y.checked_add(frame.height).is_none_or(|end|end>bottom)) {
+        return Err("Invalid compositor buffer rectangle".into());
+    }
+    Ok(rect)
 }

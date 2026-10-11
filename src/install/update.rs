@@ -522,7 +522,16 @@ fn restart_services() -> Result<(), String> {
 
 /// Whether an agent task holds this computer, from its controller (`ibara admin status`).
 fn busy() -> Result<Option<String>, String> {
-    if super::package::Kind::host()?==super::package::Kind::Ubuntu && !super::gnome::target_package() { return Ok(None); }
+    if super::package::Kind::host()? == super::package::Kind::Ubuntu {
+        if !super::gnome::target_package() { return Ok(None); }
+        // The first signed target install precedes setup and has no controller
+        // to ask. Any trace of setup keeps the authenticated busy check below.
+        let unconfigured = [super::STATION, "/etc/agent-computer/policy.json",
+            "/etc/agent-computer/admin.key", "/run/agent-computer/admin.sock"]
+            .iter().all(|path| matches!(std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        if unconfigured { return Ok(None); }
+    }
     let status = output(Command::new(Path::new(LIB).join("bin/ibara")).args(["admin", "status"]))?;
     let status: Value = serde_json::from_str(&status).map_err(|_| "Could not check whether this computer is busy.")?;
     let result = status.get("result").filter(|r| r.is_object()).ok_or("Could not check whether this computer is busy.")?;

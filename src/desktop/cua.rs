@@ -657,7 +657,9 @@ impl Cua {
                     .with("next", "Scroll it into view, observe again and click it; or click a point from computer_observe with view \"image\".")
             })),
         };
-        if tool != "click" {
+        // Entry activation may acknowledge without moving keyboard focus.
+        // Use the exact freshly resolved bounds and guarded real pointer.
+        if tool != "click" || editable_role(role) || matches!(role, "table cell" | "spin button" | "slider" | "combo box" | "search box" | "textbox") {
             return pointer(None);
         }
         let token = element["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
@@ -1434,6 +1436,12 @@ pub(super) fn page(tree: Tree, query: Option<&str>, limit: u32, cursor: Option<u
 fn answer(tool: &str, outcome: Value, mutates: bool) -> Result<Value> {
     if outcome.get("isError").and_then(Value::as_bool) == Some(true) {
         return Err(refusal(tool, &outcome, mutates));
+    }
+    let sc=&outcome["structuredContent"];
+    if mutates && (sc["effect"].as_str()==Some("suspected_noop") ||
+        (sc["effect"].as_str()==Some("unverifiable") && sc["note"].as_str().is_some_and(|note|note.contains("no acknowledgement received")))) {
+        return Err(IbaraError::new("OUTCOME_UNKNOWN",format!("Cua {tool} was dispatched, but its action was not acknowledged or may have had no effect. Observe before acting again."),false)
+            .with("execution_not_started",false).with("cua_effect",sc["effect"].clone()).requires_reconciliation());
     }
     Ok(outcome)
 }

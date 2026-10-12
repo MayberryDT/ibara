@@ -35,10 +35,10 @@ pub async fn probe(env:std::sync::Arc<[(OsString,OsString)]>)->Result<bool> {
     }).await.map_err(|_|refused("Accessibility bus probe timed out"))?
 }
 
-struct Reader {connection:Connection,guid:String,owner:String,root:OwnedObjectPath,window:Window,screen_coords:bool}
+struct Reader {connection:Connection,guid:String,owner:String,root:OwnedObjectPath,window:Window,screen_coords:bool,buffer_coords:bool}
 impl Reader {
     fn client_rect(&self)->std::result::Result<[i32;4],String> {
-        if !self.screen_coords && self.window.buffer_rect.is_some() { return buffer_rect(&self.window); }
+        if self.buffer_coords && self.window.buffer_rect.is_some() { return buffer_rect(&self.window); }
         let [x,y,w,h]=self.window.client_rect.unwrap_or([self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]]);
         let frame=self.window.geometry();
         if w<=0 || h<=0 || x<frame.x || y<frame.y ||
@@ -101,22 +101,28 @@ impl Reader {
             let owner:String=dbus.call("GetNameOwner",&(app,)).await.map_err(|e|e.to_string())?;
             let pid:u32=dbus.call("GetConnectionUnixProcessID",&(&owner,)).await.map_err(|e|e.to_string())?;
             if pid as i64!=window.pid {continue;}
-            let mut reader=Self {connection:connection.clone(),guid:guid.clone(),owner,root:path.clone(),window:window.clone(),screen_coords:false};
+            let mut reader=Self {connection:connection.clone(),guid:guid.clone(),owner,root:path.clone(),window:window.clone(),screen_coords:false,buffer_coords:window.buffer_rect.is_some()};
             let toolkit:String=reader.proxy(&path,"org.a11y.atspi.Application").await?.get_property("ToolkitName").await.map_err(|e|e.to_string())?;
             reader.screen_coords=toolkit.eq_ignore_ascii_case("qt");
+            reader.buffer_coords &= !reader.screen_coords;
             for (_,path) in reader.children(&path).await? {
                 let candidate=Self {root:path.clone(),..reader.clone()};
                 let bounds=candidate.bounds(&path).await?;
-                let client=reader.client_rect()?;
+                let mut selected=reader.clone();
+                let client=selected.client_rect()?;
+                if bounds!=[0,0,client[2],client[3]] && !selected.screen_coords {
+                    selected.buffer_coords=false;
+                }
+                let client=selected.client_rect()?;
                 if reader.name(&path).await?==window.title && bounds==[0,0,client[2],client[3]] {
-                    matches.push(Self {root:path,..reader.clone()});
+                    matches.push(Self {root:path,..selected});
                 }
             }
         }
         if matches.len()!=1 {return Err("Native top-level identity was not proved uniquely".into());}
         Ok(matches.pop().unwrap())
     }
-    fn clone(&self)->Self {Self {connection:self.connection.clone(),guid:self.guid.clone(),owner:self.owner.clone(),root:self.root.clone(),window:self.window.clone(),screen_coords:self.screen_coords}}
+    fn clone(&self)->Self {Self {connection:self.connection.clone(),guid:self.guid.clone(),owner:self.owner.clone(),root:self.root.clone(),window:self.window.clone(),screen_coords:self.screen_coords,buffer_coords:self.buffer_coords}}
     async fn tree(&self)->std::result::Result<Tree,String> {
         let mut tree=Tree {available:true,..Tree::default()};
         let mut seen=HashSet::new();
@@ -158,7 +164,7 @@ impl Reader {
             }
             let frame=if interfaces.iter().any(|i|i=="org.a11y.atspi.Component") {Some(self.bounds(&path).await?)} else {None};
             let selector=json!({"backend":"gnome-atspi","bus_guid":self.guid,"owner":self.owner,"window_path":self.root.as_str(),
-                "object_path":path.as_str(),"chain":chain,"pid":self.window.pid,"window_rect":[self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]],"client_rect":self.client_rect()?,"local_frame":frame,"coordinate_basis":if self.screen_coords {"screen_top_level"} else if self.window.buffer_rect.is_some() {"window_buffer"} else {"window"}});
+                "object_path":path.as_str(),"chain":chain,"pid":self.window.pid,"window_rect":[self.window.at[0],self.window.at[1],self.window.size[0],self.window.size[1]],"client_rect":self.client_rect()?,"local_frame":frame,"coordinate_basis":if self.screen_coords {"screen_top_level"} else if self.buffer_coords {"window_buffer"} else {"window"}});
             observed_bytes+=selector.to_string().len()+ancestor.len()+name.len()+role.len()+text.len()+actions.iter().map(String::len).sum::<usize>();
             if observed_bytes>900000 {return Err("Native observation exceeds its byte limit".into());}
             tree.elements.push(RawElement {selector,role:role.clone(),name:name.clone(),states,ancestor:ancestor.clone(),actions,text});

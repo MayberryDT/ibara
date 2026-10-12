@@ -75,7 +75,16 @@ pub async fn read(window: &Window, env: &[(OsString, OsString)], cancel: Option<
     }
     let exe=std::env::current_exe().map_err(|e|refused(e.to_string()))?;
     let mut cmd=Cmd::new(exe).args(["native-field".to_string(),window.pid.to_string(),rect.x.to_string(),rect.y.to_string(),rect.width.to_string(),rect.height.to_string()]).envs(env).timeout(Duration::from_secs(6)).max_output(1024*1024);
-    if window.address.starts_with("gnome:") {cmd=cmd.arg("window-local");}
+    if window.address.starts_with("gnome:") {
+        cmd=cmd.arg("window-local");
+        if let Some(client)=window.client_rect {
+            let frame=window.geometry();
+            if client[2]<=0 || client[3]<=0 || client[0]<frame.x || client[1]<frame.y ||
+                client[0].checked_add(client[2]).is_none_or(|end|frame.x.checked_add(frame.width).is_none_or(|right|end>right)) ||
+                client[1].checked_add(client[3]).is_none_or(|end|frame.y.checked_add(frame.height).is_none_or(|bottom|end>bottom)) {return Err(refused("Invalid compositor client rectangle."));}
+            cmd=cmd.args(client.map(|n|n.to_string()));
+        }
+    }
     if let Some(c)=cancel { cmd=cmd.cancel(c); }
     let out=run::run(cmd).await?;
     if !out.success() { return Err(refused(out.failure_text("native field read"))); }
@@ -226,7 +235,7 @@ impl Api {
         for i in 0..count {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
         Ok(())
     }
-    fn read(&self,pid:u32,rect:[i32;4],window_local:bool)->std::result::Result<Field,String>{
+    fn read(&self,pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>)->std::result::Result<Field,String>{
         if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
         // A cold LibreOffice accessibility reply can take over one second.
         // The isolated runner still enforces the six-second overall deadline.
@@ -246,12 +255,13 @@ impl Api {
                 // GTK on Wayland reports screen extents with a window-local
                 // zero origin. Require the unique ACTIVE top-level window in
                 // the compositor-focused PID and exact size, never size alone.
-                let origin=(frame[0]==rect[0] && frame[1]==rect[1]) || (frame[0]==0 && frame[1]==0);
-                if origin && frame[2..]==rect[2..] && unsafe{(self.has)(states,1)}!=0 {windows.push((w,vec![j]));}
+                let matched=std::iter::once(rect).chain(client).find(|candidate|
+                    ((frame[0]==candidate[0] && frame[1]==candidate[1]) || (frame[0]==0 && frame[1]==0)) && frame[2..]==candidate[2..]);
+                if let Some(matched)=matched {if unsafe{(self.has)(states,1)}!=0 {windows.push((w,vec![j],matched));}}
             }
         }
         if windows.len()!=1{return Err("The native window identity could not be proved uniquely.".into());}
-        let (w,mut path)=windows.pop().unwrap();
+        let (w,mut path,rect)=windows.pop().unwrap();
         // Root desktop application order can change independently; identity is
         // the selected process plus its top-level window index and field path.
         let mut found=Vec::new();self.walk(w,&mut path,&mut 0,&mut found,window_local.then_some(rect))?;
@@ -261,11 +271,12 @@ impl Api {
 /// Private read-only daemon subcommand. The desktop runner owns its deadline.
 pub fn main(args:&[String])->u8 {
     let result=(|| {
-        if args.len()!=5 && !(args.len()==6 && args[5]=="window-local") {return Err("Expected native-field PID X Y WIDTH HEIGHT [window-local].".into());}
+        if args.len()!=5 && !((args.len()==6 || args.len()==10) && args[5]=="window-local") {return Err("Expected native-field PID X Y WIDTH HEIGHT [window-local].".into());}
         let pid=args[0].parse::<u32>().map_err(|_|"Invalid native PID.")?;
         let mut rect=[0;4];for (dst,s) in rect.iter_mut().zip(&args[1..]){*dst=s.parse().map_err(|_|"Invalid native window geometry.")?;}
         if pid==0 || rect[2]<=0 || rect[3]<=0{return Err("Invalid native window identity.".into());}
-        unsafe{Api::load()}?.read(pid,rect,args.len()==6)
+        let client=if args.len()==10 {let mut client=[0;4];for (dst,s) in client.iter_mut().zip(&args[6..]){*dst=s.parse().map_err(|_|"Invalid native client geometry.")?;}if client[2]<=0 || client[3]<=0{return Err("Invalid native client identity.".into());}Some(client)}else{None};
+        unsafe{Api::load()}?.read(pid,rect,args.len()>=6,client)
     })();
     match result {Ok(f)=>{println!("{}",serde_json::to_string(&f).unwrap());0},Err(e)=>{eprintln!("{e}");1}}
 }

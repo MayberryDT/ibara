@@ -208,7 +208,7 @@ impl Gnome {
                         }
                     };
                     let (reason,): (String,) = message.body().deserialize().map_err(|e| unavailable(e.to_string()))?;
-                    let _ = events.send(DesktopEvent::Resync);
+                    let _ = events.send(DesktopEvent::StateChanged);
                     if reason == "displays" || reason == "session" { let _ = events.send(DesktopEvent::DisplayChanged); }
                 }
                 Ok::<(), IbaraError>(())

@@ -551,6 +551,7 @@ impl Controller {
                 self.display_changed();
                 return;
             }
+            DesktopEvent::StateChanged => "desktop changed; observe current state".to_string(),
             DesktopEvent::Resync => "desktop events restarted; some changes may be missing".to_string(),
         };
         events.push(true, None, text);

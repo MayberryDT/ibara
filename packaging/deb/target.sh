@@ -9,7 +9,7 @@ if [[ -n ${IBARA_PKGREL:-} ]]; then
   profile=release
   stage_id="release-$IBARA_PKGREL"
 else
-  : "${IBARA_BUILD_ID:?Choose a fresh private build ID}"
+  : "${IBARA_BUILD_ID:?Choose a fresh private build ID: <branch>.r<n>.<commit>, no hyphens}"
   stage_id=$IBARA_BUILD_ID
 fi
 bash "$core/packaging/deb/operator.sh"

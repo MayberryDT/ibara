@@ -19,7 +19,7 @@ if [[ -n ${IBARA_PKGREL:-} ]]; then
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$core=/usr/src/ibara --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/usr/src/cargo"
   stage_id="release-$IBARA_PKGREL"
 else
-  : "${IBARA_BUILD_ID:?Choose a fresh private build ID}"
+  : "${IBARA_BUILD_ID:?Choose a fresh private build ID: <branch>.r<n>.<commit>, no hyphens}"
   stage_id=$IBARA_BUILD_ID
 fi
 export IBARA_BUILD_ID

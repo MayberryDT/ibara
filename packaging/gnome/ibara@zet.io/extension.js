@@ -88,6 +88,12 @@ export default class IbaraIdentity extends Extension {
         this._impl?.emit_signal('Changed', new GLib.Variant('(s)', [reason]));
     }
     _locked() { return Main.sessionMode.isLocked || Main.sessionMode.isGreeter; }
+    // A shell dialog, secure prompt, overview or shell menu: always a person's.
+    _shellModal() {
+        return Main.modalCount > 0 || !!global.stage.get_key_focus() || Main.actionMode !== Shell.ActionMode.NORMAL;
+    }
+    // A grab the shell did not take: an application's open menu or popup.
+    _popupGrab() { return !this._shellModal() && !!global.stage.get_grab_actor(); }
     _shellInputBlocked() {
         if (typeof global.display.ibara_input_state === 'function') {
             const state = JSON.parse(global.display.ibara_input_state());
@@ -125,6 +131,7 @@ export default class IbaraIdentity extends Extension {
         });
         return JSON.stringify({ epoch: this._epoch, session_generation: this._sessionGeneration, locked: this._locked(),
             capture_api: 1, input_readiness_api: 1, shell_input_blocked: shellInputBlocked,
+            shell_modal: this._shellModal(), popup_grab: this._popupGrab(),
             cursor_api: this._personSignal ? 1 : 0,
             cursor_visible: !!this._cursor?.inhibited, last_person_us: this._personAt,
             guarded_input_api: ['begin', 'key', 'motion', 'button', 'scroll', 'text', 'end', 'state', 'idle']
@@ -191,6 +198,7 @@ export default class IbaraIdentity extends Extension {
     }
     Focus(encoded) {
         const window = this._target(encoded);
+        if (this._shellModal()) return false;
         Main.activateWindow(window);
         return global.display.focus_window === window;
     }

@@ -31,6 +31,11 @@ pub struct Gnome { env: Arc<[(OsString, OsString)]> }
 pub struct State {
     #[serde(default)] pub input_readiness_api: u32,
     #[serde(default)] pub shell_input_blocked: bool,
+    /// A shell dialog, secure prompt, overview or shell menu holds input.
+    /// Absent from an older helper.
+    #[serde(default)] pub shell_modal: Option<bool>,
+    /// An application's open menu or popup holds a grab (no shell modal).
+    #[serde(default)] pub popup_grab: Option<bool>,
     #[serde(default)] pub capture_api: u32,
     #[serde(default)]
     pub guarded_input_api: u32,
@@ -53,11 +58,22 @@ impl State {
     /// closes the menu is refused.
     pub fn stranded_menu(&self) -> Option<&Window> {
         if !self.shell_input_blocked { return None; }
-        self.windows.iter()
-            .filter(|w| w.visible && !w.hidden && !w.modal && w.title.is_empty() && w.class.is_empty())
-            .filter_map(|w| w.transient_for.as_deref())
-            .filter(|owner| self.focused.as_deref() != Some(*owner))
-            .find_map(|owner| self.windows.iter().find(|w| w.address == owner && w.visible && !w.hidden))
+        self.menu_owner().filter(|owner| self.focused.as_deref() != Some(owner.address.as_str()))
+    }
+    /// The window whose open menu holds an application grab while focused;
+    /// focusing another window would strand it ([`Self::stranded_menu`]).
+    pub fn open_menu(&self) -> Option<&Window> {
+        if self.shell_input_blocked { return None; }
+        self.menu_owner().filter(|owner| self.focused.as_deref() == Some(owner.address.as_str()))
+    }
+    /// Owner of the topmost untitled popup, only while the helper reports an
+    /// application grab and no shell modal. Windows arrive bottom to top.
+    fn menu_owner(&self) -> Option<&Window> {
+        if self.popup_grab != Some(true) || self.shell_modal != Some(false) { return None; }
+        let popup = self.windows.iter().rev()
+            .find(|w| w.visible && !w.hidden && !w.modal && w.title.is_empty() && w.class.is_empty() && w.transient_for.is_some())?;
+        let owner = popup.transient_for.as_deref()?;
+        self.windows.iter().find(|w| w.address == owner && w.visible && !w.hidden)
     }
     /// Why GNOME input is refused, and what releases it.
     pub fn blocked(&self) -> IbaraError {
@@ -65,12 +81,23 @@ impl State {
             IbaraError::new("CAPABILITY_UNAVAILABLE", "The GNOME input readiness helper needs a session reload.", true)
         } else if let Some(owner) = self.stranded_menu() {
             IbaraError::new("CAPABILITY_UNAVAILABLE", format!(
-                "An open menu or popup in {} \"{}\" holds input while another window has focus. Focus that window (allowed now), then press Escape or choose a menu item.",
-                owner.class, owner.title), true).with("reason", "menu_holds_input")
+                "An open menu or popup in {} holds input while another window has focus. Focus that window (allowed now), then press Escape or choose a menu item.",
+                named(owner)), true).with("reason", "menu_holds_input")
+        } else if self.shell_modal == Some(true) {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "A GNOME Shell dialog, secure prompt or overview holds input. A person must dismiss it before agent work.", true)
+                .with("reason", "shell_modal")
         } else {
             IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any shell dialog or secure prompt before agent work.", true)
         };
         error.with("execution_not_started", true)
+    }
+}
+fn named(window: &Window) -> String {
+    match (window.class.is_empty(), window.title.is_empty()) {
+        (false, false) => format!("{} \"{}\"", window.class, window.title),
+        (false, true) => window.class.clone(),
+        (true, false) => format!("\"{}\"", window.title),
+        (true, true) => window.address.clone(),
     }
 }
 impl Gnome {
@@ -145,6 +172,11 @@ impl Gnome {
             if method=="Focus" && state.shell_input_blocked
                 && state.stranded_menu().is_none_or(|owner| owner.address != surface.address) {
                 return Err(state.blocked());
+            }
+            if method=="Focus" && let Some(owner) = state.open_menu().filter(|owner| owner.address != surface.address) {
+                return Err(IbaraError::new("STALE_TARGET", format!(
+                    "An open menu or popup in {} holds input; focusing another window would leave it stranded. Press Escape or choose a menu item first.",
+                    named(owner)), true).with("execution_not_started", true).with("reason", "menu_holds_input"));
             }
             if method=="Focus" {
                 for modal in state.windows.iter().filter(|w|w.modal && w.visible && !w.hidden && w.address!=surface.address) {

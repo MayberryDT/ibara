@@ -120,9 +120,19 @@ impl Controller {
     pub(crate) fn repair_status(&self) -> Value {
         let watchdog = self.watchdog.borrow();
         let needs = PROBLEMS.into_iter().find(|p| watchdog.attempts[p.index()].failures >= NEEDS_PERSON_AFTER);
+        let mut need = needs.map(|p| p.needs_person(watchdog.attempts[p.index()].needs_person_since_ms));
+        if needs == Some(Problem::Unsettled) {
+            if let Ok(reset) = self.journal.desktop_reset() {
+                if let Some(reason) = reset.pointer("/cleanup/left/0/reason").and_then(Value::as_str) {
+                    if let Some(ref mut value) = need {
+                        value["message"] = json!(format!("Cleanup stopped: {}", super::squash(reason, 200)));
+                    }
+                }
+            }
+        }
         json!({
             "last": watchdog.last.as_ref().map(|(at, summary)| json!({ "at": at, "summary": summary })),
-            "needs_person": needs.map(|p| p.needs_person(watchdog.attempts[p.index()].needs_person_since_ms)),
+            "needs_person": need,
         })
     }
 
@@ -309,6 +319,16 @@ impl Controller {
         let since = *self.watchdog.borrow_mut().unsettled_since_ms.get_or_insert(now);
         if now - since < UNSETTLED_GRACE_MS || !self.due(Problem::Unsettled) {
             return Ok(());
+        }
+        // Do not claim another repair when the reset intentionally refuses
+        // unchanged clients. Recheck at the capped interval for actual changes.
+        let reset = self.journal.desktop_reset()?;
+        if reset["state"] == "blocked" && self.watchdog.borrow().attempts[Problem::Unsettled.index()].failures >= NEEDS_PERSON_AFTER {
+            let inventory = self.desktop.all_windows().await.ok();
+            if reset["blocked_inventory"] == super::windows::reset_inventory(inventory.as_deref()) {
+                self.watchdog.borrow_mut().attempts[Problem::Unsettled.index()].next_at_ms = now + BACKOFF_MAX_MS;
+                return Ok(());
+            }
         }
         // Without a lease, settlement only cancels leftover work, releases input and drains.
         self.release_lease(None, Release::Finished, false).await?;

@@ -351,6 +351,10 @@ impl DesktopPort for LiveDesktop {
         self.desktop.set_agent(label);
     }
 
+    fn emits_window_open_events(&self) -> bool {
+        self.desktop.emits_window_open_events()
+    }
+
     fn set_idle_inhibited(&self, on: bool) -> LocalFuture<'_, Result<()>> {
         Box::pin(async move {
             if !session_env() {

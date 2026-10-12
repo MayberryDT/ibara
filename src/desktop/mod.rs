@@ -536,6 +536,9 @@ impl Desktop {
     /// from now until control ends or a person takes over ([`handover`]), or
     /// none. With none, the screen goes back to the person's pointer within
     /// [`handover::POLL`], and at once through [`Desktop::release_input`].
+    /// GNOME reports inventory changes, never per-window open events.
+    pub fn emits_window_open_events(&self) -> bool { self.gnome_control.is_none() }
+
     pub fn set_agent(&self, label: Option<String>) {
         if let Some(control) = &self.gnome_control {
             control.set_agent(label);

@@ -91,6 +91,52 @@ pub(super) fn reset_inventory(windows: Option<&[Win]>) -> Value {
 }
 
 impl Controller {
+    // Chromium beforeunload is native browser chrome, never a page form.
+    async fn leave_browser_cleanup_prompt(&self, key: &WinKey, cancel: &Cancel,
+        allowed: &impl Fn() -> Result<bool>) -> Result<bool> {
+        use super::ports::Button;
+        if !allowed()? || cancel.is_cancelled() { return Ok(false); }
+        let native = |e: &crate::desktop::atspi::Element, name: &str| {
+            e.name == name && matches!(e.role.as_str(), "button" | "push button")
+                && e.states.iter().any(|s| s == "enabled")
+                && matches!(e.context.as_slice(), [c] if matches!(c.as_str(), r#"dialog "Leave site?""# | r#"alert "Leave site?""#))
+        };
+        // An unreadable tree proves no prompt; tab-close verification still guards.
+        let Ok(leave) = self.desktop.elements(key, Some("Leave"), 60, None).await else { return Ok(false) };
+        if !leave.available || leave.next_cursor.is_some() { return Ok(false); }
+        let buttons: Vec<_> = leave.elements.iter().filter(|e| native(e, "Leave")).collect();
+        if buttons.len() != 1 { return Ok(false); }
+        let Ok(cancel_button) = self.desktop.elements(key, Some("Cancel"), 60, None).await else { return Ok(false) };
+        if !cancel_button.available || cancel_button.next_cursor.is_some()
+            || cancel_button.elements.iter().filter(|e| native(e, "Cancel")).count() != 1 { return Ok(false); }
+        if !allowed()? || cancel.is_cancelled()
+            || !self.desktop.windows().await?.iter().any(|w| w.key() == *key && w.focused) { return Ok(false); }
+        self.desktop.act(&Effect::ClickElement { surface:key.clone(), element:Box::new((*buttons[0]).clone()),
+            button:Button::Left, double:false }, cancel).await?;
+        if !allowed()? || cancel.is_cancelled() {
+            return Err(IbaraError::new("CONTROL_UNSETTLED", "Browser cleanup authority changed after confirmation.", false));
+        }
+        self.timeline("desktop_dialog_cleanup", None, "ibara", "Confirmed Chromium's native leave-site prompt during disposable cleanup.",
+            json!({"window":key.address,"dialog":"Leave site?","action":"Leave","basis":"native alert/dialog; exact Leave and Cancel; outside web document; reset authority"}));
+        Ok(true)
+    }
+
+    /// The reader sees exactly one ordinary window holding one blank tab, so a
+    /// graceful close leaves no session to restore. Unreadable means no.
+    async fn browser_only_blank(&self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let read = loop {
+            match self.desktop.browser_call("lifecycle_inventory", json!({}), false).await {
+                Err(e) if e.details.get("execution_not_started") == Some(&Value::Bool(true)) && Instant::now() < deadline => sleep(POLL).await,
+                result => break result,
+            }
+        };
+        let Ok(read) = read else { return false };
+        matches!(read["windows"].as_array().map(Vec::as_slice), Some([w])
+            if w["type"] == "normal" && w["incognito"] != true
+                && matches!(w["tabs"].as_array().map(Vec::as_slice), Some([t]) if t["blank"] == true))
+    }
+
     /// Native retirement is owned by the serialized reset, never an expired task.
     async fn retire_browser(&self, key: &WinKey, cancel: &Cancel, allowed: &impl Fn() -> Result<bool>) -> Result<()> {
         // A reader update can reconnect between native input and its read-only
@@ -128,6 +174,7 @@ impl Controller {
         if !self.desktop.windows().await?.iter().any(|w| w.key() == *key && w.focused) {
             return Err(IbaraError::new("CONTROL_UNSETTLED", "Browser retirement window focus changed.", false));
         }
+        self.leave_browser_cleanup_prompt(key, cancel, allowed).await?;
         // Full-screen Chromium can hide/retract browser chrome while the next
         // native chord is delivered. Retire in an ordinary visible window and
         // independently observe that transition before using the address bar.
@@ -205,8 +252,10 @@ impl Controller {
             send(Effect::Key { surface:key.clone(), combo:"ctrl+1".into() }).await?;
             send(Effect::Key { surface:key.clone(), combo:"ctrl+w".into() }).await?;
             let deadline = Instant::now() + CLOSE_WAIT;
+            let mut confirmed = false;
             loop {
                 if !allowed()? || cancel.is_cancelled() { return Err(IbaraError::new("CONTROL_UNSETTLED", "Reset authority changed.", false)); }
+                if !confirmed { confirmed = self.leave_browser_cleanup_prompt(key, cancel, allowed).await?; }
                 let read = inventory().await?;
                 let w = read["windows"].as_array().and_then(|ws| ws.iter().find(|w| w["id"] == window_id && w["focused"] == true));
                 if let Some(tabs) = w.and_then(|w| w["tabs"].as_array()) {
@@ -240,7 +289,18 @@ impl Controller {
         let started = Instant::now();
         let (cancel, _) = self.abort_handles();
         self.mark_effect(Some("desktop-reset"));
-        let reset = tokio::time::timeout(Duration::from_secs(60), self.reset_desktop_windows_inner()).await;
+        let reset = tokio::time::timeout(Duration::from_secs(60), async {
+            let verified = self.reset_desktop_windows_inner().await?;
+            // One bounded second pass retires restore state after an unreadable
+            // browser was gracefully closed; never report ready between passes.
+            if !verified && self.journal.desktop_reset()?["state"] == "unsettled"
+                && self.journal.browser_retirement_pending()?
+            {
+                self.reset_desktop_windows_inner().await
+            } else {
+                Ok(verified)
+            }
+        }).await;
         self.mark_effect(None);
         let result = match reset {
             Ok(Ok(verified)) => Ok(verified),
@@ -306,8 +366,14 @@ impl Controller {
             // A crashed or manually closed browser can leave a restore session behind with zero windows.
             // Reopen under settlement authority, retire it natively, then close before any new lease.
             if !allowed()? || cancel.is_cancelled() { return Ok(false); }
-            self.desktop.act(&Effect::Launch { app_id:"browser".into() }, &cancel).await?;
+            // GNOME input needs the reset to own control, as for its closes.
+            self.desktop.set_agent(Some("ibara desktop reset".into()));
+            let launched = self.desktop.act(&Effect::Launch { app_id:"browser".into() }, &cancel).await;
+            self.desktop.set_agent(None);
+            self.desktop.release_input().await?;
+            launched?;
             let deadline = Instant::now() + Duration::from_secs(10);
+            let mut mapped: Option<(WinKey, Instant)> = None;
             loop {
                 if !allowed()? || cancel.is_cancelled() { return Ok(false); }
                 windows = self.desktop.all_windows().await?;
@@ -318,6 +384,18 @@ impl Controller {
                 if generation == browser_generation + 1 && windows.iter().any(|w| is_browser(&w.class) && Some(&w.address) == address.as_ref()) {
                     browser_generation = generation;
                     break;
+                }
+                // Without open events (GNOME), accept only exactly one browser
+                // window in a reset that started with none, once it has stayed
+                // mapped for a second (focus right after mapping is refused).
+                if !self.desktop.emits_window_open_events() && generation == browser_generation {
+                    let browsers: Vec<_> = windows.iter().filter(|w| is_browser(&w.class)).map(|w| w.key()).collect();
+                    match (&browsers[..], &mapped) {
+                        ([key], Some((seen, since))) if seen == key && since.elapsed() >= Duration::from_secs(1) => break,
+                        ([key], Some((seen, _))) if seen == key => {}
+                        ([key], _) => mapped = Some((key.clone(), Instant::now())),
+                        _ => mapped = None,
+                    }
                 }
                 if generation > browser_generation + 1 {
                     return Err(IbaraError::new("CONTROL_UNSETTLED", "Another browser opened during preparation; fresh reconciliation required.", false));
@@ -341,10 +419,17 @@ impl Controller {
         // Keep the original tiling intact while sending browser keys. Closing a
         // neighboring app changes focus/layout and can revoke Cua's input route.
         // Retire all browser sessions first; graceful closes happen only afterward.
+        let mut asked = Vec::new();
         let mut retired = Vec::new();
+        let mut unreadable_browser_closed = false;
+        let browsers = windows.iter().filter(|w| is_browser(&w.class)).count();
         for window in windows.iter().filter(|w| is_browser(&w.class)) {
             if !allowed()? || cancel.is_cancelled() { break; }
             let name = format!("{} {}", window.class, window.address);
+            if browsers == 1 && self.browser_only_blank().await {
+                retired.push(window.key());
+                continue;
+            }
             self.desktop.set_agent(Some("ibara desktop reset".into()));
             let retirement = self.retire_browser(&window.key(), &cancel, &allowed).await;
             self.desktop.set_agent(None);
@@ -352,6 +437,26 @@ impl Controller {
             // The reset wrapper cancels and drains again and retains a blocker.
             self.desktop.release_input().await?;
             if let Err(e) = retirement {
+                super::log_event("browser_retirement_refused", &format!("{name}: {}: {} at {}", e.code, e.message,
+                    e.details.get("retirement_step").and_then(Value::as_str).unwrap_or("verification")));
+                // A refused step sent nothing (focus unavailable, or a native field
+                // that exposes no accessibility object). Close only this exact browser
+                // under reset authority, then require fresh normal-session retirement
+                // before any new admission. Uncertain input never takes this path.
+                let refused = e.code == "CAPABILITY_UNAVAILABLE" && (e.message == "Browser retirement focus unavailable."
+                    || e.details.get("execution_not_started") == Some(&Value::Bool(true)));
+                if refused && allowed()? && !cancel.is_cancelled()
+                {
+                    self.desktop.set_agent(Some("ibara desktop reset".into()));
+                    let closed = self.desktop.act(&Effect::Close(window.key()), &cancel).await;
+                    self.desktop.set_agent(None);
+                    self.desktop.release_input().await?;
+                    if closed.is_ok() {
+                        unreadable_browser_closed = true;
+                        asked.push((window.key(), name));
+                        continue;
+                    }
+                }
                 cleanup.left.push(crate::contract::LeftOpen { surface:name, reason:format!("native browser retirement refused at {}: {}: {} ({})", e.details.get("retirement_step").and_then(Value::as_str).unwrap_or("verification"), e.code, e.message, squash(e.details.get("detail").and_then(Value::as_str).unwrap_or("no native detail"), 300)) });
             } else {
                 retired.push(window.key());
@@ -372,7 +477,6 @@ impl Controller {
                 Err(e) => cleanup.left.push(crate::contract::LeftOpen { surface:format!("{} {}",window.class,window.address), reason:format!("owned editor cleanup: {}: {}",e.code,e.message) }),
             }
         }
-        let mut asked = Vec::new();
         let mut stale = Vec::new();
         let mut already_gone = Vec::new();
         for window in windows {
@@ -428,7 +532,7 @@ impl Controller {
         if !generation_settled {
             cleanup.left.push(crate::contract::LeftOpen { surface:"browser session".into(), reason:"a browser opened during retirement; fresh reconciliation required".into() });
         }
-        let verified = allowed()? && !cancel.is_cancelled() && remaining == Some(0) && cleanup.left.is_empty() && generation_settled;
+        let verified = allowed()? && !cancel.is_cancelled() && remaining == Some(0) && cleanup.left.is_empty() && generation_settled && !unreadable_browser_closed;
         if verified { self.journal.set_browser_retirement_pending(false)?; }
         if !automatic_dialogs.is_empty() {
             // The latest reset can be replaced by an empty startup pass; retain
@@ -436,7 +540,7 @@ impl Controller {
             self.timeline("desktop_dialog_cleanup", None, "ibara", "Resolved task-owned native dialogs.",
                 json!({"verified":verified,"remaining":remaining,"automatic_dialogs":automatic_dialogs}));
         }
-        self.journal.put_desktop_reset(&json!({"state":if verified {"verified"} else {"blocked"},
+        self.journal.put_desktop_reset(&json!({"state":if verified {"verified"} else if unreadable_browser_closed && remaining == Some(0) && cleanup.left.is_empty() {"unsettled"} else {"blocked"},
             "reason":if verified { Value::Null } else { json!(if remaining.is_none() { "window inventory unavailable or control changed" } else { "windows remain open or control changed" }) },
             "remaining":remaining,"at":self.now_iso(),"cleanup":cleanup,"already_gone":already_gone,"automatic_dialogs":automatic_dialogs}))?;
         Ok(verified)

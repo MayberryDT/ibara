@@ -1101,8 +1101,12 @@ impl Desktop {
                                 if expected.confirms_insertion(&observed) { return Ok::<_,IbaraError>(observed); }
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
-                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", format!("Native text was admitted; readback unconfirmed ({}). Reobserve before further input.",last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation before deadline".into())), false)
-                            .with("execution_not_started",false).with("native_readback",last_readback.unwrap_or(Value::Null)).requires_reconciliation())??;
+                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false)).and_then(|result|result)
+                            .map_err(|mut error| {
+                                let diagnostic=last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation".into());
+                                error.message=format!("{} Native readback: {diagnostic}. Reobserve before further input.",error.message);
+                                error.with("execution_not_started",false).with("native_readback",last_readback.unwrap_or(Value::Null)).requires_reconciliation()
+                            })?;
                         confirmed+=piece.chars().count();
                         before=observed;
                         offset=end;

@@ -3,7 +3,8 @@
 use super::{run::{self, Cmd, Cancel}, Window};
 use crate::error::{Result, IbaraError};
 use serde::{Serialize, Deserialize};
-use std::{ffi::{CStr, OsString}, time::Duration};
+use std::{ffi::OsString, time::Duration};
+use zbus::{Connection, Proxy, zvariant::OwnedObjectPath};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Field {
@@ -122,219 +123,204 @@ async fn read_with(window: &Window, env: &[(OsString, OsString)], cancel: Option
     serde_json::from_slice(&out.stdout).map_err(|_|refused("Native focused-field observation was invalid."))
 }
 
-// libatspi is already an Ibara runtime dependency. Loading it only here keeps
-// desktop IPC and a hung application outside the controller process. Opaque
-// GObjects never cross this process boundary; all function signatures match
-// the installed public libatspi/glib ABI. Process exit frees the bounded walk.
-type Obj=*mut libc::c_void;
-type ErrPtr=*mut *mut libc::c_void;
-#[repr(C)] struct Rect { x:i32,y:i32,width:i32,height:i32 }
-#[repr(C)] struct TextRange { start:i32,end:i32 }
-macro_rules! api {
-    ($($field:ident : $symbol:literal => $sig:ty),* $(,)?) => {
-        struct Api { $($field: $sig),* }
-        impl Api {
-            unsafe fn load()->std::result::Result<Self,String> {
-                let lib=unsafe { libc::dlopen(c"libatspi.so.0".as_ptr(),libc::RTLD_NOW) };
-                if lib.is_null() { return Err("Native accessibility library unavailable.".into()); }
-                Ok(Self { $($field: {
-                    let p=unsafe { libc::dlsym(lib,concat!($symbol,"\0").as_ptr().cast()) };
-                    if p.is_null() { return Err(format!("Native accessibility symbol unavailable: {}",$symbol)); }
-                    unsafe { std::mem::transmute::<Obj,$sig>(p) }
-                }),* })
-            }
-        }
-    }
+// Raw AT-SPI D-Bus calls, as the element reader makes, never libatspi.
+// libatspi 2.60 asks each application it meets for its whole cache
+// (Cache.GetItems), and every later call waits behind that dump: 9 s from
+// LibreOffice with five documents open. Each read here asks only for the
+// objects it walks, fresh, with no client cache. Desktop IPC and a hung
+// application stay in this isolated process.
+type Reference=(String,OwnedObjectPath);
+const ACCESSIBLE:&str="org.a11y.atspi.Accessible";
+const TEXT:&str="org.a11y.atspi.Text";
+fn failed(step:&str,error:zbus::Error)->String {
+    // An application's error message is never copied: it could quote text.
+    let cause=match error {zbus::Error::MethodError(name,_,_)=>name.to_string(),other=>other.to_string()};
+    format!("Native accessibility read failed at {step} ({}); no field was proved.",cause.chars().take(120).collect::<String>())
 }
-api! {
- init:"atspi_init"=>unsafe extern "C" fn()->i32,
- timeout:"atspi_set_timeout"=>unsafe extern "C" fn(i32,i32),
- iteration:"g_main_context_iteration"=>unsafe extern "C" fn(Obj,i32)->i32,
- desktop:"atspi_get_desktop"=>unsafe extern "C" fn(i32)->Obj,
- children:"atspi_accessible_get_child_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
- child:"atspi_accessible_get_child_at_index"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->Obj,
- parent:"atspi_accessible_get_parent"=>unsafe extern "C" fn(Obj,ErrPtr)->Obj,
- pid:"atspi_accessible_get_process_id"=>unsafe extern "C" fn(Obj,ErrPtr)->u32,
- states:"atspi_accessible_get_state_set"=>unsafe extern "C" fn(Obj)->Obj,
- has:"atspi_state_set_contains"=>unsafe extern "C" fn(Obj,i32)->i32,
- role:"atspi_accessible_get_role_name"=>unsafe extern "C" fn(Obj,ErrPtr)->*mut libc::c_char,
- component:"atspi_accessible_get_component_iface"=>unsafe extern "C" fn(Obj)->Obj,
- extents:"atspi_component_get_extents"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->*mut Rect,
- text:"atspi_accessible_get_text_iface"=>unsafe extern "C" fn(Obj)->Obj,
- count:"atspi_text_get_character_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
- value:"atspi_text_get_text"=>unsafe extern "C" fn(Obj,i32,i32,ErrPtr)->*mut libc::c_char,
- caret:"atspi_text_get_caret_offset"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
- selections:"atspi_text_get_n_selections"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
- selection:"atspi_text_get_selection"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->*mut TextRange,
-}
-fn valid(error:Obj)->std::result::Result<(),String> { if error.is_null(){Ok(())}else{Err("Native accessibility read failed; no field was proved.".into())} }
-fn present(obj:Obj)->std::result::Result<Obj,String>{if obj.is_null(){Err("Native accessibility returned no object.".into())}else{Ok(obj)}}
-impl Api {
-    fn child_count(&self,node:Obj)->std::result::Result<i32,String>{
-        for attempt in 0..2 {
-            let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
-            if n>=0 {return Ok(n);}
-            if attempt==0 {
-                // Properties.Get can return -1 without GError while the
-                // isolated process's AT-SPI cache is still being populated.
-                // Drain bounded pending callbacks, then require a real count.
-                for _ in 0..64 {
-                    if unsafe{(self.iteration)(std::ptr::null_mut(),0)}==0 {break;}
-                }
-            }
-        }
-        Err("Native child count is invalid after bounded cache refresh.".into())
+fn has(states:&[u32],state:usize)->bool {states.get(state/32).is_some_and(|bits|bits&(1<<(state%32))!=0)}
+struct Reader {connection:Connection,owner:String}
+impl Reader {
+    async fn proxy<'a>(&'a self,path:&'a OwnedObjectPath,interface:&'a str)->std::result::Result<Proxy<'a>,String> {
+        zbus::proxy::Builder::new(&self.connection)
+            .destination(self.owner.as_str()).map_err(|e|failed("proxy",e))?
+            .path(path.as_str()).map_err(|e|failed("proxy",e))?
+            .interface(interface).map_err(|e|failed("proxy",e))?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build().await.map_err(|e|failed("proxy",e))
     }
-    fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
-        let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)
+    async fn states(&self,node:&OwnedObjectPath)->std::result::Result<Vec<u32>,String> {
+        let bits:Vec<u32>=self.proxy(node,ACCESSIBLE).await?.call("GetState",&()).await.map_err(|e|failed("state",e))?;
+        if bits.len()>8 {return Err("Invalid native state mask.".into());}Ok(bits)
     }
-    fn paragraph_context(&self,node:Obj,path:&[i32],value:&str)->std::result::Result<Option<Vec<String>>,String>{
-        let mut e=std::ptr::null_mut();let parent=unsafe{(self.parent)(node,&mut e)};valid(e)?;
-        if parent.is_null(){return Ok(None);}
-        let mut e=std::ptr::null_mut();let role=unsafe{(self.role)(parent,&mut e)};valid(e)?;present(role.cast())?;
-        if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"document text" {return Ok(None);}
-        let count=self.child_count(parent)?;
+    async fn role(&self,node:&OwnedObjectPath)->std::result::Result<String,String> {
+        let role:String=self.proxy(node,ACCESSIBLE).await?.call("GetRoleName",&()).await.map_err(|e|failed("role",e))?;
+        if role.len()>128 {return Err("Invalid native field role.".into());}Ok(role)
+    }
+    async fn child_count(&self,node:&OwnedObjectPath)->std::result::Result<i32,String> {
+        let count:i32=self.proxy(node,ACCESSIBLE).await?.get_property("ChildCount").await.map_err(|e|failed("child count",e))?;
+        if count<0 {return Err("Native child count is invalid.".into());}Ok(count)
+    }
+    async fn child_at(&self,node:&OwnedObjectPath,index:i32)->std::result::Result<OwnedObjectPath,String> {
+        let (owner,path):Reference=self.proxy(node,ACCESSIBLE).await?.call("GetChildAtIndex",&(index,)).await.map_err(|e|failed("child",e))?;
+        if path.as_str()=="/org/a11y/atspi/null" {return Err("Native accessibility returned no object.".into());}
+        if owner!=self.owner || path.as_str().len()>4096 {return Err("Cross-process or invalid native child reference.".into());}
+        Ok(path)
+    }
+    async fn implements(&self,node:&OwnedObjectPath,interface:&str)->std::result::Result<bool,String> {
+        let interfaces:Vec<String>=self.proxy(node,ACCESSIBLE).await?.call("GetInterfaces",&()).await.map_err(|e|failed("interfaces",e))?;
+        Ok(interfaces.iter().any(|i|i==interface))
+    }
+    fn frame(&self,node:&OwnedObjectPath)->impl std::future::Future<Output=std::result::Result<[i32;4],String>> {self.frame_at(node,0)}
+    async fn frame_at(&self,node:&OwnedObjectPath,coordinate:u32)->std::result::Result<[i32;4],String> {
+        let (x,y,w,h):(i32,i32,i32,i32)=self.proxy(node,"org.a11y.atspi.Component").await?.call("GetExtents",&(coordinate,)).await.map_err(|e|failed("extents",e))?;
+        Ok([x,y,w,h])
+    }
+    /// The whole text of a Text object, checked against its own count.
+    async fn text(&self,text:&Proxy<'_>,limit:&str,changed:&str)->std::result::Result<(i32,String),String> {
+        let count:i32=text.get_property("CharacterCount").await.map_err(|e|failed("character count",e))?;
+        if !(0..=131072).contains(&count){return Err(limit.into());}
+        let value:String=text.call("GetText",&(0i32,count)).await.map_err(|e|failed("text",e))?;
+        if value.chars().count()!=count as usize {return Err(changed.into());}
+        Ok((count,value))
+    }
+    async fn paragraph_context(&self,parent:Option<&OwnedObjectPath>,path:&[i32],value:&str)->std::result::Result<Option<Vec<String>>,String>{
+        let Some(parent)=parent else {return Ok(None)};
+        if self.role(parent).await?!="document text" {return Ok(None);}
+        let count=self.child_count(parent).await?;
         if !(1..=512).contains(&count){return Err("Native paragraph count exceeds readback capacity.".into());}
         let mut values=Vec::new();let mut chars=0usize;
         for i in 0..count {
-            let child=self.child_at(parent,i)?;
-            let mut e=std::ptr::null_mut();let role=unsafe{(self.role)(child,&mut e)};valid(e)?;present(role.cast())?;
-            if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"paragraph" {return Ok(None);}
-            let text=unsafe{(self.text)(child)};if text.is_null(){return Ok(None);}
-            let mut e=std::ptr::null_mut();let n=unsafe{(self.count)(text,&mut e)};valid(e)?;
-            if n<0 || n>131072 {return Err("Native paragraph text exceeds readback capacity.".into());}
+            let child=self.child_at(parent,i).await?;
+            if self.role(&child).await?!="paragraph" {return Ok(None);}
+            if !self.implements(&child,TEXT).await? {return Ok(None);}
+            let (n,text)=self.text(&self.proxy(&child,TEXT).await?,"Native paragraph text exceeds readback capacity.","Native paragraph text changed during observation.").await?;
             chars+=n as usize;if chars>131072{return Err("Native paragraph context exceeds readback capacity.".into());}
-            let mut e=std::ptr::null_mut();let text=unsafe{(self.value)(text,0,n,&mut e)};valid(e)?;present(text.cast())?;
-            let text=unsafe{CStr::from_ptr(text)}.to_str().map_err(|_|"Invalid native paragraph text.")?.to_owned();
-            if text.chars().count()!=n as usize{return Err("Native paragraph text changed during observation.".into());}
             values.push(text);
         }
         let index=*path.last().ok_or("Native paragraph path is unavailable.")?;
         if index<0 || values.get(index as usize).map(String::as_str)!=Some(value){return Err("Native paragraph context is inconsistent.".into());}
         Ok(Some(values))
     }
-    fn frame(&self,node:Obj)->std::result::Result<[i32;4],String>{self.frame_at(node,0)}
-    fn frame_at(&self,node:Obj,coordinate:i32)->std::result::Result<[i32;4],String>{
-        let c=present(unsafe{(self.component)(node)})?;let mut e=std::ptr::null_mut();let r=unsafe{(self.extents)(c,coordinate,&mut e)};valid(e)?;present(r.cast())?;
-        let r=unsafe{&*r};Ok([r.x,r.y,r.width,r.height])
-    }
-    fn walk(&self,node:Obj,path:&mut Vec<i32>,visited:&mut usize,found:&mut Vec<Field>,origin:Option<[i32;4]>)->std::result::Result<(),String>{
+    async fn walk(&self,node:OwnedObjectPath,parent:Option<&OwnedObjectPath>,path:&mut Vec<i32>,visited:&mut usize,found:&mut Vec<Field>,origin:Option<[i32;4]>)->std::result::Result<(),String>{
         *visited+=1;if *visited>4096 || path.len()>40{return Err("Native field traversal was incomplete.".into());}
-        let states=present(unsafe{(self.states)(node)})?;
+        let states=self.states(&node).await?;
         // Hidden/defunct branches cannot contain the current visible edit target.
-        if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 { return Ok(()); }
-        if let Some(field)=self.field(node,states,path,origin)? {found.push(field);}
+        if has(&states,6) || !has(&states,25) { return Ok(()); }
+        if let Some(field)=self.field(&node,parent,&states,path,origin).await? {found.push(field);}
         // Writer exposes focused paragraphs beneath small virtual containers.
         // Calc's virtual table can contain millions of cells. Search only a
         // bounded child list; large virtual containers cannot be enumerated.
-        let count=self.child_count(node).map_err(|e|format!("{e} at native path {path:?}"))?;
+        let count=self.child_count(&node).await.map_err(|e|format!("{e} at native path {path:?}"))?;
         if count>4096 {
-            if unsafe{(self.has)(states,31)}!=0 { return Ok(()); }
+            if has(&states,31) { return Ok(()); }
             return Err("Native field traversal exceeds its limit.".into());
         }
-        for i in 0..count {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
+        for i in 0..count {
+            let child=self.child_at(&node,i).await?;path.push(i);
+            Box::pin(self.walk(child,Some(&node),path,visited,found,origin)).await?;path.pop();
+        }
         Ok(())
     }
     /// The focused editable field at `node`, if it is one.
-    fn field(&self,node:Obj,states:Obj,path:&[i32],origin:Option<[i32;4]>)->std::result::Result<Option<Field>,String>{
-        if unsafe{(self.has)(states,12)}!=0 { // ATSPI_STATE_FOCUSED
-            let mut e=std::ptr::null_mut();let r=unsafe{(self.role)(node,&mut e)};valid(e)?;present(r.cast())?;
-            let role=unsafe{CStr::from_ptr(r)}.to_str().map_err(|_|"Invalid native field role.")?.to_owned();
-            if role.to_lowercase().contains("password"){return Err("Unicode paste into password fields is unavailable.".into());}
-            // Focused noneditable containers are not fields; still walk children.
-            // GTK4 reports SENSITIVE without ENABLED on its editable text view.
-            if unsafe{(self.has)(states,7)}!=0 &&
-                (unsafe{(self.has)(states,8)}!=0 || unsafe{(self.has)(states,24)}!=0) {
-            // Editable focused containers (Calc table) need not expose Text.
-            // Continue to their real editor rather than accepting the container.
-            let text=unsafe{(self.text)(node)};
-            if !text.is_null() {
-            let mut e=std::ptr::null_mut();let count=unsafe{(self.count)(text,&mut e)};valid(e)?;
-            if !(0..=131072).contains(&count){return Err("Native field text exceeds the verification limit.".into());}
-            let mut e=std::ptr::null_mut();let s=unsafe{(self.value)(text,0,count,&mut e)};valid(e)?;present(s.cast())?;
-            let value=unsafe{CStr::from_ptr(s)}.to_str().map_err(|_|"Invalid native field text.")?.to_owned();
-            if value.chars().count()!=count as usize {return Err("Native character count changed during observation.".into());}
-            let mut e=std::ptr::null_mut();let caret=unsafe{(self.caret)(text,&mut e)};valid(e)?;
-            if !(0..=count).contains(&caret){return Err("Native caret offset is invalid.".into());}
-            let mut e=std::ptr::null_mut();let n=unsafe{(self.selections)(text,&mut e)};valid(e)?;
-            if !(0..=1).contains(&n){return Err("Multiple native selections are unsupported.".into());}
-            let mut selections=Vec::new();
-            if n==1 {
-                let mut e=std::ptr::null_mut();let range=unsafe{(self.selection)(text,0,&mut e)};valid(e)?;present(range.cast())?;
-                let range=unsafe{&*range};
-                if !(0..=count).contains(&range.start) || !(0..=count).contains(&range.end){return Err("Native selection offsets are invalid.".into());}
-                selections.push([range.start,range.end]);
-            }
-            let frame=if let Some(window)=origin {
-                let mut frame=self.frame_at(node,1)?; // ATSPI_COORD_TYPE_WINDOW
-                if frame[0]<0 || frame[1]<0 || frame[2]<=0 || frame[3]<=0 ||
-                    frame[0].checked_add(frame[2]).is_none_or(|end|end>window[2]) ||
-                    frame[1].checked_add(frame[3]).is_none_or(|end|end>window[3]) {
-                    return Err("Native field bounds lie outside the exact window.".into());
-                }
-                frame[0]=frame[0].checked_add(window[0]).ok_or("Invalid native field X")?;
-                frame[1]=frame[1].checked_add(window[1]).ok_or("Invalid native field Y")?;
-                frame
-            } else {self.frame(node)?};
-            let paragraphs=if role=="paragraph" {self.paragraph_context(node,path,&value)?}else{None};
-            return Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs}));
-            }
-            }
+    async fn field(&self,node:&OwnedObjectPath,parent:Option<&OwnedObjectPath>,states:&[u32],path:&[i32],origin:Option<[i32;4]>)->std::result::Result<Option<Field>,String>{
+        // ATSPI_STATE_FOCUSED; focused noneditable containers are not fields.
+        // GTK4 reports SENSITIVE without ENABLED on its editable text view.
+        if !has(states,12) {return Ok(None);}
+        let role=self.role(node).await?;
+        if role.to_lowercase().contains("password"){return Err("Unicode paste into password fields is unavailable.".into());}
+        if !has(states,7) || !(has(states,8) || has(states,24)) {return Ok(None);}
+        // Editable focused containers (Calc table) need not expose Text.
+        // Continue to their real editor rather than accepting the container.
+        if !self.implements(node,TEXT).await? {return Ok(None);}
+        let text=self.proxy(node,TEXT).await?;
+        let (count,value)=self.text(&text,"Native field text exceeds the verification limit.","Native character count changed during observation.").await?;
+        let caret:i32=text.get_property("CaretOffset").await.map_err(|e|failed("caret",e))?;
+        if !(0..=count).contains(&caret){return Err("Native caret offset is invalid.".into());}
+        let n:i32=text.call("GetNSelections",&()).await.map_err(|e|failed("selections",e))?;
+        if !(0..=1).contains(&n){return Err("Multiple native selections are unsupported.".into());}
+        let mut selections=Vec::new();
+        if n==1 {
+            let (start,end):(i32,i32)=text.call("GetSelection",&(0i32,)).await.map_err(|e|failed("selection",e))?;
+            if !(0..=count).contains(&start) || !(0..=count).contains(&end){return Err("Native selection offsets are invalid.".into());}
+            selections.push([start,end]);
         }
-        Ok(None)
+        let frame=if let Some(window)=origin {
+            let mut frame=self.frame_at(node,1).await?; // ATSPI_COORD_TYPE_WINDOW
+            if frame[0]<0 || frame[1]<0 || frame[2]<=0 || frame[3]<=0 ||
+                frame[0].checked_add(frame[2]).is_none_or(|end|end>window[2]) ||
+                frame[1].checked_add(frame[3]).is_none_or(|end|end>window[3]) {
+                return Err("Native field bounds lie outside the exact window.".into());
+            }
+            frame[0]=frame[0].checked_add(window[0]).ok_or("Invalid native field X")?;
+            frame[1]=frame[1].checked_add(window[1]).ok_or("Invalid native field Y")?;
+            frame
+        } else {self.frame(node).await?};
+        let paragraphs=if role=="paragraph" {self.paragraph_context(parent,path,&value).await?}else{None};
+        Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs}))
     }
-    fn read(&self,pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>,target:Option<Vec<i32>>)->std::result::Result<Field,String>{
-        if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
-        // A cold LibreOffice reply can take over one second, and its
-        // application child count about two with several documents open.
-        // The isolated runner still enforces the six-second overall deadline.
-        unsafe{(self.timeout)(4000,4000)};
-        let root=present(unsafe{(self.desktop)(0)})?;let mut windows=Vec::new();
-        let applications=self.child_count(root).map_err(|e|format!("{e} at desktop root"))?;
-        if applications>4096{return Err("Native application count exceeds its limit.".into());}
-        for i in 0..applications {
-            let app=self.child_at(root,i)?;let mut e=std::ptr::null_mut();let got=unsafe{(self.pid)(app,&mut e)};
-            if !e.is_null() || got!=pid {continue;}
-            let children=self.child_count(app).map_err(|e|format!("{e} at selected application"))?;
-            if children>4096{return Err("Native window count exceeds its limit.".into());}
-            for j in 0..children {
-                let w=self.child_at(app,j)?;
-                let frame=self.frame(w)?;
-                let states=present(unsafe{(self.states)(w)})?;
-                // GTK on Wayland reports screen extents with a window-local
-                // zero origin. Require the unique ACTIVE top-level window in
-                // the compositor-focused PID and exact size, never size alone.
-                let matched=std::iter::once(rect).chain(client).find(|candidate|
-                    ((frame[0]==candidate[0] && frame[1]==candidate[1]) || (frame[0]==0 && frame[1]==0)) && frame[2..]==candidate[2..]);
-                if let Some(matched)=matched {if unsafe{(self.has)(states,1)}!=0 {windows.push((w,vec![j],matched));}}
-            }
+}
+async fn read_field(pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>,target:Option<Vec<i32>>)->std::result::Result<Field,String>{
+    // One slow reply stays within the runner's six-second deadline.
+    let limit=Duration::from_millis(4000);
+    let session=zbus::connection::Builder::session().map_err(|e|failed("session bus",e))?
+        .method_timeout(limit).build().await.map_err(|e|failed("session bus",e))?;
+    let bus=Proxy::new(&session,"org.a11y.Bus","/org/a11y/bus","org.a11y.Bus").await.map_err(|e|failed("accessibility bus",e))?;
+    let address:String=bus.call("GetAddress",&()).await.map_err(|e|failed("accessibility bus",e))?;
+    if address.is_empty() || address.len()>4096 {return Err("Invalid accessibility bus address.".into());}
+    let connection=zbus::connection::Builder::address(address.as_str()).map_err(|e|failed("accessibility bus",e))?
+        .method_timeout(limit).build().await.map_err(|e|failed("accessibility bus",e))?;
+    let dbus=Proxy::new(&connection,"org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus").await.map_err(|e|failed("bus",e))?;
+    let registry=Proxy::new(&connection,"org.a11y.atspi.Registry","/org/a11y/atspi/accessible/root",ACCESSIBLE).await.map_err(|e|failed("desktop",e))?;
+    let applications:Vec<Reference>=registry.call("GetChildren",&()).await.map_err(|e|failed("desktop",e))?;
+    if applications.len()>4096{return Err("Native application count exceeds its limit.".into());}
+    let mut windows=Vec::new();
+    for (name,app) in applications {
+        // The PID is the bus owner's, from the bus itself; an application
+        // that has gone away is skipped.
+        let Ok(owner)=dbus.call::<_,_,String>("GetNameOwner",&(name,)).await else {continue};
+        let Ok(got)=dbus.call::<_,_,u32>("GetConnectionUnixProcessID",&(&owner,)).await else {continue};
+        if got!=pid {continue;}
+        let reader=Reader{connection:connection.clone(),owner};
+        let children=reader.child_count(&app).await.map_err(|e|format!("{e} at selected application"))?;
+        if children>4096{return Err("Native window count exceeds its limit.".into());}
+        for j in 0..children {
+            let w=reader.child_at(&app,j).await?;
+            let frame=reader.frame(&w).await?;
+            let states=reader.states(&w).await?;
+            // GTK on Wayland reports screen extents with a window-local
+            // zero origin. Require the unique ACTIVE top-level window in
+            // the compositor-focused PID and exact size, never size alone.
+            let matched=std::iter::once(rect).chain(client).find(|candidate|
+                ((frame[0]==candidate[0] && frame[1]==candidate[1]) || (frame[0]==0 && frame[1]==0)) && frame[2..]==candidate[2..]);
+            if let Some(matched)=matched {if has(&states,1) {windows.push((Reader{connection:connection.clone(),owner:reader.owner.clone()},w,vec![j],matched));}}
         }
-        if windows.len()!=1{return Err("The native window identity could not be proved uniquely.".into());}
-        let (w,mut path,rect)=windows.pop().unwrap();
-        if let Some(target)=target {
-            // The same window index, then each child in turn; the node must
-            // still be the visible focused editable field.
-            if target.first()!=path.first() {return Err("The expected native field is no longer in the focused window.".into());}
-            let mut node=w;
-            for (depth,&index) in target.iter().enumerate().skip(1) {
-                // As the full walk: a hidden or defunct branch holds no
-                // current visible field.
-                let states=present(unsafe{(self.states)(node)})?;
-                if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 {return Err("The expected native field is no longer the focused editable field.".into());}
-                let count=self.child_count(node).map_err(|e|format!("{e} at native path {:?}",&target[..depth]))?;
-                if index>=count {return Err("The expected native field is no longer the focused editable field.".into());}
-                node=self.child_at(node,index)?;
-            }
-            let states=present(unsafe{(self.states)(node)})?;
-            if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 {return Err("The expected native field is no longer the focused editable field.".into());}
-            let origin=window_local.then_some(rect);
-            return self.field(node,states,&target,origin)?.ok_or_else(||"The expected native field is no longer the focused editable field.".into());
-        }
-        // Root desktop application order can change independently; identity is
-        // the selected process plus its top-level window index and field path.
-        let mut found=Vec::new();self.walk(w,&mut path,&mut 0,&mut found,window_local.then_some(rect))?;
-        if found.len()!=1{return Err("Exactly one focused editable native field is required.".into());}Ok(found.remove(0))
     }
+    if windows.len()!=1{return Err("The native window identity could not be proved uniquely.".into());}
+    let (reader,w,mut path,rect)=windows.pop().unwrap();
+    if let Some(target)=target {
+        // The same window index, then each child in turn; the node must
+        // still be the visible focused editable field.
+        if target.first()!=path.first() {return Err("The expected native field is no longer in the focused window.".into());}
+        let (mut parent,mut node)=(None,w);
+        for (depth,&index) in target.iter().enumerate().skip(1) {
+            // As the full walk: a hidden or defunct branch holds no
+            // current visible field.
+            let states=reader.states(&node).await?;
+            if has(&states,6) || !has(&states,25) {return Err("The expected native field is no longer the focused editable field.".into());}
+            let count=reader.child_count(&node).await.map_err(|e|format!("{e} at native path {:?}",&target[..depth]))?;
+            if index>=count {return Err("The expected native field is no longer the focused editable field.".into());}
+            let child=reader.child_at(&node,index).await?;
+            parent=Some(std::mem::replace(&mut node,child));
+        }
+        let states=reader.states(&node).await?;
+        if has(&states,6) || !has(&states,25) {return Err("The expected native field is no longer the focused editable field.".into());}
+        let origin=window_local.then_some(rect);
+        return reader.field(&node,parent.as_ref(),&states,&target,origin).await?.ok_or_else(||"The expected native field is no longer the focused editable field.".into());
+    }
+    // Root desktop application order can change independently; identity is
+    // the selected process plus its top-level window index and field path.
+    let mut found=Vec::new();reader.walk(w,None,&mut path,&mut 0,&mut found,window_local.then_some(rect)).await?;
+    if found.len()!=1{return Err("Exactly one focused editable native field is required.".into());}Ok(found.remove(0))
 }
 /// Private read-only daemon subcommand. The desktop runner owns its deadline.
 pub fn main(args:&[String])->u8 {
@@ -351,7 +337,8 @@ pub fn main(args:&[String])->u8 {
         let mut rect=[0;4];for (dst,s) in rect.iter_mut().zip(&args[1..]){*dst=s.parse().map_err(|_|"Invalid native window geometry.")?;}
         if pid==0 || rect[2]<=0 || rect[3]<=0{return Err("Invalid native window identity.".into());}
         let client=if args.len()==10 {let mut client=[0;4];for (dst,s) in client.iter_mut().zip(&args[6..]){*dst=s.parse().map_err(|_|"Invalid native client geometry.")?;}if client[2]<=0 || client[3]<=0{return Err("Invalid native client identity.".into());}Some(client)}else{None};
-        unsafe{Api::load()}?.read(pid,rect,args.len()>=6,client,target)
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e|e.to_string())?;
+        runtime.block_on(read_field(pid,rect,args.len()>=6,client,target))
     })();
     match result {Ok(f)=>{println!("{}",serde_json::to_string(&f).unwrap());0},Err(e)=>{eprintln!("{e}");1}}
 }

@@ -8,6 +8,7 @@ use std::{ffi::{CStr, OsString}, time::Duration};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     pub path: Vec<i32>, pub value: String, pub role: String, pub frame: [i32;4],
+    #[serde(default)] pub window_frame: Option<[i32;4]>,
     #[serde(default)] pub caret: Option<i32>,
     #[serde(default)] pub selections: Option<Vec<[i32;2]>>,
     #[serde(default)] pub paragraphs: Option<Vec<String>>,
@@ -16,7 +17,7 @@ impl Field {
     /// Application relayout may change the rectangle after insertion. The
     /// isolated reader validates that fresh rectangle before returning it.
     pub fn confirms_insertion(&self, observed: &Field) -> bool {
-        self.path == observed.path && self.role == observed.role && self.value == observed.value &&
+        self.window_frame == observed.window_frame && self.path == observed.path && self.role == observed.role && self.value == observed.value &&
             self.caret == observed.caret && self.selections == observed.selections && self.paragraphs == observed.paragraphs
     }
     pub fn after_insertion(&self, text: &str) -> Result<Field> {self.inserted(text,false)}
@@ -220,7 +221,7 @@ impl Api {
                 frame
             } else {self.frame(node)?};
             let paragraphs=if role=="paragraph" {self.paragraph_context(node,path,&value)?}else{None};
-            found.push(Field{path:path.clone(),value,role,frame,caret:Some(caret),selections:Some(selections),paragraphs});
+            found.push(Field{path:path.clone(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs});
             }
             }
         }

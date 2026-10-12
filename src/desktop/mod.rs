@@ -853,8 +853,15 @@ impl Desktop {
                     cua::unless_cancelled(cancel).map_err(sent)?;
                     return self.menu_keys(surface, "Return", 1).await.map_err(sent);
                 }
-                cua::MenuMove::Open(token) => self.cua.click_token(pid, window, token).await.map_err(sent)?,
-                cua::MenuMove::Keys(key, count) => self.menu_keys(surface, key, *count).await.map_err(sent)?,
+                // A menu opened again starts with no submenu entered.
+                cua::MenuMove::Open(token) => {
+                    entered.clear();
+                    self.cua.click_token(pid, window, token).await.map_err(sent)?
+                }
+                cua::MenuMove::Keys(key, count) => {
+                    if *key == "Escape" { entered.clear(); }
+                    self.menu_keys(surface, key, *count).await.map_err(sent)?
+                }
                 // Into a submenu that opened under its highlighted entry, once:
                 // if it asks again the keyboard is already inside it, on an
                 // entry Cua marks nothing on, so walk down instead.

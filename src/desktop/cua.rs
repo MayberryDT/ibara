@@ -427,12 +427,24 @@ impl Cua {
                     // Keep the drawn cursor's session: the motion every move
                     // starts from (each glide sets its own), no input, no move.
                     let kept = tokio::time::timeout(READ_TIMEOUT, call_tool(worker, "set_agent_cursor_motion", motion(Some(&label), 1.0))).await;
-                    if !matches!(kept, Ok(Ok(Ok(ref answer))) if answer.get("isError").and_then(Value::as_bool) != Some(true)) {
-                        // The handover draws it again, in a new session, before
+                    match kept {
+                        Ok(Ok(Ok(answer))) if answer.get("isError").and_then(Value::as_bool) != Some(true) => {}
+                        // Cua ended it: nothing of it is drawn. The handover
+                        // draws the cursor again, in a new session, before
                         // the next input.
-                        crate::controller::log_event("agent_cursor_session_lost", "Cua did not keep the agent's session; its cursor is drawn again");
-                        inner.shown.store(false, Ordering::SeqCst);
-                        worker.session = None;
+                        Ok(Ok(Ok(answer))) if ended(&answer) => {
+                            crate::controller::log_event("agent_cursor_session_lost", "Cua had ended the agent's session; its cursor is drawn again");
+                            inner.shown.store(false, Ordering::SeqCst);
+                            worker.session = None;
+                        }
+                        // Not known to be gone: stop the worker, which ends the
+                        // session and takes its cursor down.
+                        _ => {
+                            crate::controller::log_event("agent_cursor_session_lost", "Cua did not keep the agent's session; the worker was stopped");
+                            inner.shown.store(false, Ordering::SeqCst);
+                            let mut worker = slot.take().expect("checked");
+                            close(&mut worker).await;
+                        }
                     }
                 }
             }

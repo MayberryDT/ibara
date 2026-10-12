@@ -300,6 +300,10 @@ impl Api {
             if target.first()!=path.first() {return Err("The expected native field is no longer in the focused window.".into());}
             let mut node=w;
             for (depth,&index) in target.iter().enumerate().skip(1) {
+                // As the full walk: a hidden or defunct branch holds no
+                // current visible field.
+                let states=present(unsafe{(self.states)(node)})?;
+                if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 {return Err("The expected native field is no longer the focused editable field.".into());}
                 let count=self.child_count(node).map_err(|e|format!("{e} at native path {:?}",&target[..depth]))?;
                 if index>=count {return Err("The expected native field is no longer the focused editable field.".into());}
                 node=self.child_at(node,index)?;

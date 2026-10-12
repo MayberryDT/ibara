@@ -207,7 +207,7 @@ impl DesktopPort for LiveDesktop {
                     let target = ClickTarget::Point { x: *x, y: *y, surface: key.as_ref().map(surface) };
                     self.desktop.click(&target, button(*b), *double, Some(cancel)).await.map(|point| Done { point, ..Done::default() })
                 }
-                Effect::Type { surface: key, text, cursor } => self.desktop.type_text(&surface(key), text, *cursor, Some(cancel)).await.map(|_| Done::default()),
+                Effect::Type { surface: key, text, cursor } => self.desktop.type_text(&surface(key), text, *cursor, Some(cancel)).await.map(|note| Done { note, ..Done::default() }),
                 Effect::Key { surface: key, combo } => self.desktop.key(&surface(key), combo, Some(cancel)).await.map(|_| Done::default()),
                 Effect::Scroll { at, dx, dy } => {
                     let at = at.map(|(x, y)| desktop::Point { x, y });

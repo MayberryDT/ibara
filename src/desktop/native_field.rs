@@ -20,6 +20,22 @@ impl Field {
         self.window_frame == observed.window_frame && self.path == observed.path && self.role == observed.role && self.value == observed.value &&
             self.caret == observed.caret && self.selections == observed.selections && self.paragraphs == observed.paragraphs
     }
+    /// Characters an application added right after a confirmed insertion
+    /// and left selected (GTK entry completion): typing replaces them and
+    /// Return accepts them. `self` is the expected field after insertion.
+    /// Any other difference stays unconfirmed.
+    pub fn completion_after(&self, observed: &Field) -> Option<usize> {
+        if self.window_frame != observed.window_frame || self.path != observed.path || self.role != observed.role
+            || self.paragraphs.is_some() || observed.paragraphs.is_some() || self.selections.as_deref() != Some(&[]) { return None; }
+        let caret = usize::try_from(self.caret?).ok()?;
+        let split = self.value.char_indices().nth(caret).map(|(byte, _)| byte).unwrap_or(self.value.len());
+        let (before, after) = self.value.split_at(split);
+        let added = observed.value.chars().count().checked_sub(self.value.chars().count()).filter(|n| *n > 0)?;
+        if observed.value.len() < before.len() + after.len() || !observed.value.starts_with(before) || !observed.value.ends_with(after) { return None; }
+        let (start, end) = (i32::try_from(caret).ok()?, i32::try_from(caret + added).ok()?);
+        let selected = matches!(observed.selections.as_deref(), Some([[a, b]]) if (*a, *b) == (start, end) || (*a, *b) == (end, start));
+        (selected && (observed.caret == Some(start) || observed.caret == Some(end))).then_some(added)
+    }
     pub fn after_insertion(&self, text: &str) -> Result<Field> {self.inserted(text,false)}
     /// Clipboard newlines split paragraphs; direct native text inserts soft
     /// breaks. Only inserted boundaries may change the sibling structure.

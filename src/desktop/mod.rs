@@ -1102,10 +1102,12 @@ impl Desktop {
         }).await
     }
 
-    pub async fn type_text(&self, surface: &SurfaceId, text: &str, cursor: TypingCursor, cancel: Option<&Cancel>) -> Result<()> {
+    /// Returns a note when the application left a completion selected after
+    /// the typed text.
+    pub async fn type_text(&self, surface: &SurfaceId, text: &str, cursor: TypingCursor, cancel: Option<&Cancel>) -> Result<Option<String>> {
         if let Some(control) = &self.gnome_control {
             input::check_text(text)?;
-            if text.is_empty() { return Ok(()); }
+            if text.is_empty() { return Ok(None); }
             return self.effect(cancel,async {
                 let live=self.ensure_focused(surface).await?;
                 let mut before=native_field::read(&live,&self.env,cancel).await?;
@@ -1123,7 +1125,8 @@ impl Desktop {
                 if fresh!=before { return Err(stale("The native field changed before insertion.").with("execution_not_started",true)); }
                 let mut admitted=0usize;
                 let mut confirmed=0usize;
-                let result: Result<()>=async {
+                let mut completed=None;
+                let result: Result<Option<String>>=async {
                     let mut offset=0;
                     while offset<text.len() {
                         cua::unless_cancelled(cancel)?;
@@ -1135,18 +1138,21 @@ impl Desktop {
                         transaction.text(piece).await?;
                         admitted+=piece.chars().count();
                         let mut last_readback=None;
-                        let observed=read_back(&live,&self.env,cancel,&expected,&mut last_readback).await
+                        let (observed,added)=read_back(&live,&self.env,cancel,&expected,&mut last_readback).await
                             .map_err(|mut error| {
                                 let diagnostic=last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation".into());
                                 error.message=format!("{} Native readback: {diagnostic}. Reobserve before further input.",error.message);
                                 error.with("execution_not_started",false).with("native_readback",last_readback.unwrap_or(Value::Null)).requires_reconciliation()
                             })?;
                         confirmed+=piece.chars().count();
+                        // A later piece replaces a selected completion.
+                        completed=added;
                         before=observed;
                         offset=end;
                     }
                     transaction.finish().await?;
-                    Ok(())
+                    Ok(completed.map(|n| format!("the app completed {n} more character{} after it and left {} selected; typing replaces {}, Return accepts {}",
+                        if n==1 {""} else {"s"}, if n==1 {"it"} else {"them"}, if n==1 {"it"} else {"them"}, if n==1 {"it"} else {"them"})))
                 }.await;
                 *self.typed_at.lock().unwrap_or_else(|p|p.into_inner())=Some(Instant::now());
                 result.map_err(|mut error| {
@@ -1229,6 +1235,7 @@ impl Desktop {
             result
         })
         .await
+        .map(|()| None)
     }
 
     /// Before a point click: put the real pointer where the named cursor is,
@@ -1769,8 +1776,10 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 /// helper is left running; no new read starts after [`READBACK_WINDOW`]. A
 /// reader refusal or helper timeout is read again; cancellation and any
 /// other error stop at once. `last` keeps only boolean comparisons of the
-/// last complete observation. Sends no input.
-async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<native_field::Field> {
+/// last complete observation. Sends no input. Also accepts the exact text
+/// followed by a completion the application left selected, returning its
+/// length ([`native_field::Field::completion_after`]).
+async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<(native_field::Field, Option<usize>)> {
     let start = Instant::now();
     let mut observations = 0;
     loop {
@@ -1781,7 +1790,8 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
                     "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
                     "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
                     "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));
-                if expected.confirms_insertion(&observed) { return Ok(observed); }
+                if expected.confirms_insertion(&observed) { return Ok((observed, None)); }
+                if let Some(added) = expected.completion_after(&observed) { return Ok((observed, Some(added))); }
                 false
             }
             Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => true,

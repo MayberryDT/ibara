@@ -1830,9 +1830,10 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
             }
             Err(error) => return Err(error),
         };
-        // The application may have scrolled the typed paragraph to another
-        // index: find the unique focused field instead.
-        match native_field::read(live, env, cancel).await {
+        // Refused at the expected path: the application may have scrolled
+        // the typed paragraph to another index. Find the unique focused
+        // field instead.
+        if refused { match native_field::read(live, env, cancel).await {
             Ok(observed) if expected.confirms_scrolled(&observed) => {
                 *last = Some(serde_json::json!({"scrolled": true, "path_shift": expected.path.last().zip(observed.path.last()).map(|(a, b)| i64::from(*a) - i64::from(*b))}));
                 return Ok((observed, None));
@@ -1840,7 +1841,7 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
             Ok(_) => {}
             Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => {}
             Err(error) => return Err(error),
-        }
+        } }
         reads += 1;
         let elapsed = start.elapsed();
         if elapsed >= READBACK_LIMIT || (elapsed >= READBACK_WINDOW && observations >= READBACK_OBSERVATIONS) {

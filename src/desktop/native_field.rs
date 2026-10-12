@@ -13,6 +13,8 @@ pub struct Field {
     #[serde(default)] pub caret: Option<i32>,
     #[serde(default)] pub selections: Option<Vec<[i32;2]>>,
     #[serde(default)] pub paragraphs: Option<Vec<String>>,
+    /// In an expectation only: the first paragraph the insertion changed.
+    #[serde(skip)] pub changed_from: Option<i32>,
 }
 impl Field {
     /// Application relayout may change the rectangle after insertion. The
@@ -29,21 +31,29 @@ impl Field {
     /// both sides have paragraph context, every observed paragraph that was
     /// on screen before must be unchanged at the shifted index; paragraphs
     /// scrolled in from beyond either end are not compared.
+    ///
+    /// Only a paragraph that moved up the list (text grows downwards and
+    /// earlier paragraphs leave the top) is accepted. Without paragraph
+    /// context the insertion cannot have split paragraphs, so the exact
+    /// value covers all of it; with context, every paragraph the insertion
+    /// created or changed must still be visible and equal.
     pub fn confirms_scrolled(&self, observed: &Field) -> bool {
-        if self.window_frame != observed.window_frame || self.role != observed.role || self.value != observed.value
+        if self.role != "paragraph" || self.window_frame != observed.window_frame || self.role != observed.role || self.value != observed.value
             || self.caret != observed.caret || self.selections != observed.selections { return false; }
         let (Some((&expected_at, parent)), Some((&observed_at, observed_parent))) = (self.path.split_last(), observed.path.split_last()) else { return false };
-        if parent != observed_parent { return false; }
+        if parent != observed_parent || expected_at <= observed_at { return false; }
+        let shift = i64::from(expected_at) - i64::from(observed_at);
         match (&self.paragraphs, &observed.paragraphs) {
+            (None, _) => true,
+            (Some(_), None) => false,
             (Some(expected), Some(seen)) => {
-                let shift = i64::from(expected_at) - i64::from(observed_at);
-                seen.get(observed_at as usize) == Some(&self.value)
+                i64::from(self.changed_from.unwrap_or(expected_at)) >= shift
+                    && seen.get(observed_at as usize) == Some(&self.value)
                     && seen.iter().enumerate().all(|(i, p)| {
                         let j = i as i64 + shift;
-                        j < 0 || j >= expected.len() as i64 || expected[j as usize] == *p
+                        j >= expected.len() as i64 || expected[j as usize] == *p
                     })
             }
-            _ => true,
         }
     }
     /// Characters an application added right after a confirmed insertion
@@ -81,6 +91,7 @@ impl Field {
         after.value=format!("{}{}{}",&self.value[..offset(start)],text,&self.value[offset(end)..]);
         if after.value.chars().count()>131072 {return Err(refused("Resulting text exceeds native readback capacity."));}
         after.caret=Some(start+text.chars().count() as i32);
+        after.changed_from=self.path.last().copied();
         after.selections=Some(Vec::new());
         let splits=clipboard && self.role=="paragraph" && text.contains('\n');
         if splits && after.paragraphs.is_none() {
@@ -342,7 +353,7 @@ impl Reader {
             frame
         } else {self.frame_at(node,0).await?};
         let paragraphs=if role=="paragraph" {self.paragraph_context(parent,path,&value).await?}else{None};
-        Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs}))
+        Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs,changed_from:None}))
     }
 }
 async fn read_field(pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>,target:Option<Vec<i32>>)->std::result::Result<Field,String>{

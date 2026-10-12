@@ -383,7 +383,11 @@ impl Controller {
             // Releasing input can yield to Take Control. Closing belongs to
             // this reset too; never use the unfenced person-window route.
             if !allowed()? || cancel.is_cancelled() { break; }
-            match self.desktop.act(&Effect::Close(window.key()), &cancel).await {
+            self.desktop.set_agent(Some("ibara desktop reset".into()));
+            let result = self.desktop.act(&Effect::Close(window.key()), &cancel).await;
+            self.desktop.set_agent(None);
+            self.desktop.release_input().await?;
+            match result {
                 Ok(_) => asked.push((window.key(), name)),
                 Err(e) if e.code == "STALE_TARGET" => stale.push((window.key(), name)),
                 Err(e) => cleanup.left.push(crate::contract::LeftOpen { surface:name, reason:format!("close refused: {}", e.code) }),

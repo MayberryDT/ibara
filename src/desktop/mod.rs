@@ -1094,7 +1094,7 @@ impl Desktop {
                         let observed=tokio::time::timeout(Duration::from_secs(3),async {
                             loop {
                                 let observed=native_field::read(&live,&self.env,cancel).await?;
-                                last_readback=Some(json!({"window_matches":expected.window_frame==observed.window_frame,
+                                last_readback=Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,
                                     "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
                                     "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
                                     "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));

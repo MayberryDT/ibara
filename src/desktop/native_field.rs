@@ -168,35 +168,25 @@ api! {
  selection:"atspi_text_get_selection"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->*mut TextRange,
 }
 fn valid(error:Obj)->std::result::Result<(),String> { if error.is_null(){Ok(())}else{Err("Native accessibility read failed; no field was proved.".into())} }
-/// How long one cold LibreOffice accessibility reply may take; the isolated
-/// runner's six-second deadline still bounds the whole read.
-const COLD_REPLY:std::time::Duration=std::time::Duration::from_secs(3);
 fn present(obj:Obj)->std::result::Result<Obj,String>{if obj.is_null(){Err("Native accessibility returned no object.".into())}else{Ok(obj)}}
 impl Api {
     fn child_count(&self,node:Obj)->std::result::Result<i32,String>{
-        // Properties.Get can return -1 without GError while the isolated
-        // process's AT-SPI cache is still being populated. LibreOffice with
-        // several documents open takes about two seconds to answer a cold
-        // application, so wait for the reply, bounded, then require a real count.
-        let n=self.settled(||{let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e).map(|()|(n>=0).then_some(n))})?;
-        n.ok_or_else(||"Native child count is invalid after bounded cache refresh.".into())
+        for attempt in 0..2 {
+            let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
+            if n>=0 {return Ok(n);}
+            if attempt==0 {
+                // Properties.Get can return -1 without GError while the
+                // isolated process's AT-SPI cache is still being populated.
+                // Drain bounded pending callbacks, then require a real count.
+                for _ in 0..64 {
+                    if unsafe{(self.iteration)(std::ptr::null_mut(),0)}==0 {break;}
+                }
+            }
+        }
+        Err("Native child count is invalid after bounded cache refresh.".into())
     }
     fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
-        let p=self.settled(||{let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e).map(|()|(!p.is_null()).then_some(p))})?;
-        p.ok_or_else(||"Native accessibility returned no object.".into())
-    }
-    /// Ask again while a cold reply is still pending: drain callbacks without
-    /// blocking and retry for at most [`COLD_REPLY`]. An error ends it at once.
-    fn settled<T>(&self,mut ask:impl FnMut()->std::result::Result<Option<T>,String>)->std::result::Result<Option<T>,String>{
-        let start=std::time::Instant::now();
-        loop {
-            if let Some(value)=ask()? {return Ok(Some(value));}
-            if start.elapsed()>=COLD_REPLY {return Ok(None);}
-            for _ in 0..64 {
-                if unsafe{(self.iteration)(std::ptr::null_mut(),0)}==0 {break;}
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)
     }
     fn paragraph_context(&self,node:Obj,path:&[i32],value:&str)->std::result::Result<Option<Vec<String>>,String>{
         let mut e=std::ptr::null_mut();let parent=unsafe{(self.parent)(node,&mut e)};valid(e)?;
@@ -295,9 +285,10 @@ impl Api {
     }
     fn read(&self,pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>,target:Option<Vec<i32>>)->std::result::Result<Field,String>{
         if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
-        // A cold LibreOffice accessibility reply can take over one second.
+        // A cold LibreOffice reply can take over one second, and its
+        // application child count about two with several documents open.
         // The isolated runner still enforces the six-second overall deadline.
-        unsafe{(self.timeout)(1500,1500)};
+        unsafe{(self.timeout)(4000,4000)};
         let root=present(unsafe{(self.desktop)(0)})?;let mut windows=Vec::new();
         let applications=self.child_count(root).map_err(|e|format!("{e} at desktop root"))?;
         if applications>4096{return Err("Native application count exceeds its limit.".into());}

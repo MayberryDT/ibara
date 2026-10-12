@@ -338,8 +338,15 @@ async fn begin_input_on(connection: zbus::Connection, owner: String, surface: &S
             let proxy = zbus::Proxy::new(&connection, owner.as_str(), PATH, SERVICE).await
                 .map_err(|e| unavailable(e.to_string()))?;
             DISPATCHED.fetch_add(1, Ordering::SeqCst);
-            proxy.call("InputBegin", &(identity.to_string(), generation)).await
-                .map_err(|e| input_unknown(format!("Input begin was not acknowledged: {e}")))?
+            proxy.call("InputBegin", &(identity.to_string(), generation)).await.map_err(|e| match e {
+                // The helper raises every InputBegin refusal before it starts
+                // any input (extension.js InputBeginAsync): nothing was sent.
+                zbus::Error::MethodError(name, detail, _) if name.as_str() == "org.ibara.Gnome.InputRefused" =>
+                    IbaraError::new("STALE_TARGET", format!("The window could not take the input; nothing was sent. {}. Observe again.",
+                        detail.unwrap_or_default().trim_start_matches("Error: ").chars().take(120).collect::<String>()), true)
+                        .with("execution_not_started", true),
+                e => input_unknown(format!("Input begin was not acknowledged: {e}")),
+            })?
         };
         if uuid::Uuid::parse_str(&token).is_err() { return Err(input_unknown("Invalid input transaction receipt.")); }
         Ok(InputTransaction { persistent_cursor: cursor_lease.is_some(), connection: Some(connection), owner, token })

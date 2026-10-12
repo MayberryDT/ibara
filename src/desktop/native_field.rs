@@ -117,7 +117,14 @@ impl Field {
         Ok(after)
     }
 }
-fn refused(message: impl Into<String>) -> IbaraError { IbaraError::new("CAPABILITY_UNAVAILABLE", message, true).with("execution_not_started", true) }
+fn refused(message: impl Into<String>) -> IbaraError {
+    let message = message.into();
+    let error = IbaraError::new("CAPABILITY_UNAVAILABLE", message.clone(), true).with("execution_not_started", true);
+    // A new document can show a caret before its app reports the field as
+    // focused; a click there makes it so.
+    if message.contains(NO_FOCUSED_FIELD) { error.with("next", "Click where the text should go (for a new document, its page), then type again.") } else { error }
+}
+const NO_FOCUSED_FIELD: &str = "No editable text field has the keyboard focus in this window.";
 pub async fn read(window: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>) -> Result<Field> {
     read_with(window, env, cancel, None).await
 }
@@ -424,6 +431,7 @@ async fn read_field(pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]
     // Root desktop application order can change independently; identity is
     // the selected process plus its top-level window index and field path.
     let mut found=reader.walk(w,path,window_local.then_some(rect)).await?;
+    if found.is_empty(){return Err(NO_FOCUSED_FIELD.into());}
     if found.len()!=1{return Err("Exactly one focused editable native field is required.".into());}Ok(found.remove(0))
 }
 /// Private read-only daemon subcommand. The desktop runner owns its deadline.

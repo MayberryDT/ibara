@@ -354,11 +354,15 @@ impl InputTransaction {
     /// as a guarded stop; unreadable receipt stays a person-attributed stop.
     async fn refused(&self, kind: &str) -> IbaraError {
         match self.receipt().await {
-            Ok(receipt) => {
+            Ok(mut receipt) => {
                 eprintln!("ibara guarded_input_refused kind={kind} reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
+                // Still active: the helper refused only this event (a point
+                // outside the window, an invalid key), not the transaction.
+                if receipt.active { receipt.reason = "refused_before_queue".into(); }
                 stopped(&receipt)
             }
-            Err(_) => IbaraError::new("HUMAN_CONTROL", format!("Guarded {kind} refused."), false).with("reason", "interrupted"),
+            Err(_) => input_unknown(format!("Guarded {kind} refused; its transaction state could not be read."))
+                .with("execution_not_started", false),
         }
     }
     pub async fn key(&self, key: u32, pressed: bool) -> Result<InputReceipt> {

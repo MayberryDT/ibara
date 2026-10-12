@@ -42,12 +42,16 @@ impl GnomeControl {
             });
         }
     }
-    pub async fn to_agent(&self) -> Result<()> {
+    pub async fn to_agent(&self) -> Result<()> { self.handover(false).await }
+    /// As [`Self::to_agent`], but proceeds while only a menu stranded in an
+    /// unfocused window holds input, so focus can return to that window and
+    /// the menu can be closed. Focus sends no input.
+    pub async fn to_agent_for_focus(&self) -> Result<()> { self.handover(true).await }
+    async fn handover(&self, stranded_menu_ok: bool) -> Result<()> {
         let state = self.0.desktop.state().await?;
-        if state.input_readiness_api != 1 || state.shell_input_blocked {
-            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE",
-                "GNOME Shell holds input or its readiness helper needs a session reload. A person must dismiss any secure prompt before agent work.", true)
-                .with("execution_not_started", true));
+        if state.input_readiness_api != 1
+            || state.shell_input_blocked && !(stranded_menu_ok && state.stranded_menu().is_some()) {
+            return Err(state.blocked());
         }
         tokio::time::timeout(std::time::Duration::from_secs(3),self.to_agent_inner()).await
             .map_err(|_| IbaraError::new("CONTROL_UNSETTLED", "GNOME cursor handover did not complete within three seconds; application input was not started.", false)

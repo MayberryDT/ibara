@@ -46,6 +46,33 @@ pub struct State {
     pub windows: Vec<Window>,
     pub focused: Option<String>,
 }
+impl State {
+    /// The window whose open menu or popup holds input while another window
+    /// has focus. Mutter accepts input only for the window that owns a popup
+    /// grab, so until that window is focused again even the Escape that
+    /// closes the menu is refused.
+    pub fn stranded_menu(&self) -> Option<&Window> {
+        if !self.shell_input_blocked { return None; }
+        self.windows.iter()
+            .filter(|w| w.visible && !w.hidden && !w.modal && w.title.is_empty() && w.class.is_empty())
+            .filter_map(|w| w.transient_for.as_deref())
+            .filter(|owner| self.focused.as_deref() != Some(*owner))
+            .find_map(|owner| self.windows.iter().find(|w| w.address == owner && w.visible && !w.hidden))
+    }
+    /// Why GNOME input is refused, and what releases it.
+    pub fn blocked(&self) -> IbaraError {
+        let error = if self.input_readiness_api != 1 {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "The GNOME input readiness helper needs a session reload.", true)
+        } else if let Some(owner) = self.stranded_menu() {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", format!(
+                "An open menu or popup in {} \"{}\" holds input while another window has focus. Focus that window (allowed now), then press Escape or choose a menu item.",
+                owner.class, owner.title), true).with("reason", "menu_holds_input")
+        } else {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any shell dialog or secure prompt before agent work.", true)
+        };
+        error.with("execution_not_started", true)
+    }
+}
 impl Gnome {
     pub fn selected(env: &[(OsString, OsString)]) -> bool {
         let desktop = env.iter().rev().find(|(key, _)| key == "XDG_CURRENT_DESKTOP").map(|(_, value)| value.to_string_lossy().into_owned())
@@ -114,6 +141,10 @@ impl Gnome {
             if state.locked { return Err(IbaraError::new("HUMAN_CONTROL", "The GNOME session is locked.", false)); }
             if !state.windows.iter().any(|window| window.is(surface)) {
                 return Err(IbaraError::new("STALE_TARGET", "GNOME window/process/session identity changed.", true).with("execution_not_started", true));
+            }
+            if method=="Focus" && state.shell_input_blocked
+                && state.stranded_menu().is_none_or(|owner| owner.address != surface.address) {
+                return Err(state.blocked());
             }
             if method=="Focus" {
                 for modal in state.windows.iter().filter(|w|w.modal && w.visible && !w.hidden && w.address!=surface.address) {

@@ -634,13 +634,21 @@ impl Desktop {
     }
 
     async fn effect<T>(&self, cancel: Option<&Cancel>, work: impl Future<Output = Result<T>>) -> Result<T> {
+        self.gated(cancel, false, work).await
+    }
+
+    /// `focus` is true for a window focus, which may return to a window whose
+    /// stranded menu holds input ([`gnome::State::stranded_menu`]).
+    async fn gated<T>(&self, cancel: Option<&Cancel>, focus: bool, work: impl Future<Output = Result<T>>) -> Result<T> {
         cua::unless_cancelled(cancel)?;
         if self.gnome_control.is_none() && self.uses_dispatchers().await {
             // The passive seat pointer must exist before hiding it. Launch
             // and window management still work if wheel support is missing.
             let _ = self.prepare_dispatchers().await;
         }
-        if let Some(control) = &self.gnome_control { control.to_agent().await?; }
+        if let Some(control) = &self.gnome_control {
+            if focus { control.to_agent_for_focus().await?; } else { control.to_agent().await?; }
+        }
         else { self.handover.to_agent().await?; }
         cua::unless_cancelled(cancel)?;
         let before = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count(), gnome::dispatch_count());
@@ -690,7 +698,7 @@ impl Desktop {
     }
 
     pub async fn focus(&self, surface: &SurfaceId, cancel: Option<&Cancel>) -> Result<()> {
-        self.effect(cancel, async {
+        self.gated(cancel, true, async {
             self.live(surface).await?.ok_or_else(|| stale("Cannot focus a missing surface."))?;
             // Hyprland may move the pointer onto the window it focuses.
             let motion = self.cua.motion();
@@ -1587,8 +1595,7 @@ impl Desktop {
                 row("native.gnome", "gnome-shell+ibara-identity".into(), state.as_ref().map(|_|true).map_err(Clone::clone)),
                 row("session", "gnome-session-mode".into(), ready),
                 row("native.input", "mutter-ibara-guard+gnome-shell".into(), state.as_ref().map_err(Clone::clone).and_then(|s| {
-                    if s.input_readiness_api!=1 { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME input readiness helper needs a session reload.", true)); }
-                    if s.shell_input_blocked { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any secure prompt before agent work.", true)); }
+                    if s.input_readiness_api!=1 || s.shell_input_blocked { return Err(s.blocked()); }
                     Ok(!s.locked && s.guarded_input_api==1 && s.cursor_api==1 && s.monitors.len()==1 && s.monitors[0].scale==1.0)
                 })),
                 row("native.capture", "gnome-shell+ibara-snapshot".into(), state.as_ref().map(|s|

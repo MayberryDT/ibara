@@ -3,6 +3,7 @@ import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
+import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -115,6 +116,8 @@ export default class IbaraIdentity extends Extension {
                 at: [frame.x, frame.y], size: [frame.width, frame.height], monitor: window.get_monitor(),
                 clientRect: [client.x, client.y, client.width, client.height],
                 bufferRect: [buffer.x, buffer.y, buffer.width, buffer.height],
+                modal: window.get_window_type() === Meta.WindowType.MODAL_DIALOG,
+                transientFor: window.get_transient_for() ? `gnome:${window.get_transient_for().get_stable_sequence()}` : null,
                 workspace: { id: (window.get_workspace()?.index() ?? -1) + 1 },
                 mapped: true, hidden: window.minimized || !window.showing_on_its_workspace(),
                 visible: window.showing_on_its_workspace() && !window.minimized,

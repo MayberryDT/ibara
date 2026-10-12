@@ -85,6 +85,9 @@ pub struct Window {
     pub hidden: bool,
     pub visible: bool,
     pub accepts_input: bool,
+    /// Trusted compositor modal relationship, used only by GNOME focus preflight.
+    pub modal: bool,
+    pub transient_for: Option<String>,
     pub at: [i32; 2],
     pub size: [i32; 2],
     /// Trusted compositor content bounds for AT-SPI WINDOW coordinates.

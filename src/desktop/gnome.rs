@@ -115,6 +115,20 @@ impl Gnome {
             if !state.windows.iter().any(|window| window.is(surface)) {
                 return Err(IbaraError::new("STALE_TARGET", "GNOME window/process/session identity changed.", true).with("execution_not_started", true));
             }
+            if method=="Focus" {
+                for modal in state.windows.iter().filter(|w|w.modal && w.visible && !w.hidden && w.address!=surface.address) {
+                    let mut parent=modal.transient_for.as_deref();
+                    let mut seen=std::collections::HashSet::new();
+                    while let Some(address)=parent {
+                        if !seen.insert(address) || seen.len()>512 {return Err(unavailable("Invalid GNOME modal ancestry; no activation sent."));}
+                        if address==surface.address {
+                            return Err(IbaraError::new("STALE_TARGET", "A modal child blocks this window. Observe and handle the dialog before focusing its parent.", true)
+                                .with("execution_not_started",true).with("reason","modal_focus_blocked"));
+                        }
+                        parent=state.windows.iter().find(|w|w.address==address).and_then(|w|w.transient_for.as_deref());
+                    }
+                }
+            }
             let identity = json!({"epoch":state.epoch,"address":surface.address,"pid":surface.pid,"class":surface.class}).to_string();
             let proxy = zbus::Proxy::new(&connection, owner.as_str(), PATH, SERVICE).await.map_err(|e| unavailable(e.to_string()))?;
             DISPATCHED.fetch_add(1, Ordering::SeqCst);

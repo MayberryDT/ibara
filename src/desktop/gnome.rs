@@ -349,6 +349,18 @@ impl InputTransaction {
             }
         }).await.map_err(|_| input_unknown("Queued input has no dispatch receipt; do not replay."))?
     }
+    /// The helper refused to queue an event: it emitted nothing for it
+    /// (`ibara-input.c` returns before notifying). Labelled from the receipt
+    /// as a guarded stop; unreadable receipt stays a person-attributed stop.
+    async fn refused(&self, kind: &str) -> IbaraError {
+        match self.receipt().await {
+            Ok(receipt) => {
+                eprintln!("ibara guarded_input_refused kind={kind} reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
+                stopped(&receipt)
+            }
+            Err(_) => IbaraError::new("HUMAN_CONTROL", format!("Guarded {kind} refused."), false).with("reason", "interrupted"),
+        }
+    }
     pub async fn key(&self, key: u32, pressed: bool) -> Result<InputReceipt> {
         let result = self.key_inner(key, pressed).await;
         if result.is_err() {
@@ -363,7 +375,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputKey", &(self.token.as_str(), key, pressed)).await
                 .map_err(|e| input_unknown(format!("Key acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Key acknowledgement timed out; do not replay."))??;
-        if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded key refused.", false).with("reason", "interrupted")); }
+        if !queued { return Err(self.refused("key").await); }
         self.admitted(&previous, "key").await
     }
     pub async fn scroll(&self, dx: i32, dy: i32) -> Result<InputReceipt> {
@@ -380,8 +392,7 @@ impl InputTransaction {
                         self.proxy().await?.call("InputScroll", &(self.token.as_str(), direction)).await
                             .map_err(|e| input_unknown(format!("Wheel acknowledgement lost: {e}")))
                     }).await.map_err(|_| input_unknown("Wheel acknowledgement timed out; do not replay."))??;
-                    if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded wheel refused.", false)
-                        .with("reason", "interrupted").with("execution_not_started", false)); }
+                    if !queued { return Err(self.refused("wheel").await); }
                     receipt = self.admitted(&receipt, "scroll").await?;
                 }
             }
@@ -429,12 +440,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputMotion", &(self.token.as_str(), x, y)).await
                 .map_err(|e| input_unknown(format!("Motion acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Motion acknowledgement timed out; do not replay."))??;
-        if !queued {
-            if let Ok(receipt) = self.receipt().await {
-                eprintln!("ibara guarded_input_refused kind=motion reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
-            }
-            return Err(IbaraError::new("HUMAN_CONTROL", "Guarded motion refused.", false).with("reason", "interrupted"));
-        }
+        if !queued { return Err(self.refused("motion").await); }
         self.admitted(&previous, "motion").await
     }
     pub async fn button(&self, button: u32, pressed: bool) -> Result<InputReceipt> {
@@ -451,12 +457,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputButton", &(self.token.as_str(), button, pressed)).await
                 .map_err(|e| input_unknown(format!("Button acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Button acknowledgement timed out; do not replay."))??;
-        if !queued {
-            if let Ok(receipt) = self.receipt().await {
-                eprintln!("ibara guarded_input_refused kind=button reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
-            }
-            return Err(IbaraError::new("HUMAN_CONTROL", "Guarded button refused.", false).with("reason", "interrupted"));
-        }
+        if !queued { return Err(self.refused("button").await); }
         self.admitted(&previous, "button").await
     }
     pub async fn finish(mut self) -> Result<InputReceipt> {

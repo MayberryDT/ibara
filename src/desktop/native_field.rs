@@ -119,6 +119,7 @@ macro_rules! api {
 api! {
  init:"atspi_init"=>unsafe extern "C" fn()->i32,
  timeout:"atspi_set_timeout"=>unsafe extern "C" fn(i32,i32),
+ iteration:"g_main_context_iteration"=>unsafe extern "C" fn(Obj,i32)->i32,
  desktop:"atspi_get_desktop"=>unsafe extern "C" fn(i32)->Obj,
  children:"atspi_accessible_get_child_count"=>unsafe extern "C" fn(Obj,ErrPtr)->i32,
  child:"atspi_accessible_get_child_at_index"=>unsafe extern "C" fn(Obj,i32,ErrPtr)->Obj,
@@ -140,8 +141,19 @@ fn valid(error:Obj)->std::result::Result<(),String> { if error.is_null(){Ok(())}
 fn present(obj:Obj)->std::result::Result<Obj,String>{if obj.is_null(){Err("Native accessibility returned no object.".into())}else{Ok(obj)}}
 impl Api {
     fn child_count(&self,node:Obj)->std::result::Result<i32,String>{
-        let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
-        if n<0 {Err("Native child count is invalid.".into())}else{Ok(n)}
+        for attempt in 0..2 {
+            let mut e=std::ptr::null_mut();let n=unsafe{(self.children)(node,&mut e)};valid(e)?;
+            if n>=0 {return Ok(n);}
+            if attempt==0 {
+                // Properties.Get can return -1 without GError while the
+                // isolated process's AT-SPI cache is still being populated.
+                // Drain bounded pending callbacks, then require a real count.
+                for _ in 0..64 {
+                    if unsafe{(self.iteration)(std::ptr::null_mut(),0)}==0 {break;}
+                }
+            }
+        }
+        Err("Native child count is invalid after bounded cache refresh.".into())
     }
     fn child_at(&self,node:Obj,index:i32)->std::result::Result<Obj,String>{
         let mut e=std::ptr::null_mut();let p=unsafe{(self.child)(node,index,&mut e)};valid(e)?;present(p)

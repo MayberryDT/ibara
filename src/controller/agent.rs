@@ -1542,6 +1542,7 @@ impl Controller {
     async fn run_steps(&self, ctx: &CallCtx<'_>, op0: OperationRecord, steps: &[StepSpec], start: usize, mut results: Vec<StepResult>, approved_first: bool) -> Result<Reply> {
         let mut receipt0: Map<String, Value> = op0.receipt.as_object().cloned().unwrap_or_default();
         let mut stop = false;
+        let mut halted = false;
         let mut attention: Option<(usize, String)> = None;
         let mut touched_desktop = false;
         let mut late_windows: Option<(WinKey, Vec<Win>)> = None;
@@ -1551,7 +1552,9 @@ impl Controller {
         for (i, spec) in steps.iter().enumerate().skip(start) {
             if stop || ctx.gone.is_cancelled() {
                 stop = true;
-                let why = if ctx.gone.is_cancelled() { "not run: the caller went away" } else { "not run: an earlier step did not complete" };
+                let why = if ctx.gone.is_cancelled() { "not run: the caller went away" }
+                    else if halted { "not run: the app left a completion selected in the typed field; check it first" }
+                    else { "not run: an earlier step did not complete" };
                 results.push(step_result(i, StepOutcome::NotRun, why, None));
                 continue;
             }
@@ -1743,6 +1746,10 @@ impl Controller {
                         }
                         None => (StepOutcome::Done, String::new()),
                     };
+                    if done.halts && outcome == StepOutcome::Done {
+                        stop = true;
+                        halted = true;
+                    }
                     // What the step itself saw happen (where a clicked page went), then the expectation.
                     let detail = match done.note {
                         Some(note) if awaited.is_empty() => note,

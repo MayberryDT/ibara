@@ -141,6 +141,8 @@ pub struct Done {
     pub note: Option<String>,
     /// Where a click landed, as a fraction of the screen showing it.
     pub point: Option<(f64, f64)>,
+    /// The rest of the batch waits for the agent to read `note`.
+    pub halts: bool,
 }
 
 /// What to capture.

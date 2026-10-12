@@ -66,12 +66,12 @@ impl State {
         if self.shell_input_blocked { return None; }
         self.menu_owner().filter(|owner| self.focused.as_deref() == Some(owner.address.as_str()))
     }
-    /// Owner of the topmost untitled popup, only while the helper reports an
+    /// Owner of the topmost menu window, only while the helper reports an
     /// application grab and no shell modal. Windows arrive bottom to top.
     fn menu_owner(&self) -> Option<&Window> {
         if self.popup_grab != Some(true) || self.shell_modal != Some(false) { return None; }
         let popup = self.windows.iter().rev()
-            .find(|w| w.visible && !w.hidden && !w.modal && w.title.is_empty() && w.class.is_empty() && w.transient_for.is_some())?;
+            .find(|w| w.menu && w.visible && !w.hidden && !w.modal && w.transient_for.is_some())?;
         let owner = popup.transient_for.as_deref()?;
         self.windows.iter().find(|w| w.address == owner && w.visible && !w.hidden)
     }

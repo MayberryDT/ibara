@@ -127,7 +127,8 @@ export default class IbaraIdentity extends Extension {
                 workspace: { id: (window.get_workspace()?.index() ?? -1) + 1 },
                 mapped: true, hidden: window.minimized || !window.showing_on_its_workspace(),
                 visible: window.showing_on_its_workspace() && !window.minimized,
-                acceptsInput: !this._locked() && !shellInputBlocked, focusHistoryID: window === global.display.focus_window ? 0 : 1 };
+                acceptsInput: !this._locked() && !shellInputBlocked, focusHistoryID: window === global.display.focus_window ? 0 : 1,
+                menu: [Meta.WindowType.DROPDOWN_MENU, Meta.WindowType.POPUP_MENU, Meta.WindowType.MENU, Meta.WindowType.COMBO].includes(window.get_window_type()) };
         });
         return JSON.stringify({ epoch: this._epoch, session_generation: this._sessionGeneration, locked: this._locked(),
             capture_api: 1, input_readiness_api: 1, shell_input_blocked: shellInputBlocked,

@@ -106,6 +106,9 @@ pub struct Window {
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i64,
     pub stable_id: Option<String>,
+    /// GNOME types this window as a menu (dropdown, popup or combo), not a
+    /// tooltip; used only to find a menu that holds input.
+    pub menu: bool,
     /// Local /proc and compositor provenance, never accepted from client JSON.
     #[serde(skip_deserializing)]
     pub process_start_ticks: Option<u64>,

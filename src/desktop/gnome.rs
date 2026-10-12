@@ -303,11 +303,6 @@ impl InputTransaction {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let receipt = self.receipt().await?;
-                if !receipt.active || receipt.rejected > previous.rejected {
-                    eprintln!("ibara guarded_input_stopped reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
-                    return Err(IbaraError::new("HUMAN_CONTROL", "Guarded input stopped before completion.", false)
-                        .with("reason", "interrupted").with("execution_not_started", false));
-                }
                 let advanced = match kind {
                     "key" => receipt.key_events > previous.key_events,
                     "button" => receipt.button_events > previous.button_events,
@@ -316,7 +311,18 @@ impl InputTransaction {
                     "scroll" => receipt.scroll_events > previous.scroll_events,
                     _ => false,
                 };
-                if advanced { return Ok(receipt); }
+                // A final released event can close its own modal and retire
+                // the token. Its dispatch counter still proves that event;
+                // it does not authorize another input on the ended token.
+                let released_end = receipt.reason == "ended" && receipt.held == 0;
+                if advanced && receipt.rejected == previous.rejected && (receipt.active || released_end) {
+                    return Ok(receipt);
+                }
+                if !receipt.active || receipt.rejected > previous.rejected {
+                    eprintln!("ibara guarded_input_stopped reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
+                    return Err(IbaraError::new("HUMAN_CONTROL", "Guarded input stopped before completion.", false)
+                        .with("reason", "interrupted").with("execution_not_started", false));
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.map_err(|_| input_unknown("Queued input has no dispatch receipt; do not replay."))?

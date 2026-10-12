@@ -45,6 +45,11 @@ impl Turns {
     pub fn observed_since(&mut self, started_ms: i64) {
         if self.person.is_none() && self.previous.is_some_and(|(_, ended)| started_ms >= ended) { self.previous = None; }
     }
+    /// Whether a person is using the computer or used it since the agent
+    /// last looked; unlike [`Self::before_action`], nothing is cleared, so
+    /// an effect ibara makes on the agent's behalf leaves the refusal for
+    /// the agent's next step.
+    pub fn person_involved(&self) -> bool { self.person.is_some() || self.previous.is_some() }
     pub fn before_action(&mut self) -> Result<()> {
         let error = |reason: &str, message: String| IbaraError::new("CAPABILITY_UNAVAILABLE", message, true)
             .with("reason", reason).with("execution_not_started", true);

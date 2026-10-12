@@ -2598,8 +2598,13 @@ impl Controller {
             focused = self.desktop.windows().await.is_ok_and(|now| now.iter().any(|w| w.address == window.address && w.focused));
         }
         if !focused || abort.is_cancelled() { return; }
-        let gated = self.turns.borrow_mut().before_action().and_then(|()| self.assert_authority(ctx.lease));
-        let result = match gated {
+        // Read the person's turn without clearing it: the agent's next step
+        // must still be told to look again.
+        if self.turns.borrow().person_involved() {
+            self.push_event(Some(ctx.task_ref), "launched window left at its tile size: a person used this computer");
+            return;
+        }
+        let result = match self.assert_authority(ctx.lease) {
             Ok(()) => self.desktop.act(&Effect::Focus(window.key()), abort).await.map(drop),
             Err(error) => Err(error),
         };

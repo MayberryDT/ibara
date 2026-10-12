@@ -424,13 +424,15 @@ impl Cua {
                 } else if inner.shown.load(Ordering::SeqCst) && worker.touched.elapsed() >= SESSION_REFRESH
                     && let Some(label) = worker.session.clone()
                 {
-                    // Keep the drawn cursor's session: the setting it already
-                    // has, no input, no move.
-                    let kept = tokio::time::timeout(READ_TIMEOUT, call_tool(worker, "set_agent_cursor_motion", json!({"session": label, "idle_hide_ms": 0.0}))).await;
+                    // Keep the drawn cursor's session: the motion every move
+                    // starts from (each glide sets its own), no input, no move.
+                    let kept = tokio::time::timeout(READ_TIMEOUT, call_tool(worker, "set_agent_cursor_motion", motion(Some(&label), 1.0))).await;
                     if !matches!(kept, Ok(Ok(Ok(ref answer))) if answer.get("isError").and_then(Value::as_bool) != Some(true)) {
-                        // The handover draws it again before the next input.
+                        // The handover draws it again, in a new session, before
+                        // the next input.
                         crate::controller::log_event("agent_cursor_session_lost", "Cua did not keep the agent's session; its cursor is drawn again");
                         inner.shown.store(false, Ordering::SeqCst);
+                        worker.session = None;
                     }
                 }
             }
@@ -504,9 +506,12 @@ impl Cua {
                 Ok(Ok(Ok(result))) if ended(&result) => {
                     // Cua refused before acting: the session it ended carries
                     // no input. The handover draws the cursor again (with its
-                    // person checks) before the next input; this one is not
-                    // sent again.
+                    // person checks) in a new session before the next input;
+                    // this one is not sent again.
                     self.inner.shown.store(false, Ordering::SeqCst);
+                    if let Some(worker) = slot.as_mut() {
+                        worker.session = None;
+                    }
                     return Err(unavailable("Cua had ended the agent's cursor session, so nothing was sent. Observe again, then try again.")
                         .with("reason", SESSION_ENDED));
                 }
@@ -698,7 +703,9 @@ impl Cua {
         };
         // Entry activation may acknowledge without moving keyboard focus.
         // Use the exact freshly resolved bounds and guarded real pointer.
-        if tool != "click" || editable_role(role) || matches!(role, "table cell" | "spin button" | "slider" | "combo box" | "search box" | "textbox") {
+        // A menu opened through accessibility in a fresh LibreOffice opens
+        // its menu bar's first menu instead (Format opened File).
+        if tool != "click" || editable_role(role) || matches!(role, "table cell" | "spin button" | "slider" | "combo box" | "search box" | "textbox" | "menu") {
             return pointer(None);
         }
         let token = element["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
@@ -1317,6 +1324,9 @@ pub enum MenuMove {
     /// The item is highlighted: `Return` chooses it. Its centre on the
     /// screen, for the agent's cursor.
     Choose(Option<(f64, f64)>),
+    /// `Right` into the submenu at `level` that opened under its highlighted
+    /// entry; `down` presses of `Down` reach the next step from inside it.
+    Enter { level: usize, down: usize },
 }
 
 /// The next [`MenuMove`] for the menu item with `identity` in `snapshot`,
@@ -1372,11 +1382,12 @@ fn menu_move(snapshot: &Value, identity: &Value, role: &str, name: &str) -> Resu
     // Cua gives a submenu entry no `selected` (only menu items); LibreOffice
     // opens a highlighted submenu at once, keeping the keyboard in its
     // parent. So an open submenu is its parent's highlighted entry.
-    let highlighted = shown.iter().position(|e| e["selected"] == true || (e["role"] == "menu" && !entries(e).is_empty()));
+    // A check or radio entry's `selected` is its checked state.
+    let highlighted = shown.iter().position(|e| (e["role"] == "menu item" && e["selected"] == true) || (e["role"] == "menu" && !entries(e).is_empty()));
     if highlighted.is_none() && level > 0 {
         // This submenu opened under its highlighted entry; the keyboard is
         // still in the menu above it.
-        return Ok(MenuMove::Keys("Right", 1));
+        return Ok(MenuMove::Enter { level, down: want + 1 });
     }
     Ok(match highlighted {
         Some(have) if have == want && level + 1 < chain.len() => MenuMove::Keys("Right", 1),

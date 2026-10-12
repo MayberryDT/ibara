@@ -292,7 +292,8 @@ fn stopped(receipt: &InputReceipt) -> IbaraError {
     let person = matches!(receipt.reason.as_str(), "person_input" | "target_or_person_changed");
     if receipt.accepted == 0 && receipt.held == 0 {
         let error = if person {
-            IbaraError::new("HUMAN_CONTROL", "A person used the mouse or keyboard before any input reached the window; nothing was delivered.", true)
+            let who = if receipt.reason == "person_input" { "A person used the mouse or keyboard" } else { "A person, or a focus or window change," };
+            IbaraError::new("HUMAN_CONTROL", format!("{who} stopped the input before any of it reached the window; nothing was delivered."), false)
                 .with("reason", "interrupted")
         } else {
             IbaraError::new("STALE_TARGET", "The window under the input changed before any of it was delivered; nothing was sent to it. Observe again.", true)

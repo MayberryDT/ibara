@@ -51,9 +51,15 @@ const PREVIEW_DEADLINE: Duration = Duration::from_millis(2000);
 /// How long a menu level may take to close after Escape.
 const MENU_CLOSE: Duration = Duration::from_secs(1);
 const MENU_POLL: Duration = Duration::from_millis(50);
-/// After admitted text, how long new read-only observations may start. A
-/// read already started finishes under its own helper bound.
-const READBACK_WINDOW: Duration = Duration::from_secs(3);
+/// After admitted text, how long new read-only observations may start
+/// (LibreOffice on Hyprland fetches a pasted clipboard seconds later, and
+/// a Writer field read takes 2.5 s). A read already started finishes under
+/// its own helper bound.
+const READBACK_WINDOW: Duration = Duration::from_secs(8);
+/// At least this many complete observations, each starting after the last,
+/// before readback gives up, unless [`READBACK_LIMIT`] has passed.
+const READBACK_OBSERVATIONS: usize = 2;
+const READBACK_LIMIT: Duration = Duration::from_secs(14);
 /// Tries of a shortcut after its menu closed (at [`MENU_POLL`]).
 const MENU_RELEASE_TRIES: u32 = 20;
 /// Moves at most to reach a menu item (open, walk, open a submenu, …).
@@ -819,8 +825,17 @@ impl Desktop {
     /// [`MENU_CLOSE`] for the menu to show it; when the item cannot be
     /// reached, the menu is closed again and nothing is chosen.
     async fn choose_menu_item(&self, element: &ElementTarget, pid: i64, window: u64, screens: &Screens, cancel: Option<&Cancel>) -> Result<()> {
+        // Cua reports a check or radio entry's `selected` as checked, so
+        // nothing shows which of them is highlighted: Return could choose
+        // another entry.
+        if matches!(element.role.as_str(), "check menu item" | "radio menu item") {
+            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Nothing was sent: ibara cannot see which check or radio menu entry is highlighted, so it cannot choose one safely.", true)
+                .with("execution_not_started", true)
+                .with("next", "Use the app's keyboard shortcut or the dialog that sets this option, then observe to confirm it."));
+        }
         let read = || self.cua.menu_move(&element.selector, &element.role, &element.name);
         let surface = &element.surface;
+        let mut entered = Vec::new();
         let mut next = read().await?;
         for moved in 0..MENU_MOVES {
             // Once a move went out, a refusal no longer means nothing was sent.
@@ -840,6 +855,14 @@ impl Desktop {
                 }
                 cua::MenuMove::Open(token) => self.cua.click_token(pid, window, token).await.map_err(sent)?,
                 cua::MenuMove::Keys(key, count) => self.menu_keys(surface, key, *count).await.map_err(sent)?,
+                // Into a submenu that opened under its highlighted entry, once:
+                // if it asks again the keyboard is already inside it, on an
+                // entry Cua marks nothing on, so walk down instead.
+                cua::MenuMove::Enter { level, down } if entered.contains(level) => self.menu_keys(surface, "Down", *down).await.map_err(sent)?,
+                cua::MenuMove::Enter { level, .. } => {
+                    entered.push(*level);
+                    self.menu_keys(surface, "Right", 1).await.map_err(sent)?
+                }
             }
             let done = next.clone();
             let start = Instant::now();
@@ -1165,7 +1188,8 @@ impl Desktop {
                         read_back(&live, &self.env, cancel, &expected, &mut last_readback).await.map(drop)
                             .map_err(|mut e| {
                                 if e.code == "OUTCOME_UNKNOWN" {
-                                    e.message = "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.".into();
+                                    let diagnostic = last_readback.as_ref().map(Value::to_string).unwrap_or_else(|| "no complete observation".into());
+                                    e.message = format!("Native paste was sent once, but changed exact text in the focused field was not confirmed. Native readback: {diagnostic}. Observe before acting again.");
                                 }
                                 e.retry_safe = false;
                                 e.with("execution_not_started", false).with("native_readback", last_readback.unwrap_or(Value::Null)).requires_reconciliation()
@@ -1731,9 +1755,11 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 /// last complete observation. Sends no input.
 async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<native_field::Field> {
     let start = Instant::now();
+    let mut observations = 0;
     loop {
         let refused = match native_field::read(live, env, cancel).await {
             Ok(observed) => {
+                observations += 1;
                 *last = Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,
                     "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
                     "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
@@ -1744,7 +1770,8 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
             Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => true,
             Err(error) => return Err(error),
         };
-        if start.elapsed() >= READBACK_WINDOW {
+        let elapsed = start.elapsed();
+        if elapsed >= READBACK_LIMIT || (elapsed >= READBACK_WINDOW && observations >= READBACK_OBSERVATIONS) {
             return Err(IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false).with("reader_refused_last", refused));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

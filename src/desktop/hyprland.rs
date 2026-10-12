@@ -517,6 +517,19 @@ impl Hyprland {
         bound.window_dispatch(lua, &surface.address, "close").await
     }
 
+    /// Maximize a window within its workspace (Hyprland's internal
+    /// fullscreen mode 1, which keeps the bar); the client is not told it is
+    /// full screen. Address, PID and class must still match.
+    pub async fn maximize_surface(&self, surface: &SurfaceId) -> Result<()> {
+        let bound = self.surface_session(surface).await?;
+        let lua = format!(
+            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {} and w.class == {} then target = w break end end; \
+             if not target then error('window not found') end; hl.dispatch(hl.dsp.window.fullscreen_state({{ internal = 1, client = 0, window = target }}))",
+            lua_string(&surface.address), surface.pid, lua_string(&surface.class)
+        );
+        bound.window_dispatch(lua, &surface.address, "maximize").await
+    }
+
     /// Move a window to workspace `workspace` without following it (the
     /// `movetoworkspacesilent` of Hyprland's string dispatchers, in 0.56's Lua
     /// as `hl.dsp.window.move({ workspace, follow = false })`). The window

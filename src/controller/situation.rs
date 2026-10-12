@@ -382,6 +382,9 @@ fn window_line(id: &str, w: &Win) -> String {
     if w.floating {
         line.push_str(" floating");
     }
+    if w.tiled {
+        line.push_str(" tiled; focus maximizes it");
+    }
     line
 }
 

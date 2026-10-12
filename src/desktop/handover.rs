@@ -1675,7 +1675,7 @@ mv "$dir/elements.new" "$dir/elements"
         let screen = Screen::new((500, 400)).await;
         screen.taken().await;
         screen.focus_moves_away();
-        for refused in [screen.desktop.type_text(&screen.surface, "hello", TypingCursor::ToField, None).await, screen.key(None).await] {
+        for refused in [screen.desktop.type_text(&screen.surface, "hello", TypingCursor::ToField, None).await.map(drop), screen.key(None).await] {
             let refused = refused.unwrap_err();
             assert_eq!(refused.code, "STALE_TARGET", "{refused:?}");
             assert_eq!(refused.details["execution_not_started"], serde_json::json!(true), "{refused:?}");

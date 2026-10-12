@@ -704,9 +704,37 @@ impl Desktop {
             let motion = self.cua.motion();
             let _moving = motion.begin();
             if let Some(gnome) = self.hypr.gnome() { return gnome.mutate("Focus", surface).await; }
-            self.hypr.focus_address(&surface.address).await
+            self.hypr.focus_address(&surface.address).await?;
+            self.give_room(surface).await
         })
         .await
+    }
+
+    /// Whether windows tile here (Hyprland), rather than overlap (GNOME).
+    pub fn tiling(&self) -> bool { self.hypr.gnome().is_none() }
+
+    /// A tiled window that shares its workspace with another tiled window
+    /// can be too small to work in (a 466x245 dwindle tile). Maximize it
+    /// there, then wait (at most 2 s) until its geometry holds still, so
+    /// later reads and clicks bind to where it is. Floating, maximized,
+    /// full-screen and lone windows are left as they are.
+    async fn give_room(&self, surface: &SurfaceId) -> Result<()> {
+        let windows = self.hypr.clients().await?;
+        let Some(window) = windows.iter().find(|w| w.is(surface)) else { return Err(stale("Cannot focus a missing surface.")) };
+        let laid = |w: &hyprland::Window| w.mapped && !w.hidden && !w.floating && w.fullscreen == 0;
+        if !laid(window) || !windows.iter().any(|o| o.address != window.address && o.workspace.id == window.workspace.id && laid(o)) {
+            return Ok(());
+        }
+        self.hypr.maximize_surface(surface).await?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut last, mut since) = (None, Instant::now());
+        while Instant::now() < deadline {
+            let now = self.live(surface).await?.map(|w| (w.geometry(), w.fullscreen));
+            if now != last { (last, since) = (now, Instant::now()); }
+            else if last.as_ref().is_some_and(|(_, mode)| *mode != 0) && since.elapsed() >= Duration::from_millis(300) { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 
     /// Ask a window to close (like its close button); the address **and**

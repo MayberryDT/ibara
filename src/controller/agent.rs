@@ -2570,8 +2570,13 @@ impl Controller {
         let started = Instant::now();
         self.mark_effect(Some(task_ref));
         loop {
-            let mapped = self.desktop.windows().await.is_ok_and(|now| now.iter().any(|w| self.claims(&owner, before, w)));
-            if mapped || started.elapsed() >= LAUNCH_WINDOW_WAIT || pause(LAUNCH_WINDOW_POLL, gone).await {
+            let mapped = self.desktop.windows().await.ok().and_then(|now| now.into_iter().find(|w| self.claims(&owner, before, w)));
+            if let Some(window) = mapped.as_ref().filter(|w| w.tiled && w.focused) {
+                // As a focus step would: a launched window tiled beside
+                // others is maximized so the agent can work in it.
+                let _ = self.desktop.act(&Effect::Focus(window.key()), gone).await;
+            }
+            if mapped.is_some() || started.elapsed() >= LAUNCH_WINDOW_WAIT || pause(LAUNCH_WINDOW_POLL, gone).await {
                 break;
             }
         }

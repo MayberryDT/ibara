@@ -54,6 +54,9 @@ pub struct Win {
     pub workspace_id: i64,
     pub fullscreen: bool,
     pub rect: Rect,
+    /// A tiled window sharing its workspace with another tiled window on a
+    /// tiling desktop (Hyprland): focusing it maximizes it there.
+    pub tiled: bool,
 }
 
 impl Win {

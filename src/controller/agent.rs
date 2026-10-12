@@ -1769,7 +1769,7 @@ impl Controller {
                 }
             };
             if outcome == StepOutcome::Done {
-                self.await_launched_window(ctx.task_ref, &windows, &resolved, launched, ctx.gone).await;
+                self.await_launched_window(&ctx, &windows, &resolved, launched).await;
             }
             receipt.insert("elapsed_ms".into(), json!(started.elapsed().as_millis() as u64));
             receipt.insert("step".into(), json!({ "index": i, "describe": resolved.describe, "outcome": outcome_name(outcome) }));
@@ -2561,26 +2561,51 @@ impl Controller {
     /// later. Wait for it, up to `LAUNCH_WINDOW_WAIT`, so it becomes the
     /// task's (finishing closes it) and the frame shows it. Window events
     /// until it maps are the launch's, not a person's.
-    async fn await_launched_window(&self, task_ref: &str, before: &[Win], resolved: &Resolved, launched: Option<u32>, gone: &Cancel) {
+    async fn await_launched_window(&self, ctx: &CallCtx<'_>, before: &[Win], resolved: &Resolved, launched: Option<u32>) {
+        let (task_ref, gone) = (ctx.task_ref, ctx.gone);
         // A launch with neither a pid nor a known class has no window to look for.
         let owner = match step_owner(resolved, None, launched) {
             Some(Owner::Launch { pid: None, class: None }) | Some(Owner::Process(_)) | None => return,
             Some(owner) => owner,
         };
         let started = Instant::now();
+        let (abort, _) = self.abort_handles();
         self.mark_effect(Some(task_ref));
         loop {
             let mapped = self.desktop.windows().await.ok().and_then(|now| now.into_iter().find(|w| self.claims(&owner, before, w)));
-            if let Some(window) = mapped.as_ref().filter(|w| w.tiled && w.focused) {
-                // As a focus step would: a launched window tiled beside
-                // others is maximized so the agent can work in it.
-                let _ = self.desktop.act(&Effect::Focus(window.key()), gone).await;
+            if let Some(window) = &mapped {
+                self.room_for_launched(ctx, &owner, window, &abort).await;
             }
-            if mapped.is_some() || started.elapsed() >= LAUNCH_WINDOW_WAIT || pause(LAUNCH_WINDOW_POLL, gone).await {
+            if mapped.is_some() || started.elapsed() >= LAUNCH_WINDOW_WAIT || abort.is_cancelled() || pause(LAUNCH_WINDOW_POLL, gone).await {
                 break;
             }
         }
         self.mark_effect(None);
+    }
+
+    /// As a focus step would: the launched program's own window, mapped
+    /// tiled beside others, is focused and so maximized. Only a window of
+    /// the launched process tree (never one claimed by class alone), once
+    /// the compositor has given it focus, and only past the same person,
+    /// authority and abort gates as any step. A refusal is an event.
+    async fn room_for_launched(&self, ctx: &CallCtx<'_>, owner: &Owner, window: &Win, abort: &Cancel) {
+        let Owner::Launch { pid: Some(root), .. } = owner else { return };
+        if !window.tiled || !self.descends_from(window.pid, *root) { return; }
+        let mut focused = window.focused;
+        for _ in 0..5 {
+            if focused || abort.is_cancelled() { break; }
+            if pause(Duration::from_millis(100), ctx.gone).await { return; }
+            focused = self.desktop.windows().await.is_ok_and(|now| now.iter().any(|w| w.address == window.address && w.focused));
+        }
+        if !focused || abort.is_cancelled() { return; }
+        let gated = self.turns.borrow_mut().before_action().and_then(|()| self.assert_authority(ctx.lease));
+        let result = match gated {
+            Ok(()) => self.desktop.act(&Effect::Focus(window.key()), abort).await.map(drop),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            self.push_event(Some(ctx.task_ref), &format!("launched window left at its tile size: {}", error.code));
+        }
     }
 
     /// Windows that appeared during a step and belong to it are the task's

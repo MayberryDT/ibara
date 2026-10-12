@@ -135,6 +135,9 @@ impl Reader {
             let node=self.proxy(&path,ACCESSIBLE).await?;
             let role:String=node.call("GetRoleName",&()).await.map_err(|e|e.to_string())?;
             if role.len()>128 {return Err("Invalid native element role".into());}
+            // GTK4 and Qt do not name a password entry as one; its role does.
+            let index:u32=node.call("GetRole",&()).await.map_err(|e|e.to_string())?;
+            let role=if index==40 {"password text".to_owned()} else {role};
             let name=self.name(&path).await?;
             let bits:Vec<u32>=node.call("GetState",&()).await.map_err(|e|e.to_string())?;
             if bits.len()>8 {return Err("Invalid native state mask".into());}

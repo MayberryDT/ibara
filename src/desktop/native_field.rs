@@ -137,6 +137,30 @@ fn failed(step:&str,error:zbus::Error)->String {
     let cause=match error {zbus::Error::MethodError(name,_,_)=>name.to_string(),other=>other.to_string()};
     format!("Native accessibility read failed at {step} ({}); no field was proved.",cause.chars().take(120).collect::<String>())
 }
+/// libatspi 2.60.6's role names (`atspi_role_get_name`), indexed by
+/// `GetRole`. libatspi asked the application's own `GetRoleName` only for
+/// EXTENDED or unknown roles; GTK4 and Qt name a password entry "text box"
+/// and "text" there, so the role must come from this table.
+const ROLE_NAMES:[&str;132]=[
+    "invalid", "accelerator label", "alert", "animation", "arrow", "calendar", "canvas", "check box",
+    "check menu item", "color chooser", "column header", "combo box", "date editor", "desktop icon", "desktop frame", "dial",
+    "dialog", "directory pane", "drawing area", "file chooser", "filler", "focus traversable", "font chooser", "frame",
+    "glass pane", "html container", "icon", "image", "internal frame", "label", "layered pane", "list",
+    "list item", "menu", "menu bar", "menu item", "option pane", "page tab", "page tab list", "panel",
+    "password text", "popup menu", "progress bar", "button", "radio button", "radio menu item", "root pane", "row header",
+    "scroll bar", "scroll pane", "separator", "slider", "spin button", "split pane", "status bar", "table",
+    "table cell", "table column header", "table row header", "tearoff menu item", "terminal", "text", "toggle button", "tool bar",
+    "tool tip", "tree", "tree table", "unknown", "viewport", "window", "extended", "header",
+    "footer", "paragraph", "ruler", "application", "autocomplete", "editbar", "embedded", "entry",
+    "chart", "caption", "document frame", "heading", "page", "section", "redundant object", "form",
+    "link", "input method window", "table row", "tree item", "document spreadsheet", "document presentation", "document text", "document web",
+    "document email", "comment", "list box", "grouping", "image map", "notification", "info bar", "level bar",
+    "title bar", "block quote", "audio", "video", "definition", "article", "landmark", "log",
+    "marquee", "math", "rating", "timer", "static", "math fraction", "math root", "subscript",
+    "superscript", "description list", "description term", "description value", "footnote", "content deletion", "content insertion", "mark",
+    "suggestion", "push button menu", "switch", "last defined",
+];
+const ROLE_EXTENDED:u32=70;
 fn has(states:&[u32],state:usize)->bool {states.get(state/32).is_some_and(|bits|bits&(1<<(state%32))!=0)}
 /// Calls for a whole tree level go out together, a bounded number at a
 /// time: one by one, a 900-object Writer window took 3.5 s, together 0.4 s.
@@ -164,6 +188,8 @@ impl Reader {
         if bits.len()>8 {return Err("Invalid native state mask.".into());}Ok(bits)
     }
     async fn role(&self,node:&OwnedObjectPath)->std::result::Result<String,String> {
+        let index:u32=self.call("role",node,ACCESSIBLE,"GetRole",&()).await?;
+        if let Some(name)=ROLE_NAMES.get(index as usize).filter(|_|index!=ROLE_EXTENDED) {return Ok((*name).to_owned());}
         let role:String=self.call("role",node,ACCESSIBLE,"GetRoleName",&()).await?;
         if role.len()>128 {return Err("Invalid native field role.".into());}Ok(role)
     }
@@ -245,6 +271,11 @@ impl Reader {
                 }
                 if count>0 {parents.push((node,path,count));}
             }
+            // As the depth-first walk did: more than 4096 objects is incomplete,
+            // refused before their references are fetched.
+            if parents.iter().try_fold(visited,|n,(_,_,count)|n.checked_add(*count as usize)).is_none_or(|n|n>4096) {
+                return Err("Native field traversal was incomplete.".into());
+            }
             let children=all(parents.iter().map(|(node,_,count)|self.children(node,*count))).await?;
             level=parents.into_iter().zip(children).flat_map(|((node,path,_),children)|children.into_iter().enumerate().map(move |(i,child)|{
                 let mut path=path.clone();path.push(i as i32);(child,Some(node.clone()),path)
@@ -303,27 +334,34 @@ async fn read_field(pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]
     let registry=Proxy::new(&connection,"org.a11y.atspi.Registry","/org/a11y/atspi/accessible/root",ACCESSIBLE).await.map_err(|e|failed("desktop",e))?;
     let applications:Vec<Reference>=registry.call("GetChildren",&()).await.map_err(|e|failed("desktop",e))?;
     if applications.len()>4096{return Err("Native application count exceeds its limit.".into());}
+    // Just after a compositor resize (a maximize on focus) the application
+    // may not have relaid its top-level yet. Look again briefly; a second
+    // match still refuses at once.
     let mut windows=Vec::new();
-    for (name,app) in applications {
-        // The PID is the bus owner's, from the bus itself; an application
-        // that has gone away is skipped.
-        let Ok(owner)=dbus.call::<_,_,String>("GetNameOwner",&(name,)).await else {continue};
-        let Ok(got)=dbus.call::<_,_,u32>("GetConnectionUnixProcessID",&(&owner,)).await else {continue};
-        if got!=pid {continue;}
-        let reader=Reader{connection:connection.clone(),owner};
-        let children=reader.child_count(&app).await.map_err(|e|format!("{e} at selected application"))?;
-        if children>4096{return Err("Native window count exceeds its limit.".into());}
-        for j in 0..children {
-            let w=reader.child_at(&app,j).await?;
-            let frame=reader.frame_at(&w,0).await?;
-            let states=reader.states(&w).await?;
-            // GTK on Wayland reports screen extents with a window-local
-            // zero origin. Require the unique ACTIVE top-level window in
-            // the compositor-focused PID and exact size, never size alone.
-            let matched=std::iter::once(rect).chain(client).find(|candidate|
-                ((frame[0]==candidate[0] && frame[1]==candidate[1]) || (frame[0]==0 && frame[1]==0)) && frame[2..]==candidate[2..]);
-            if let Some(matched)=matched {if has(&states,1) {windows.push((Reader{connection:connection.clone(),owner:reader.owner.clone()},w,vec![j],matched));}}
+    for attempt in 0..4 {
+        if attempt>0 {tokio::time::sleep(Duration::from_millis(250)).await;}
+        for (name,app) in &applications {
+            // The PID is the bus owner's, from the bus itself; an application
+            // that has gone away is skipped.
+            let Ok(owner)=dbus.call::<_,_,String>("GetNameOwner",&(name,)).await else {continue};
+            let Ok(got)=dbus.call::<_,_,u32>("GetConnectionUnixProcessID",&(&owner,)).await else {continue};
+            if got!=pid {continue;}
+            let reader=Reader{connection:connection.clone(),owner};
+            let children=reader.child_count(&app).await.map_err(|e|format!("{e} at selected application"))?;
+            if children>4096{return Err("Native window count exceeds its limit.".into());}
+            for j in 0..children {
+                let w=reader.child_at(&app,j).await?;
+                let frame=reader.frame_at(&w,0).await?;
+                let states=reader.states(&w).await?;
+                // GTK on Wayland reports screen extents with a window-local
+                // zero origin. Require the unique ACTIVE top-level window in
+                // the compositor-focused PID and exact size, never size alone.
+                let matched=std::iter::once(rect).chain(client).find(|candidate|
+                    ((frame[0]==candidate[0] && frame[1]==candidate[1]) || (frame[0]==0 && frame[1]==0)) && frame[2..]==candidate[2..]);
+                if let Some(matched)=matched {if has(&states,1) {windows.push((Reader{connection:connection.clone(),owner:reader.owner.clone()},w,vec![j],matched));}}
+            }
         }
+        if !windows.is_empty() {break;}
     }
     if windows.len()!=1{return Err("The native window identity could not be proved uniquely.".into());}
     let (reader,w,path,rect)=windows.pop().unwrap();

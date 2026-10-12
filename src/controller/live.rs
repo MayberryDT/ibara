@@ -162,7 +162,7 @@ impl DesktopPort for LiveDesktop {
                         tiled: false,
                     }
                 })
-                .collect::<Vec<_>>()).map(|windows| tiles(self.desktop.tiling(), windows))
+                .map(|w| (w, true)).collect::<Vec<_>>()).map(|windows| tiles(self.desktop.tiling(), windows))
         })
     }
 
@@ -174,10 +174,11 @@ impl DesktopPort for LiveDesktop {
         Box::pin(async move {
             Ok(self.desktop.windows().await?.into_iter().map(|w| {
                 let g = w.geometry();
-                Win { address: w.address, pid: w.pid, class: w.class, title: w.title,
+                let shown = w.mapped && !w.hidden;
+                (Win { address: w.address, pid: w.pid, class: w.class, title: w.title,
                     process_start_ticks: w.process_start_ticks, compositor_instance: w.compositor_instance,
                     focused: false, floating: w.floating, workspace: w.workspace.name,
-                    workspace_id: w.workspace.id, fullscreen: w.fullscreen != 0, rect: rect(g), tiled: false }
+                    workspace_id: w.workspace.id, fullscreen: w.fullscreen != 0, rect: rect(g), tiled: false }, shown)
             }).collect::<Vec<_>>()).map(|windows| tiles(self.desktop.tiling(), windows))
         })
     }
@@ -498,12 +499,11 @@ impl Drop for LiveDesktop {
     }
 }
 
-/// Mark the tiled windows that share a workspace with another tiled window
-/// (see [`Win::tiled`]); none on a desktop that does not tile.
-fn tiles(tiling: bool, mut windows: Vec<Win>) -> Vec<Win> {
-    if !tiling { return windows; }
-    let laid = |w: &Win| !w.floating && !w.fullscreen;
-    let marks: Vec<bool> = windows.iter().map(|w| laid(w) && windows.iter().any(|o| o.address != w.address && o.workspace_id == w.workspace_id && laid(o))).collect();
-    for (w, tiled) in windows.iter_mut().zip(marks) { w.tiled = tiled; }
-    windows
+/// Mark the shown tiled windows that share a workspace with another shown
+/// tiled window (see [`Win::tiled`]); none on a desktop that does not tile.
+fn tiles(tiling: bool, windows: Vec<(Win, bool)>) -> Vec<Win> {
+    let laid = |(w, shown): &(Win, bool)| *shown && !w.floating && !w.fullscreen;
+    let marks: Vec<bool> = windows.iter().map(|w| tiling && laid(w)
+        && windows.iter().any(|o| o.0.address != w.0.address && o.0.workspace_id == w.0.workspace_id && laid(o))).collect();
+    windows.into_iter().zip(marks).map(|((mut w, _), tiled)| { w.tiled = tiled; w }).collect()
 }

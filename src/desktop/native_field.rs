@@ -66,6 +66,16 @@ impl Field {
 }
 fn refused(message: impl Into<String>) -> IbaraError { IbaraError::new("CAPABILITY_UNAVAILABLE", message, true).with("execution_not_started", true) }
 pub async fn read(window: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>) -> Result<Field> {
+    read_with(window, env, cancel, None).await
+}
+/// After admitted input: only the field at `path` in the same proven
+/// window, which must still be the focused editable field. Walking the whole
+/// window again (toolbars, sidebar) loses replies while the app is busy
+/// with the input. Uniqueness was proved by the full read before input.
+pub async fn read_at(window: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, path: &[i32]) -> Result<Field> {
+    read_with(window, env, cancel, Some(path)).await
+}
+async fn read_with(window: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, target: Option<&[i32]>) -> Result<Field> {
     let buffer=if window.address.starts_with("gnome:") && window.buffer_rect.is_some() {Some(super::native_elements::buffer_rect(window).map_err(refused)?)} else {None};
     let rect=buffer.or(window.client_rect).map(|[x,y,width,height]|super::hyprland::Rect{x,y,width,height}).unwrap_or_else(||window.geometry());
     let frame=window.geometry();
@@ -85,6 +95,10 @@ pub async fn read(window: &Window, env: &[(OsString, OsString)], cancel: Option<
                 client[1].checked_add(client[3]).is_none_or(|end|frame.y.checked_add(frame.height).is_none_or(|bottom|end>bottom)) {return Err(refused("Invalid compositor client rectangle."));}
             cmd=cmd.args(client.map(|n|n.to_string()));
         }
+    }
+    if let Some(path)=target {
+        if path.is_empty() || path.len()>40 || path.iter().any(|i|*i<0) { return Err(refused("The native field path is invalid.")); }
+        cmd=cmd.args(["path".to_string(),path.iter().map(i32::to_string).collect::<Vec<_>>().join(",")]);
     }
     if let Some(c)=cancel { cmd=cmd.cancel(c); }
     let out=run::run(cmd).await?;
@@ -193,6 +207,20 @@ impl Api {
         let states=present(unsafe{(self.states)(node)})?;
         // Hidden/defunct branches cannot contain the current visible edit target.
         if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 { return Ok(()); }
+        if let Some(field)=self.field(node,states,path,origin)? {found.push(field);}
+        // Writer exposes focused paragraphs beneath small virtual containers.
+        // Calc's virtual table can contain millions of cells. Search only a
+        // bounded child list; large virtual containers cannot be enumerated.
+        let count=self.child_count(node).map_err(|e|format!("{e} at native path {path:?}"))?;
+        if count>4096 {
+            if unsafe{(self.has)(states,31)}!=0 { return Ok(()); }
+            return Err("Native field traversal exceeds its limit.".into());
+        }
+        for i in 0..count {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
+        Ok(())
+    }
+    /// The focused editable field at `node`, if it is one.
+    fn field(&self,node:Obj,states:Obj,path:&[i32],origin:Option<[i32;4]>)->std::result::Result<Option<Field>,String>{
         if unsafe{(self.has)(states,12)}!=0 { // ATSPI_STATE_FOCUSED
             let mut e=std::ptr::null_mut();let r=unsafe{(self.role)(node,&mut e)};valid(e)?;present(r.cast())?;
             let role=unsafe{CStr::from_ptr(r)}.to_str().map_err(|_|"Invalid native field role.")?.to_owned();
@@ -233,22 +261,13 @@ impl Api {
                 frame
             } else {self.frame(node)?};
             let paragraphs=if role=="paragraph" {self.paragraph_context(node,path,&value)?}else{None};
-            found.push(Field{path:path.clone(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs});
+            return Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs}));
             }
             }
         }
-        // Writer exposes focused paragraphs beneath small virtual containers.
-        // Calc's virtual table can contain millions of cells. Search only a
-        // bounded child list; large virtual containers cannot be enumerated.
-        let count=self.child_count(node).map_err(|e|format!("{e} at native path {path:?}"))?;
-        if count>4096 {
-            if unsafe{(self.has)(states,31)}!=0 { return Ok(()); }
-            return Err("Native field traversal exceeds its limit.".into());
-        }
-        for i in 0..count {let child=self.child_at(node,i)?;path.push(i);self.walk(child,path,visited,found,origin)?;path.pop();}
-        Ok(())
+        Ok(None)
     }
-    fn read(&self,pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>)->std::result::Result<Field,String>{
+    fn read(&self,pid:u32,rect:[i32;4],window_local:bool,client:Option<[i32;4]>,target:Option<Vec<i32>>)->std::result::Result<Field,String>{
         if unsafe{(self.init)()}!=0{return Err("Native accessibility initialization failed.".into());}
         // A cold LibreOffice accessibility reply can take over one second.
         // The isolated runner still enforces the six-second overall deadline.
@@ -275,6 +294,21 @@ impl Api {
         }
         if windows.len()!=1{return Err("The native window identity could not be proved uniquely.".into());}
         let (w,mut path,rect)=windows.pop().unwrap();
+        if let Some(target)=target {
+            // The same window index, then each child in turn; the node must
+            // still be the visible focused editable field.
+            if target.first()!=path.first() {return Err("The expected native field is no longer in the focused window.".into());}
+            let mut node=w;
+            for (depth,&index) in target.iter().enumerate().skip(1) {
+                let count=self.child_count(node).map_err(|e|format!("{e} at native path {:?}",&target[..depth]))?;
+                if index>=count {return Err("The expected native field is no longer the focused editable field.".into());}
+                node=self.child_at(node,index)?;
+            }
+            let states=present(unsafe{(self.states)(node)})?;
+            if unsafe{(self.has)(states,6)}!=0 || unsafe{(self.has)(states,25)}==0 {return Err("The expected native field is no longer the focused editable field.".into());}
+            let origin=window_local.then_some(rect);
+            return self.field(node,states,&target,origin)?.ok_or_else(||"The expected native field is no longer the focused editable field.".into());
+        }
         // Root desktop application order can change independently; identity is
         // the selected process plus its top-level window index and field path.
         let mut found=Vec::new();self.walk(w,&mut path,&mut 0,&mut found,window_local.then_some(rect))?;
@@ -284,12 +318,19 @@ impl Api {
 /// Private read-only daemon subcommand. The desktop runner owns its deadline.
 pub fn main(args:&[String])->u8 {
     let result=(|| {
-        if args.len()!=5 && !((args.len()==6 || args.len()==10) && args[5]=="window-local") {return Err("Expected native-field PID X Y WIDTH HEIGHT [window-local].".into());}
+        let (args,target)=match args {
+            [rest @ .., flag, spec] if flag=="path" => {
+                let path=spec.split(',').map(|s|s.parse::<i32>().ok().filter(|i|*i>=0)).collect::<Option<Vec<_>>>().filter(|p|!p.is_empty() && p.len()<=40).ok_or("Invalid native field path.")?;
+                (rest,Some(path))
+            }
+            _ => (args,None),
+        };
+        if args.len()!=5 && !((args.len()==6 || args.len()==10) && args[5]=="window-local") {return Err("Expected native-field PID X Y WIDTH HEIGHT [window-local] [path P].".into());}
         let pid=args[0].parse::<u32>().map_err(|_|"Invalid native PID.")?;
         let mut rect=[0;4];for (dst,s) in rect.iter_mut().zip(&args[1..]){*dst=s.parse().map_err(|_|"Invalid native window geometry.")?;}
         if pid==0 || rect[2]<=0 || rect[3]<=0{return Err("Invalid native window identity.".into());}
         let client=if args.len()==10 {let mut client=[0;4];for (dst,s) in client.iter_mut().zip(&args[6..]){*dst=s.parse().map_err(|_|"Invalid native client geometry.")?;}if client[2]<=0 || client[3]<=0{return Err("Invalid native client identity.".into());}Some(client)}else{None};
-        unsafe{Api::load()}?.read(pid,rect,args.len()>=6,client)
+        unsafe{Api::load()}?.read(pid,rect,args.len()>=6,client,target)
     })();
     match result {Ok(f)=>{println!("{}",serde_json::to_string(&f).unwrap());0},Err(e)=>{eprintln!("{e}");1}}
 }

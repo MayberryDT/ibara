@@ -1757,7 +1757,7 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
     let start = Instant::now();
     let mut observations = 0;
     loop {
-        let refused = match native_field::read(live, env, cancel).await {
+        let refused = match native_field::read_at(live, env, cancel, &expected.path).await {
             Ok(observed) => {
                 observations += 1;
                 *last = Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,

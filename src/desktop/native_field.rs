@@ -142,7 +142,7 @@ impl Api {
         let mut e=std::ptr::null_mut();let role=unsafe{(self.role)(parent,&mut e)};valid(e)?;present(role.cast())?;
         if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"document text" {return Ok(None);}
         let count=self.child_count(parent)?;
-        if !(1..=512).contains(&count){return Ok(None);}
+        if !(1..=512).contains(&count){return Err("Native paragraph count exceeds readback capacity.".into());}
         let mut values=Vec::new();let mut chars=0usize;
         for i in 0..count {
             let child=self.child_at(parent,i)?;
@@ -150,8 +150,8 @@ impl Api {
             if unsafe{CStr::from_ptr(role)}.to_bytes()!=b"paragraph" {return Ok(None);}
             let text=unsafe{(self.text)(child)};if text.is_null(){return Ok(None);}
             let mut e=std::ptr::null_mut();let n=unsafe{(self.count)(text,&mut e)};valid(e)?;
-            if n<0 || n>131072 {return Ok(None);}
-            chars+=n as usize;if chars>131072{return Ok(None);}
+            if n<0 || n>131072 {return Err("Native paragraph text exceeds readback capacity.".into());}
+            chars+=n as usize;if chars>131072{return Err("Native paragraph context exceeds readback capacity.".into());}
             let mut e=std::ptr::null_mut();let text=unsafe{(self.value)(text,0,n,&mut e)};valid(e)?;present(text.cast())?;
             let text=unsafe{CStr::from_ptr(text)}.to_str().map_err(|_|"Invalid native paragraph text.")?.to_owned();
             if text.chars().count()!=n as usize{return Err("Native paragraph text changed during observation.".into());}

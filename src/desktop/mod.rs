@@ -1090,14 +1090,19 @@ impl Desktop {
                         let expected=before.after_insertion(piece)?;
                         transaction.text(piece).await?;
                         admitted+=piece.chars().count();
+                        let mut last_readback=None;
                         let observed=tokio::time::timeout(Duration::from_secs(3),async {
                             loop {
                                 let observed=native_field::read(&live,&self.env,cancel).await?;
+                                last_readback=Some(json!({"window_matches":expected.window_frame==observed.window_frame,
+                                    "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
+                                    "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
+                                    "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));
                                 if expected.confirms_insertion(&observed) { return Ok::<_,IbaraError>(observed); }
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
-                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted, but exact field/caret/selection readback was not confirmed. Reobserve before retrying.", false)
-                            .with("execution_not_started",false).requires_reconciliation())??;
+                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", format!("Native text was admitted; readback unconfirmed ({}). Reobserve; never replay admitted input.",last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation before deadline".into())), false)
+                            .with("execution_not_started",false).with("native_readback",last_readback.unwrap_or(Value::Null)).requires_reconciliation())??;
                         confirmed+=piece.chars().count();
                         before=observed;
                         offset=end;

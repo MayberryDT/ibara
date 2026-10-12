@@ -19,7 +19,11 @@ impl Field {
         self.path == observed.path && self.role == observed.role && self.value == observed.value &&
             self.caret == observed.caret && self.selections == observed.selections && self.paragraphs == observed.paragraphs
     }
-    pub fn after_insertion(&self, text: &str) -> Result<Field> {
+    pub fn after_insertion(&self, text: &str) -> Result<Field> {self.inserted(text,false)}
+    /// Clipboard newlines split paragraphs; direct native text inserts soft
+    /// breaks. Only inserted boundaries may change the sibling structure.
+    pub fn after_paste(&self, text: &str) -> Result<Field> {self.inserted(text,true)}
+    fn inserted(&self, text: &str, clipboard: bool) -> Result<Field> {
         let count=self.value.chars().count();
         let caret=self.caret.filter(|n| *n>=0 && *n as usize<=count)
             .ok_or_else(||refused("Native caret offset is unavailable."))?;
@@ -35,28 +39,26 @@ impl Field {
         if after.value.chars().count()>131072 {return Err(refused("Resulting text exceeds native readback capacity."));}
         after.caret=Some(start+text.chars().count() as i32);
         after.selections=Some(Vec::new());
+        let splits=clipboard && self.role=="paragraph" && text.contains('\n');
+        if splits && after.paragraphs.is_none() {
+            return Err(refused("Complete native paragraph context is required for multiline paste."));
+        }
         if let Some(paragraphs)=&mut after.paragraphs {
             let index=*self.path.last().ok_or_else(||refused("Native paragraph path is unavailable."))? as usize;
             if paragraphs.get(index)!=Some(&self.value) {return Err(refused("Native paragraph context is inconsistent."));}
-            paragraphs[index]=after.value.clone();
-        }
-        Ok(after)
-    }
-    /// Clipboard newlines split Writer paragraphs; direct native text may
-    /// insert soft line breaks. Prove the entire bounded sibling context.
-    pub fn after_paste(&self, text: &str) -> Result<Field> {
-        let mut after=self.after_insertion(text)?;
-        if self.role=="paragraph" && text.contains('\n') {
-            let paragraphs=after.paragraphs.as_mut().ok_or_else(||refused("Complete native paragraph context is required for multiline paste."))?;
-            let index=*self.path.last().ok_or_else(||refused("Native paragraph path is unavailable."))? as usize;
-            let parts:Vec<String>=after.value.split('\n').map(str::to_owned).collect();
-            let caret=after.caret.unwrap() as usize;
-            let prefix:String=after.value.chars().take(caret).collect();
-            let next=index+prefix.matches('\n').count();
-            after.caret=Some(prefix.rsplit('\n').next().unwrap().chars().count() as i32);
-            paragraphs.splice(index..=index,parts);
-            after.value=paragraphs[next].clone();
-            *after.path.last_mut().unwrap()=next as i32;
+            if splits {
+                let mut parts:Vec<String>=text.split('\n').map(str::to_owned).collect();
+                let next=index+parts.len()-1;
+                after.caret=Some(parts.last().unwrap().chars().count() as i32);
+                parts[0]=format!("{}{}",&self.value[..offset(start)],parts[0]);
+                parts.last_mut().unwrap().push_str(&self.value[offset(end)..]);
+                paragraphs.splice(index..=index,parts);
+                after.value=paragraphs[next].clone();
+                *after.path.last_mut().unwrap()=next as i32;
+            } else {paragraphs[index]=after.value.clone();}
+            if paragraphs.len()>512 || paragraphs.iter().map(|p|p.chars().count()).sum::<usize>()>131072 {
+                return Err(refused("Resulting paragraphs exceed native readback capacity."));
+            }
         }
         Ok(after)
     }

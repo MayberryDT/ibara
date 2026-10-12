@@ -21,6 +21,31 @@ impl Field {
         self.window_frame == observed.window_frame && self.path == observed.path && self.role == observed.role && self.value == observed.value &&
             self.caret == observed.caret && self.selections == observed.selections && self.paragraphs == observed.paragraphs
     }
+    /// The same insertion after the application scrolled. LibreOffice lists
+    /// only the paragraphs on screen, so a long insertion that scrolls the
+    /// view moves the typed paragraph to another child index under the same
+    /// parent. `observed` must be the unique focused field (a full read) with
+    /// exactly the expected window, role, value, caret and selections. When
+    /// both sides have paragraph context, every observed paragraph that was
+    /// on screen before must be unchanged at the shifted index; paragraphs
+    /// scrolled in from beyond either end are not compared.
+    pub fn confirms_scrolled(&self, observed: &Field) -> bool {
+        if self.window_frame != observed.window_frame || self.role != observed.role || self.value != observed.value
+            || self.caret != observed.caret || self.selections != observed.selections { return false; }
+        let (Some((&expected_at, parent)), Some((&observed_at, observed_parent))) = (self.path.split_last(), observed.path.split_last()) else { return false };
+        if parent != observed_parent { return false; }
+        match (&self.paragraphs, &observed.paragraphs) {
+            (Some(expected), Some(seen)) => {
+                let shift = i64::from(expected_at) - i64::from(observed_at);
+                seen.get(observed_at as usize) == Some(&self.value)
+                    && seen.iter().enumerate().all(|(i, p)| {
+                        let j = i as i64 + shift;
+                        j < 0 || j >= expected.len() as i64 || expected[j as usize] == *p
+                    })
+            }
+            _ => true,
+        }
+    }
     /// Characters an application added right after a confirmed insertion
     /// and left selected (GTK entry completion): typing replaces them and
     /// Return accepts them. `self` is the expected field after insertion.

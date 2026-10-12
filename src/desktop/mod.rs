@@ -1782,6 +1782,7 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<(native_field::Field, Option<usize>)> {
     let start = Instant::now();
     let mut observations = 0;
+    let mut reads = 0u32;
     loop {
         let refused = match native_field::read_at(live, env, cancel, &expected.path).await {
             Ok(observed) => {
@@ -1794,9 +1795,14 @@ async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&
                 if let Some(added) = expected.completion_after(&observed) { return Ok((observed, Some(added))); }
                 false
             }
-            Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => true,
+            Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => {
+                // Reader refusals carry no field text; keep the last one for the diagnostic.
+                if observations == 0 { *last = Some(serde_json::json!({"reader_refused": clip_string(&error.message, 200), "reads": reads + 1})); }
+                true
+            }
             Err(error) => return Err(error),
         };
+        reads += 1;
         let elapsed = start.elapsed();
         if elapsed >= READBACK_LIMIT || (elapsed >= READBACK_WINDOW && observations >= READBACK_OBSERVATIONS) {
             return Err(IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false).with("reader_refused_last", refused));

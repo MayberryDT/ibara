@@ -51,6 +51,9 @@ const PREVIEW_DEADLINE: Duration = Duration::from_millis(2000);
 /// How long a menu level may take to close after Escape.
 const MENU_CLOSE: Duration = Duration::from_secs(1);
 const MENU_POLL: Duration = Duration::from_millis(50);
+/// After admitted text, how long new read-only observations may start. A
+/// read already started finishes under its own helper bound.
+const READBACK_WINDOW: Duration = Duration::from_secs(3);
 /// Tries of a shortcut after its menu closed (at [`MENU_POLL`]).
 const MENU_RELEASE_TRIES: u32 = 20;
 /// Moves at most to reach a menu item (open, walk, open a submenu, …).
@@ -1091,17 +1094,7 @@ impl Desktop {
                         transaction.text(piece).await?;
                         admitted+=piece.chars().count();
                         let mut last_readback=None;
-                        let observed=tokio::time::timeout(Duration::from_secs(3),async {
-                            loop {
-                                let observed=native_field::read(&live,&self.env,cancel).await?;
-                                last_readback=Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,
-                                    "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
-                                    "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
-                                    "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));
-                                if expected.confirms_insertion(&observed) { return Ok::<_,IbaraError>(observed); }
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false)).and_then(|result|result)
+                        let observed=read_back(&live,&self.env,cancel,&expected,&mut last_readback).await
                             .map_err(|mut error| {
                                 let diagnostic=last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation".into());
                                 error.message=format!("{} Native readback: {diagnostic}. Reobserve before further input.",error.message);
@@ -1168,12 +1161,15 @@ impl Desktop {
                         } else {
                             self.cua.key(live.pid, window, &keys).await?;
                         }
-                        async {
-                            let after = native_field::read(&live, &self.env, cancel).await?;
-                            if expected.confirms_insertion(&after) { Ok(()) }
-                            else { Err(IbaraError::new("OUTCOME_UNKNOWN", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
-                        }.await
-                            .map_err(|mut e| { e.retry_safe = false; e.with("execution_not_started", false).requires_reconciliation() })
+                        let mut last_readback = None;
+                        read_back(&live, &self.env, cancel, &expected, &mut last_readback).await.map(drop)
+                            .map_err(|mut e| {
+                                if e.code == "OUTCOME_UNKNOWN" {
+                                    e.message = "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.".into();
+                                }
+                                e.retry_safe = false;
+                                e.with("execution_not_started", false).with("native_readback", last_readback.unwrap_or(Value::Null)).requires_reconciliation()
+                            })
                     }.await;
                     let restored = tokio::task::spawn_blocking(move || saved_back.put_back()).await
                         .map_err(|e| crate::error::internal(format!("clipboard: {e}")))?;
@@ -1725,6 +1721,34 @@ pub(crate) fn write_script(path: &Path, body: &str) {
         .unwrap();
     sh.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
     assert!(sh.wait().unwrap().success(), "could not write {}", path.display());
+}
+
+/// After text was admitted once, read the focused field until it shows
+/// exactly `expected`. Each read is awaited to its own helper bound, so no
+/// helper is left running; no new read starts after [`READBACK_WINDOW`]. A
+/// reader refusal or helper timeout is read again; cancellation and any
+/// other error stop at once. `last` keeps only boolean comparisons of the
+/// last complete observation. Sends no input.
+async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<native_field::Field> {
+    let start = Instant::now();
+    loop {
+        let refused = match native_field::read(live, env, cancel).await {
+            Ok(observed) => {
+                *last = Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,
+                    "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
+                    "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
+                    "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));
+                if expected.confirms_insertion(&observed) { return Ok(observed); }
+                false
+            }
+            Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => true,
+            Err(error) => return Err(error),
+        };
+        if start.elapsed() >= READBACK_WINDOW {
+            return Err(IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false).with("reader_refused_last", refused));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]

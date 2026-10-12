@@ -77,6 +77,13 @@ const WALK_BUDGET: Duration = Duration::from_secs(10);
 const FIELD_LOOK: Duration = Duration::from_secs(1);
 /// One input action. Only a guard against a hung worker.
 const ACT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Refresh the shown cursor's session after this long without a call that
+/// carries it. Cua 0.34.1 ends a named session idle for 300 s (probed:
+/// `get_session` does not reset idle; any call carrying the session does),
+/// and input through Hyprland or reads never carries it.
+const SESSION_REFRESH: Duration = Duration::from_secs(120);
+/// Cua's refusal of a call on a session it has ended, before acting.
+const SESSION_ENDED: &str = "session_ended";
 /// Longest a handoff waits for the Cua action in flight.
 pub const SETTLE: Duration = Duration::from_secs(20);
 /// Largest accessibility snapshot requested.
@@ -192,6 +199,9 @@ struct Worker {
     next_id: u64,
     /// The Cua session (agent cursor) currently open, by label.
     session: Option<String>,
+    /// When a call last carried a session: Cua 0.34 ends a named session
+    /// after 300 s without one ([`SESSION_REFRESH`]).
+    touched: Instant,
 }
 
 struct Inner {
@@ -359,7 +369,7 @@ impl Cua {
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(unavailable("Cua pipes unavailable."));
         };
-        let mut worker = Worker { child, stdin, stdout: BufReader::new(stdout), next_id: 0, session: None };
+        let mut worker = Worker { child, stdin, stdout: BufReader::new(stdout), next_id: 0, session: None, touched: Instant::now() };
         let hello = json!({
             "protocolVersion": "2025-06-18",
             "capabilities": {},
@@ -411,6 +421,17 @@ impl Cua {
                     inner.shown.store(false, Ordering::SeqCst);
                     let label = worker.session.take().unwrap_or_default();
                     let _ = tokio::time::timeout(READ_TIMEOUT, call_tool(worker, "end_session", json!({"session": label}))).await;
+                } else if inner.shown.load(Ordering::SeqCst) && worker.touched.elapsed() >= SESSION_REFRESH
+                    && let Some(label) = worker.session.clone()
+                {
+                    // Keep the drawn cursor's session: the setting it already
+                    // has, no input, no move.
+                    let kept = tokio::time::timeout(READ_TIMEOUT, call_tool(worker, "set_agent_cursor_motion", json!({"session": label, "idle_hide_ms": 0.0}))).await;
+                    if !matches!(kept, Ok(Ok(Ok(ref answer))) if answer.get("isError").and_then(Value::as_bool) != Some(true)) {
+                        // The handover draws it again before the next input.
+                        crate::controller::log_event("agent_cursor_session_lost", "Cua did not keep the agent's session; its cursor is drawn again");
+                        inner.shown.store(false, Ordering::SeqCst);
+                    }
                 }
             }
         });
@@ -480,6 +501,15 @@ impl Cua {
                 }
             }
             let outcome = match reply {
+                Ok(Ok(Ok(result))) if ended(&result) => {
+                    // Cua refused before acting: the session it ended carries
+                    // no input. The handover draws the cursor again (with its
+                    // person checks) before the next input; this one is not
+                    // sent again.
+                    self.inner.shown.store(false, Ordering::SeqCst);
+                    return Err(unavailable("Cua had ended the agent's cursor session, so nothing was sent. Observe again, then try again.")
+                        .with("reason", SESSION_ENDED));
+                }
                 Ok(Ok(Ok(result))) => result,
                 // Cua answered, so the worker is still in step; only the call failed.
                 Ok(Ok(Err(rejection))) => return Err(rejection.error(tool, mutates)),
@@ -595,12 +625,21 @@ impl Cua {
             actions: strings(&element["actions"]),
             text,
         };
+        // A GTK 3 dialog's snapshot may start below its header bar: its
+        // file chooser is a root there (47 px down in a Save dialog), not
+        // the window, so it counts only when it is the whole window.
+        let bounds = &snapshot["window_bounds"];
+        let whole = |frame: &[f64; 4]| bounds["width"].as_f64() == Some(frame[2]) && bounds["height"].as_f64() == Some(frame[3]);
         let top = snapshot["elements"]
             .as_array()
             .into_iter()
             .flatten()
-            .find(|e| e["parent_index"].is_null() && matches!(e["role"].as_str(), Some("frame" | "window" | "dialog" | "alert" | "file chooser")))
-            .and_then(frame_of);
+            .filter(|e| e["parent_index"].is_null())
+            .find_map(|e| match e["role"].as_str() {
+                Some("frame" | "window" | "dialog" | "alert") => frame_of(e),
+                Some("file chooser") => frame_of(e).filter(whole),
+                _ => None,
+            });
         Ok((element.clone(), resolved, top))
     }
 
@@ -1330,7 +1369,16 @@ fn menu_move(snapshot: &Value, identity: &Value, role: &str, name: &str) -> Resu
         .iter()
         .position(|e| e["element_index"] == step["element_index"])
         .ok_or_else(|| stale("The menu item is not shown in its open menu; observe again."))?;
-    Ok(match shown.iter().position(|e| e["selected"] == true) {
+    // Cua gives a submenu entry no `selected` (only menu items); LibreOffice
+    // opens a highlighted submenu at once, keeping the keyboard in its
+    // parent. So an open submenu is its parent's highlighted entry.
+    let highlighted = shown.iter().position(|e| e["selected"] == true || (e["role"] == "menu" && !entries(e).is_empty()));
+    if highlighted.is_none() && level > 0 {
+        // This submenu opened under its highlighted entry; the keyboard is
+        // still in the menu above it.
+        return Ok(MenuMove::Keys("Right", 1));
+    }
+    Ok(match highlighted {
         Some(have) if have == want && level + 1 < chain.len() => MenuMove::Keys("Right", 1),
         Some(have) if have == want => {
             let f = &step["frame"];
@@ -1688,7 +1736,17 @@ async fn request(worker: &mut Worker, method: &str, params: Value) -> Result<Ans
 }
 
 async fn call_tool(worker: &mut Worker, tool: &str, args: Value) -> Result<Answer> {
+    if args["session"].is_string() {
+        worker.touched = Instant::now();
+    }
     request(worker, "tools/call", json!({"name": tool, "arguments": args})).await
+}
+
+/// Cua refused a call because its named session had ended (Cua 0.34.1:
+/// `status: refused`, `refusal.code: session_ended`), before acting.
+fn ended(outcome: &Value) -> bool {
+    let sc = &outcome["structuredContent"];
+    outcome.get("isError").and_then(Value::as_bool) == Some(true) && sc["status"] == "refused" && sc["refusal"]["code"] == SESSION_ENDED
 }
 
 /// A cursor call's answer: whether Cua did it.

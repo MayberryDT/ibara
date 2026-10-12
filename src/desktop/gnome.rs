@@ -283,6 +283,28 @@ async fn begin_input_on(connection: zbus::Connection, owner: String, surface: &S
     }).await.map_err(|_| input_unknown("Input begin timed out; do not replay."))?
 }
 
+/// Why guarded input stopped, from the helper's receipt. The helper counts
+/// as accepted only events it sent to the exact target in this transaction
+/// (`ibara-input.c`); a rejected event is consumed. So with none accepted and
+/// none held, nothing reached the window. Only the helper's person reasons
+/// name a person.
+fn stopped(receipt: &InputReceipt) -> IbaraError {
+    let person = matches!(receipt.reason.as_str(), "person_input" | "target_or_person_changed");
+    if receipt.accepted == 0 && receipt.held == 0 {
+        let error = if person {
+            IbaraError::new("HUMAN_CONTROL", "A person used the mouse or keyboard before any input reached the window; nothing was delivered.", true)
+                .with("reason", "interrupted")
+        } else {
+            IbaraError::new("STALE_TARGET", "The window under the input changed before any of it was delivered; nothing was sent to it. Observe again.", true)
+                .with("reason", receipt.reason.clone())
+        };
+        return error.with("execution_not_started", true);
+    }
+    let error = IbaraError::new("OUTCOME_UNKNOWN", "Guarded input stopped before completion.", false).requires_reconciliation();
+    let error = if person { error.with("reason", "interrupted") } else { error.with("reason", receipt.reason.clone()) };
+    error.with("execution_not_started", false)
+}
+
 impl InputTransaction {
     async fn proxy(&self) -> Result<zbus::Proxy<'_>> {
         let connection = self.connection.as_ref().ok_or_else(|| input_unknown("Input connection is closed."))?;
@@ -320,8 +342,7 @@ impl InputTransaction {
                 }
                 if !receipt.active || receipt.rejected > previous.rejected {
                     eprintln!("ibara guarded_input_stopped reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
-                    return Err(IbaraError::new("HUMAN_CONTROL", "Guarded input stopped before completion.", false)
-                        .with("reason", "interrupted").with("execution_not_started", false));
+                    return Err(stopped(&receipt));
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

@@ -346,16 +346,29 @@ impl Controller {
         }
         let terminated: Vec<String> = windows.iter().map(|w| format!("{} {}", w.class, w.address)).collect();
         let mut remaining = Some(windows.len());
+        let mut intent = self.journal.desktop_reset()?;
+        intent["force_signals"] = json!([]);
+        intent["force_state"] = json!("incomplete");
+        self.journal.put_desktop_reset(&intent)?;
         for signal in [libc::SIGTERM, libc::SIGKILL] {
-            for (_, _, fd) in &pids {
+            for (pid, start, fd) in &pids {
+                if !allowed()? { return Ok(false); }
+                let mut receipt = self.journal.desktop_reset()?;
+                receipt["force_signals"].as_array_mut().unwrap().push(json!({
+                    "pid":pid,"process_start_ticks":start,"signal":signal,"state":"intent"}));
+                // Durable intent survives a crash or failed post-signal write;
+                // it is never relabelled as an effect that did not start.
+                self.journal.put_desktop_reset(&receipt)?;
                 if !allowed()? { return Ok(false); }
                 // SAFETY: the descriptor binds the verified process incarnation;
                 // null siginfo requests a normal signal, with flags zero.
                 let sent = unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
                     fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) };
-                if sent < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                    return Ok(false);
-                }
+                let error = (sent < 0).then(|| std::io::Error::last_os_error().raw_os_error());
+                let state = if sent >= 0 { "sent" } else if error == Some(Some(libc::ESRCH)) { "gone" } else { "failed" };
+                receipt["force_signals"].as_array_mut().unwrap().last_mut().unwrap()["state"] = json!(state);
+                self.journal.put_desktop_reset(&receipt)?;
+                if state == "failed" { return Ok(false); }
             }
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -376,6 +389,7 @@ impl Controller {
         }
         let mut receipt = self.journal.desktop_reset()?;
         receipt["graceful_cleanup"] = receipt.clone();
+        receipt["force_state"] = json!(if verified { "zero_windows_verified" } else { "incomplete" });
         receipt["state"] = json!(if verified && self.journal.browser_retirement_pending()? { "unsettled" }
             else if verified { "verified" } else { "blocked" });
         receipt["reason"] = if verified { Value::Null } else { json!("windows survived termination") };

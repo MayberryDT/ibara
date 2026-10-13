@@ -412,7 +412,7 @@ impl Controller {
             "computer_finish" => {
                 let input: FinishInput = parse_input(tool, args)?;
                 let (task_ref, request_id) = (input.task_ref.to_string(), input.request_id.to_string());
-                self.finish_lease(principal, connection_id, &task_ref)?;
+                self.require_readable_task(principal, &task_ref)?;
                 self.once(principal, &task_ref, &request_id, args, self.finish(principal, connection_id, agent, args, input)).await
             }
             "computer_procedures" => self.procedures_tool(principal, parse_input(tool, args)?),
@@ -3352,6 +3352,16 @@ impl Controller {
     async fn finish(&self, principal: &str, connection_id: &str, agent: &str, args: &Value, input: FinishInput) -> Result<Reply> {
         let task_ref = input.task_ref.to_string();
         let request_id = input.request_id.to_string();
+        self.require_readable_task(principal, &task_ref)?;
+        // A completed finish has released its lease. Replay its retained receipt
+        // before requiring control, without creating an intent or repeating cleanup.
+        if let Some(op) = self.journal.get_mutation_operation(principal, &task_ref, &request_id)? {
+            let fingerprint = self.journal.fingerprint(&json!({ "tool": "computer_finish", "args": fingerprint_source(args) }));
+            if op.tool != "computer_finish" || !self.journal.fingerprints_equal(&op.fingerprint, &fingerprint) {
+                return Err(fail("REQUEST_CONFLICT", "This request_id was already used with different arguments.", false));
+            }
+            return self.stored_call(&op, &task_ref).unwrap_or_else(|| Err(fail("OUTCOME_UNKNOWN", "An earlier finish with this request_id was interrupted; check the task with computer_status.", false)));
+        }
         let lease = self.finish_lease(principal, connection_id, &task_ref)?;
         let mut task = self.task(&task_ref)?;
         if lease.is_some() {

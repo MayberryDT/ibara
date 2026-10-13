@@ -41,6 +41,7 @@ install -d "$stage/DEBIAN" "$stage/usr/lib/ibara/bin" "$stage/usr/bin" \
 install -m755 "$CARGO_TARGET_DIR/$profile/ibara" "$CARGO_TARGET_DIR/$profile/ibarad" "$stage/usr/lib/ibara/bin/"
 ln -s ../lib/ibara/bin/ibara "$stage/usr/bin/ibara"
 ln -s ../lib/ibara/bin/ibarad "$stage/usr/bin/ibarad"
+bash "$core/packaging/cua/stage.sh" "$stage/usr/lib/ibara/cua" "$build/cua-cache"
 # The active portable viewer is shared with the existing screen protocol.
 # GNOME mechanisms are proven separately; operator setup grants no target access.
 install -m755 "$build/screen-target/$profile/ibara-screen" "$stage/usr/lib/ibara/bin/ibara-screen"

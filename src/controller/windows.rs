@@ -359,6 +359,10 @@ impl Controller {
                 // Durable intent survives a crash or failed post-signal write;
                 // it is never relabelled as an effect that did not start.
                 self.journal.put_desktop_reset(&receipt)?;
+                let signal_data = json!({"pid":pid,"process_start_ticks":start,"signal":signal,"state":"intent"});
+                let intent_event = self.journal.append_event(crate::store::NewEvent {
+                    at:&self.now_iso(),kind:"desktop_reset_signal_intent",task_ref:None,actor:"ibara",
+                    summary:"Disposable cleanup signal intent.",data:&signal_data })?;
                 if !allowed()? { return Ok(false); }
                 // SAFETY: the descriptor binds the verified process incarnation;
                 // null siginfo requests a normal signal, with flags zero.
@@ -368,6 +372,10 @@ impl Controller {
                 let state = if sent >= 0 { "sent" } else if error == Some(Some(libc::ESRCH)) { "gone" } else { "failed" };
                 receipt["force_signals"].as_array_mut().unwrap().last_mut().unwrap()["state"] = json!(state);
                 self.journal.put_desktop_reset(&receipt)?;
+                self.journal.append_event(crate::store::NewEvent {
+                    at:&self.now_iso(),kind:"desktop_reset_signal_outcome",task_ref:None,actor:"ibara",
+                    summary:"Disposable cleanup signal outcome.",
+                    data:&json!({"intent_event":intent_event,"state":state}) })?;
                 if state == "failed" { return Ok(false); }
             }
             let deadline = Instant::now() + Duration::from_secs(5);

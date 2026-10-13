@@ -1,0 +1,10 @@
+[Unit]
+Description=Flush Ibara archive to object storage every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

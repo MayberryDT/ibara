@@ -1,0 +1,11 @@
+[Unit]
+Description=Upload private Ibara facts
+ConditionPathExists=%h/.config/ibara/facts/write.token
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/ibara/facts/upload.env
+ExecStart=/usr/lib/ibara/ops/facts-upload.py
+NoNewPrivileges=yes
+UMask=0077
+TimeoutStartSec=240

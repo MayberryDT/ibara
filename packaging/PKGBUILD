@@ -5,7 +5,7 @@
 # computer, ibara-operator.service for the console), sysusers, tmpfiles, the
 # /dev/uinput rule, the pacman hooks (set up again after an upgrade; rebuild
 # Cua's Hyprland plugin after Hyprland changes), the plugin's source and the
-# console plugin for Omarchy's bar. No Node or Python. Take Control comes with
+# console plugin for Omarchy's bar. Python supports the opt-in facts uploader. Take Control comes with
 # it: ibara-stream and ibara-view are built at the same version from their
 # forks by packaging/release.sh, and installed together with it.
 #
@@ -47,6 +47,7 @@ depends=(
 optdepends=(
   'ufw: firewall rules keeping the agent entry, pairing and streaming on the tailnet'
   'chromium: web pages agents can read and use'
+  'python: opt-in private facts uploader'
 )
 makedepends=('cargo' 'git' 'clang')
 install=ibara.install
@@ -115,6 +116,10 @@ package() {
   install -Dm644 packaging/60-ibara-uinput.rules "$pkgdir/usr/lib/udev/rules.d/60-ibara-uinput.rules"
   install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" packaging/ibara-refresh.hook packaging/ibara-cua.hook
   install -Dm644 skills/ibara/SKILL.md "$pkgdir/usr/share/ibara/skills/ibara/SKILL.md"
+  # Provisioning a token never enables this opt-in timer.
+  install -Dm755 scripts/facts-upload.py "$lib/ops/facts-upload.py"
+  install -Dm644 facts.md "$pkgdir/usr/share/ibara/facts.md"
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" packaging/systemd/ibara-facts-upload.service packaging/systemd/ibara-facts-upload.timer
   # The console runs inside Omarchy's shell, so its window carries the shell's
   # app id; this entry gives it ibara's name, icon and a launcher to open it.
   install -Dm644 packaging/io.zet.ibara.desktop "$pkgdir/usr/share/applications/io.zet.ibara.desktop"

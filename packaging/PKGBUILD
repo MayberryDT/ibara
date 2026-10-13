@@ -51,7 +51,7 @@ optdepends=(
 )
 makedepends=('cargo' 'git' 'clang')
 install=ibara.install
-options=('!lto' '!debug')
+options=('!lto' '!debug' '!strip')
 
 
 prepare() {
@@ -89,6 +89,8 @@ package() {
   install -Dm755 "$built/ibara" "$lib/bin/ibara"
   install -Dm755 "$built/ibarad" "$lib/bin/ibarad"
   install -Dm755 "$built/ibara-screen" "$lib/bin/ibara-screen"
+  # Keep the pinned external toolkit byte-identical to its upstream archive.
+  strip --strip-all "$lib/bin/ibara" "$lib/bin/ibarad" "$lib/bin/ibara-screen"
   bash packaging/cua/stage.sh "$lib/cua" "$srcdir/cua-cache"
   install -d "$pkgdir/usr/bin"
   ln -s ../lib/ibara/bin/ibara "$pkgdir/usr/bin/ibara"

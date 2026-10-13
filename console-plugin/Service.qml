@@ -1084,7 +1084,7 @@ Item {
   }
   function hideRequestPopup(ref) {
     var next = Object.assign({}, hiddenRequestPopups)
-    var item = requestItems.filter(function(item) { return item.ref === ref })[0]
+    var item = dropdownRequests.filter(function(item) { return item.ref === ref })[0]
     next[ref] = { at: Date.now(), signature: requestAlertSignature(item) }
     var refs = Object.keys(next).sort(function(a,b) { return Number(next[b].at) - Number(next[a].at) })
     refs.slice(512).forEach(function(key) { delete next[key] })
@@ -1101,7 +1101,12 @@ Item {
   }
   function openRequestSettings() { if (shell) shell.summon("io.zet.ibara", JSON.stringify({ route: "logins" })) }
   readonly property var requestItems: approvals.concat(logins, questions).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
-  readonly property var dropdownRequests: requestItems.concat(needsYou.filter(function(item) { return item.unsupported })).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
+  readonly property var dropdownRequests: requestItems.concat(needsYou.filter(function(item) { return item.unsupported }).map(function(item) {
+    var original = root.attention.filter(function(request) {
+      return String(request.computer_id || "") === item.computer_id && request.ref && request.kind !== "repair" && ["approval", "login", "question"].indexOf(request.kind) === -1
+    })[0]
+    return original ? Object.assign({}, item, { ref: original.ref, at: original.at }) : null
+  }).filter(function(item) { return !!item })).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
   readonly property var popupRequests: requestDismissalsReady && !serviceStopped && requestBool("request_popups") && !requestsInConsole && dndReady && (!requestDnd || requestBool("popup_dnd"))
     ? requestItems.filter(function(item) {
         return root.requestNeedsAlert(item) && root.requestKindEnabled(item.kind) && (item.kind !== "login" || (root.loginNeedsNotification(item) && (item.login.assistance || !root.loginSourceElsewhere(item))))

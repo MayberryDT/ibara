@@ -12,6 +12,7 @@ use crate::error::{IbaraError, Result, invalid};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
+use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
 use tokio::time::{Instant, sleep};
 
 mod editor;
@@ -274,8 +275,113 @@ impl Controller {
     }
 
     /// Called only inside shared settlement, after input/jobs/effects have drained.
-    /// No ownership exceptions on a designated disposable desktop. Never kills apps.
+    /// No ownership exceptions on a designated disposable desktop. Graceful
+    /// retirement first; whatever it leaves open is then terminated, so a
+    /// disposable desktop can recover while settlement authority remains held.
     pub(crate) async fn reset_desktop_windows(&self) -> Result<bool> {
+        let before = self.journal.get_control()?;
+        let verified = self.reset_desktop_windows_gracefully().await?;
+        if verified { return Ok(true); }
+        self.mark_effect(Some("desktop-reset-termination"));
+        let result = self.terminate_leftover_windows(&before).await;
+        self.mark_effect(None);
+        let terminated = result?;
+        if terminated && self.journal.browser_retirement_pending()? {
+            // Process exit is not browser-session retirement. Reconcile the
+            // retained restore state natively before another task is admitted.
+            self.reset_desktop_windows_inner().await
+        } else {
+            Ok(terminated)
+        }
+    }
+
+    /// Ends the processes behind every window graceful cleanup left on a
+    /// disposable desktop: SIGTERM, then SIGKILL, then a zero-window check.
+    /// Never while a lease, a persons pause or a persons control is held.
+    async fn terminate_leftover_windows(&self, before: &crate::store::ControlState) -> Result<bool> {
+        let allowed = || -> Result<bool> {
+            let now = self.journal.get_control()?;
+            Ok((self.disposable_desktop)() && before.settling_generation.is_some()
+                && self.journal.get_active_lease()?.is_none()
+                && self.viewer_state.borrow().owner.is_none()
+                && now.settling_generation == before.settling_generation && now.epoch == before.epoch
+                && now.human_control == before.human_control && now.paused == before.paused
+                && now.pause_origin == before.pause_origin
+                && now.pause_origin != Some(crate::store::PauseOrigin::Person)
+                && (!now.human_control || now.pause_origin == Some(crate::store::PauseOrigin::System)))
+        };
+        if !allowed()? { return Ok(false); }
+        let Ok(windows) = self.desktop.all_windows().await else { return Ok(false) };
+        let me = std::process::id() as i64;
+        let mut pids: Vec<(i64, u64, OwnedFd)> = Vec::new();
+        for window in &windows {
+            let Some(start) = window.process_start_ticks else { return Ok(false) };
+            if window.pid <= 1 || window.pid == me || window.compositor_instance.is_empty() {
+                return Ok(false);
+            }
+            if pids.iter().any(|(pid, ticks, _)| *pid == window.pid && *ticks == start) { continue; }
+            // Open first, then check incarnation: a reused numeric PID cannot
+            // redirect either later signal to a replacement process.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, window.pid as libc::pid_t, 0) };
+            if raw < 0 { return Ok(false); }
+            // SAFETY: successful pidfd_open returned a new owned descriptor.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+            let ticks = std::fs::read_to_string(format!("/proc/{}/stat", window.pid)).ok()
+                .and_then(|stat| stat.rsplit_once(')').and_then(|(_, tail)| tail.split_whitespace().nth(19)?.parse::<u64>().ok()));
+            if ticks != Some(start) { return Ok(false); }
+            pids.push((window.pid, start, fd));
+        }
+        let terminated: Vec<String> = windows.iter().map(|w| format!("{} {}", w.class, w.address)).collect();
+        let mut remaining = Some(windows.len());
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            for (_, _, fd) in &pids {
+                if !allowed()? { return Ok(false); }
+                // SAFETY: the descriptor binds the verified process incarnation;
+                // null siginfo requests a normal signal, with flags zero.
+                let sent = unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) };
+                if sent < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                    return Ok(false);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if !allowed()? { return Ok(false); }
+                remaining = self.desktop.all_windows().await.ok().map(|w| w.len());
+                if remaining == Some(0) || Instant::now() >= deadline { break; }
+                sleep(POLL).await;
+            }
+            if remaining == Some(0) { break; }
+        }
+        let verified = remaining == Some(0);
+        super::log_event("desktop_reset_terminated", &format!("{} window(s), {} process(es), verified {verified}", terminated.len(), pids.len()));
+        if verified {
+            self.timeline("desktop_reset_terminated", None, "ibara", "Closed windows that did not close on request.",
+                json!({"terminated":terminated,"processes":pids.len()}));
+        }
+        let mut receipt = self.journal.desktop_reset()?;
+        receipt["state"] = json!(if verified && self.journal.browser_retirement_pending()? { "unsettled" }
+            else if verified { "verified" } else { "blocked" });
+        receipt["reason"] = if verified { Value::Null } else { json!("windows survived termination") };
+        receipt["remaining"] = json!(remaining);
+        receipt["terminated"] = json!(terminated);
+        receipt["browser_retirement_pending"] = json!(self.journal.browser_retirement_pending()?);
+        if verified {
+            let closed: Vec<Value> = terminated.iter().map(|t| json!(format!("{t} (force-closed)"))).collect();
+            receipt["cleanup"]["left"] = json!([]);
+            match receipt["cleanup"]["closed"].as_array_mut() {
+                Some(list) => list.extend(closed),
+                None => receipt["cleanup"]["closed"] = json!(closed),
+            }
+        } else {
+            let inventory = self.desktop.all_windows().await.ok();
+            receipt["blocked_inventory"] = reset_inventory(inventory.as_deref());
+        }
+        self.journal.put_desktop_reset(&receipt)?;
+        Ok(verified)
+    }
+
+    async fn reset_desktop_windows_gracefully(&self) -> Result<bool> {
         // Every release path (watchdog, admission, finish and reconciliation) comes
         // here. Do not replay uncertain native effects against unchanged clients.
         // A changed client inventory or explicit operator handback permits a new try.
@@ -523,7 +629,7 @@ impl Controller {
             sleep(POLL).await;
         }
         cleanup.left.extend(asked.into_iter().map(|(_,surface)| crate::contract::LeftOpen {
-            surface, reason:"still open; save/close the app during an authorized task or person recovery; no forced termination".into()
+            surface, reason:"still open after a close request; ended by termination if it stays".into()
         }));
         cleanup.left.extend(stale.into_iter().map(|(_, surface)| crate::contract::LeftOpen {
             surface, reason:"close refused: STALE_TARGET; disappearance not verified".into()

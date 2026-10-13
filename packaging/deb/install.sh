@@ -33,7 +33,7 @@ m=json.load(open(sys.argv[1]));role=sys.argv[2]
 assert m['schema_version']==3 and m['name']=='ibara'
 assert m['platform']=={'os':'ubuntu','version':'26.04','architecture':'amd64'} and m['role']==role
 assert re.fullmatch(r'[0-9][A-Za-z0-9.+:-]*',m['version']) and '-dev.' not in m['version']
-native='50.1-0ubuntu2.4+ibara2'
+native='50.1-0ubuntu2.4+ibara3'
 names=['ibara'] if role=='operator' else ['ibara','libmutter-18-0','mutter-common','mutter-common-bin','gir1.2-mutter-18']
 assert len(m['packages'])==len(names) and sorted(p['name'] for p in m['packages'])==sorted(names)
 assert m.get('native')==(None if role=='operator' else {'version':native,'mutter_abi':18,'guard_api':1,'helper_api':1})

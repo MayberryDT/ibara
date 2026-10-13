@@ -1279,8 +1279,8 @@ impl Controller {
         if self.journal.get_control()?.unsettled || self.settling.get() || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
             self.journal.set_control(crate::store::ControlPatch { unsettled: Some(true), ..Default::default() })?;
             if (self.disposable_desktop)() && self.journal.desktop_reset()?["state"] == "blocked" {
-                return Err(fail("CONTROL_UNSETTLED", "The disposable desktop has not reached zero windows.", false)
-                    .requires_reconciliation().with("next", "Ask the person to save/close the resisting app through existing recovery, then hand back. No task was started; do not force-kill apps."));
+                return Err(fail("CONTROL_UNSETTLED", "The disposable desktop has not reached zero windows, even after ending the apps left open.", false)
+                    .requires_reconciliation().with("next", "No task was started. Begin on another ready computer; this one retries cleanup on its own."));
             }
             return Err(fail("CONTROL_UNSETTLED", "Previous controllable work has not settled.", false).requires_reconciliation());
         }
@@ -3453,7 +3453,7 @@ impl Controller {
                     notes.push("Cleanup resolved known task-owned dialogs; saved files were not overwritten. Save required work before finishing.".into());
                 }
                 if reset["state"] != "verified" {
-                    notes.push(format!("Zero-window reset not verified: {}. Computer remains unavailable; no forced termination.",
+                    notes.push(format!("Zero-window reset not verified: {}. Computer remains unavailable until a retry closes them.",
                         reset["reason"].as_str().unwrap_or("window close or settlement did not complete")));
                 }
             } else {

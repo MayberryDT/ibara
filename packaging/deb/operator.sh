@@ -53,6 +53,7 @@ install -m644 "$core/packaging/systemd/ibara-operator.service" "$stage/usr/lib/s
 install -m644 "$core/packaging/deb/io.zet.ibara.desktop" "$stage/usr/share/applications/"
 install -m644 "$core/packaging/icons/io.zet.ibara.svg" "$stage/usr/share/icons/hicolor/scalable/apps/"
 install -m644 "$core/LICENSE" "$stage/usr/share/doc/ibara/copyright"
+install -Dm644 "$core/skills/ibara/SKILL.md" "$stage/usr/share/ibara/skills/ibara/SKILL.md"
 install -m644 "$IBARA_QUICKSHELL_SOURCE/LICENSE" "$stage/usr/share/doc/ibara/quickshell-LICENSE"
 install -m644 "$plugin/LICENSE" "$stage/usr/share/doc/ibara/console-LICENSE"
 cat > "$stage/DEBIAN/control" <<CONTROL

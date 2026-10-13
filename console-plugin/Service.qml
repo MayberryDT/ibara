@@ -1093,14 +1093,15 @@ Item {
     closeStaleApprovalNotices()
   }
   function dismissRequests() {
-    requestItems.forEach(function(item) { root.hideRequestPopup(item.ref) })
-    return JSON.stringify({ remaining: requestItems.filter(function(item) { return root.requestNeedsAlert(item) }).length })
+    dropdownRequests.forEach(function(item) { root.hideRequestPopup(item.ref) })
+    return JSON.stringify({ remaining: dropdownRequests.filter(function(item) { return root.requestNeedsAlert(item) }).length })
   }
   function openRequest(item) {
     if (shell && item) shell.summon("io.zet.ibara", JSON.stringify({ route: "computer", computerId: item.computer_id, focus: "request", ref: item.ref }))
   }
   function openRequestSettings() { if (shell) shell.summon("io.zet.ibara", JSON.stringify({ route: "logins" })) }
   readonly property var requestItems: approvals.concat(logins, questions).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
+  readonly property var dropdownRequests: requestItems.concat(needsYou.filter(function(item) { return item.unsupported })).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
   readonly property var popupRequests: requestDismissalsReady && !serviceStopped && requestBool("request_popups") && !requestsInConsole && dndReady && (!requestDnd || requestBool("popup_dnd"))
     ? requestItems.filter(function(item) {
         return root.requestNeedsAlert(item) && root.requestKindEnabled(item.kind) && (item.kind !== "login" || (root.loginNeedsNotification(item) && (item.login.assistance || !root.loginSourceElsewhere(item))))
@@ -4779,7 +4780,7 @@ Item {
         error: root.lastError,
         computers: root.computers.length,
         needs_you: root.needsYouCount,
-        visible_requests: root.requestItems.filter(function(item) { return root.requestNeedsAlert(item) }).length,
+        visible_requests: root.dropdownRequests.filter(function(item) { return root.requestNeedsAlert(item) }).length,
         dismissals_ready: root.requestDismissalsReady,
         questions: root.questions.length,
         problems: root.problems.map(function(p) { return p.heading })

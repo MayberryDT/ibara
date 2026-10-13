@@ -28,7 +28,7 @@ Panel {
   readonly property var approvals: service && Array.isArray(service.approvals) ? service.approvals : []
   readonly property var logins: service && Array.isArray(service.logins) ? service.logins : []
   readonly property var questions: service && Array.isArray(service.questions) ? service.questions : []
-  readonly property var asks: stopped ? [] : approvals.concat(logins, questions, service && service.needsYou ? service.needsYou.filter(function(n) { return n.unsupported }) : []).filter(function(item) { return root.service && root.service.requestNeedsAlert(item) }).sort(function(a, b) { return a.at - b.at || (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0) })
+  readonly property var asks: stopped || !service || !Array.isArray(service.dropdownRequests) ? [] : service.dropdownRequests.filter(function(item) { return root.service.requestNeedsAlert(item) })
   property int askOffset: 0
   onAsksChanged: if (askOffset >= asks.length) askOffset = 0
   readonly property var shownAsks: asks.slice(askOffset, askOffset + 2)

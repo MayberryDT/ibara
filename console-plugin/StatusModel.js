@@ -343,6 +343,7 @@ function parseEnvelope(text, limit) {
 function transportUnavailable(error) {
   var e = asObject(error), code = String(e.code || ""), message = String(e.message || "")
   if (["PERMISSION_DENIED", "UNAUTHORIZED", "AUTH_REQUIRED", "GRANT_REVOKED"].indexOf(code) !== -1) return false
+  if (code === "OPERATOR_REFUSED" && /^(PERMISSION_DENIED|UNAUTHORIZED|AUTH_REQUIRED|GRANT_REVOKED)\b/.test(message)) return false
   return ["TIMEOUT", "OPERATOR_TRANSPORT_UNAVAILABLE", "SESSION_UNAVAILABLE", "OFFLINE"].indexOf(code) !== -1 ||
     /^(OPERATOR_TRANSPORT_UNAVAILABLE|SESSION_UNAVAILABLE|TIMEOUT)\b/.test(message) ||
     /Operator request failed; inspect target status|^Selected operator transport (timed out|closed|failed)/.test(message)
@@ -350,7 +351,8 @@ function transportUnavailable(error) {
 
 function accessDenied(envelope) {
   var code = String(asObject(envelope.error).code || "")
-  return envelope.connection === "unauthorized" || ["UNAUTHORIZED", "PERMISSION_DENIED", "AUTH_REQUIRED", "GRANT_REVOKED"].indexOf(code) !== -1
+  return envelope.connection === "unauthorized" || ["UNAUTHORIZED", "PERMISSION_DENIED", "AUTH_REQUIRED", "GRANT_REVOKED"].indexOf(code) !== -1 ||
+    (code === "OPERATOR_REFUSED" && /^(PERMISSION_DENIED|UNAUTHORIZED|AUTH_REQUIRED|GRANT_REVOKED)\b/.test(String(asObject(envelope.error).message || "")))
 }
 
 function evidenceLines(detail) {

@@ -102,9 +102,9 @@ package() {
   done
 
   # Cua's Hyprland plugin source (built on each computer) and the browser page reader.
-  git ls-files -z vendor/cua-hyprland-plugin | while IFS= read -r -d '' file; do
-    install -Dm644 "$file" "$lib/cua-hyprland-plugin/${file#vendor/cua-hyprland-plugin/}"
-  done
+  # Source archives intentionally carry no Git metadata. Copy the vendored
+  # tree itself; a missing source directory fails package construction.
+  cp -a vendor/cua-hyprland-plugin "$lib/cua-hyprland-plugin"
   install -Dm644 -t "$lib/chrome-extension" chrome-extension/manifest.json chrome-extension/worker.js chrome-extension/document.js
 
   install -Dm644 -t "$pkgdir/usr/lib/systemd/system" \

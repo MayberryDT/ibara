@@ -25,7 +25,7 @@ function titleCase(value) {
 // becomes plain English that names a place or says ibara is handling it. %NAME% is the computer.
 var CORE_PHRASES = [
   [/The operator reply was lost\./i, "ibara lost the reply, so it can't tell whether this finished."],
-  [/Operator request failed; inspect target status/i, "%NAME% closed the connection; your access may have changed. ibara will check again."],
+  [/Operator request failed; inspect target status/i, "%NAME% isn't answering. ibara may be starting or stopped; it will check again."],
   [/Control response changed target binding/i, "%NAME% changed its pairing during this request. ibara is reconnecting; choose Join again once it answers."],
   [/Handback did not prove settled ownership/i, "%NAME% didn't confirm that the hand back finished. ibara is checking."],
   [/Retained publication is uncertain/i, "ibara can't tell whether the file arrived. Look for it in the Files tab before sending it again."],
@@ -336,6 +336,16 @@ function parseEnvelope(text, limit) {
   var parsed = JSON.parse(raw)
   if (!parsed || typeof parsed !== "object") throw new Error("Invalid envelope")
   return parsed
+}
+
+// Older operator bridges wrap connection failures in OPERATOR_REFUSED.
+// Keep explicit access refusals distinct, even with a failed transport envelope.
+function transportUnavailable(error) {
+  var e = asObject(error), code = String(e.code || ""), message = String(e.message || "")
+  if (["PERMISSION_DENIED", "UNAUTHORIZED", "AUTH_REQUIRED", "GRANT_REVOKED"].indexOf(code) !== -1) return false
+  return ["TIMEOUT", "OPERATOR_TRANSPORT_UNAVAILABLE", "SESSION_UNAVAILABLE", "OFFLINE"].indexOf(code) !== -1 ||
+    /^(OPERATOR_TRANSPORT_UNAVAILABLE|SESSION_UNAVAILABLE|TIMEOUT)\b/.test(message) ||
+    /Operator request failed; inspect target status|^Selected operator transport (timed out|closed|failed)/.test(message)
 }
 
 function accessDenied(envelope) {

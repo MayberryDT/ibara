@@ -271,6 +271,24 @@ impl Reader {
         if value.chars().count()!=count as usize {return Err(changed.into());}
         Ok((count,value))
     }
+    /// Writer can focus the empty selection endpoint while another paragraph
+    /// holds the selected text. One field cannot describe that replacement.
+    async fn paragraph_selection(&self,node:&OwnedObjectPath,parent:Option<&OwnedObjectPath>,path:&[i32])->std::result::Result<(),String>{
+        let parent=parent.ok_or("Native paragraph parent is unavailable.")?;
+        let count=self.child_count(parent).await?;
+        let index=*path.last().ok_or("Native paragraph path is unavailable.")?;
+        if !(1..=512).contains(&count) || index<0 || index>=count {return Err("Native paragraph selection proof is incomplete.".into());}
+        let children=self.children(parent,count).await?;
+        if children.get(index as usize)!=Some(node) {return Err("Native paragraph target changed during observation.".into());}
+        for (i,child) in children.iter().enumerate() {
+            if i==index as usize || self.role(child).await?!="paragraph" {continue;}
+            if !self.implements(child,TEXT).await? {return Err("Native paragraph selection proof is incomplete.".into());}
+            let selected:i32=self.call("paragraph selections",child,TEXT,"GetNSelections",&()).await?;
+            if !(0..=1).contains(&selected) {return Err("Native paragraph selection state is invalid.".into());}
+            if selected>0 {return Err("The selection extends beyond the focused paragraph. Select text within one paragraph, then type again.".into());}
+        }
+        Ok(())
+    }
     async fn paragraph_context(&self,parent:Option<&OwnedObjectPath>,path:&[i32],value:&str)->std::result::Result<Option<Vec<String>>,String>{
         let Some(parent)=parent else {return Ok(None)};
         if self.role(parent).await?!="document text" {return Ok(None);}
@@ -359,6 +377,7 @@ impl Reader {
             frame[1]=frame[1].checked_add(window[1]).ok_or("Invalid native field Y")?;
             frame
         } else {self.frame_at(node,0).await?};
+        if role=="paragraph" {self.paragraph_selection(node,parent,path).await?;}
         let paragraphs=if role=="paragraph" {self.paragraph_context(parent,path,&value).await?}else{None};
         Ok(Some(Field{path:path.to_vec(),value,role,frame,window_frame:origin,caret:Some(caret),selections:Some(selections),paragraphs,changed_from:None}))
     }

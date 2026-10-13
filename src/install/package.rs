@@ -12,7 +12,7 @@ impl Kind {
         let release = std::fs::read_to_string("/etc/os-release").map_err(|_| "Cannot identify this operating system.")?;
         let field = |name: &str| release.lines().find_map(|line| line.split_once('=').filter(|(key, _)| *key == name).map(|(_, value)| value.trim_matches('"'))).unwrap_or("");
         match (field("ID"), field("VERSION_ID"), std::env::consts::ARCH) {
-            ("arch", _, "x86_64") => Ok(Self::Arch),
+            ("arch" | "omarchy", _, "x86_64") => Ok(Self::Arch),
             ("ubuntu", "26.04", "x86_64") => Ok(Self::Ubuntu),
             _ => Err("Package lifecycle supports Arch x86_64 and Ubuntu 26.04 amd64 only.".into()),
         }

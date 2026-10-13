@@ -282,6 +282,8 @@ impl Controller {
         let before = self.journal.get_control()?;
         let verified = self.reset_desktop_windows_gracefully().await?;
         if verified { return Ok(true); }
+        let graceful = self.journal.desktop_reset()?;
+        if graceful["input_settled"] == false { return Ok(false); }
         self.mark_effect(Some("desktop-reset-termination"));
         let result = self.terminate_leftover_windows(&before).await;
         self.mark_effect(None);
@@ -289,7 +291,17 @@ impl Controller {
         if terminated && self.journal.browser_retirement_pending()? {
             // Process exit is not browser-session retirement. Reconcile the
             // retained restore state natively before another task is admitted.
-            self.reset_desktop_windows_inner().await
+            let force = self.journal.desktop_reset()?;
+            let result = self.reset_desktop_windows_gracefully().await;
+            let mut receipt = self.journal.desktop_reset()?;
+            receipt["force_cleanup"] = force.clone();
+            if let Some(closed) = force["cleanup"]["closed"].as_array() {
+                let mut all = closed.clone();
+                if let Some(retired) = receipt["cleanup"]["closed"].as_array() { all.extend(retired.iter().cloned()); }
+                receipt["cleanup"]["closed"] = json!(all);
+            }
+            self.journal.put_desktop_reset(&receipt)?;
+            result
         } else {
             Ok(terminated)
         }
@@ -312,6 +324,7 @@ impl Controller {
         };
         if !allowed()? { return Ok(false); }
         let Ok(windows) = self.desktop.all_windows().await else { return Ok(false) };
+        if !allowed()? { return Ok(false); }
         let me = std::process::id() as i64;
         let mut pids: Vec<(i64, u64, OwnedFd)> = Vec::new();
         for window in &windows {
@@ -348,11 +361,13 @@ impl Controller {
             loop {
                 if !allowed()? { return Ok(false); }
                 remaining = self.desktop.all_windows().await.ok().map(|w| w.len());
+                if !allowed()? { return Ok(false); }
                 if remaining == Some(0) || Instant::now() >= deadline { break; }
                 sleep(POLL).await;
             }
             if remaining == Some(0) { break; }
         }
+        if !allowed()? { return Ok(false); }
         let verified = remaining == Some(0);
         super::log_event("desktop_reset_terminated", &format!("{} window(s), {} process(es), verified {verified}", terminated.len(), pids.len()));
         if verified {
@@ -360,6 +375,7 @@ impl Controller {
                 json!({"terminated":terminated,"processes":pids.len()}));
         }
         let mut receipt = self.journal.desktop_reset()?;
+        receipt["graceful_cleanup"] = receipt.clone();
         receipt["state"] = json!(if verified && self.journal.browser_retirement_pending()? { "unsettled" }
             else if verified { "verified" } else { "blocked" });
         receipt["reason"] = if verified { Value::Null } else { json!("windows survived termination") };

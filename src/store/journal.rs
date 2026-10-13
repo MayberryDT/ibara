@@ -574,7 +574,12 @@ impl Journal {
         {
             return Err(conflict("An earlier request with this request_id and different arguments has not finished yet."));
         }
-        self.enforce_retention(true)?;
+        // Finishing releases work; reserve headroom for its durable receipt.
+        // All new goal effects still use the lower admission limit.
+        self.enforce_retention(input.tool != "computer_finish")?;
+        if input.tool == "computer_finish" && self.metadata_bytes()? > self.max_metadata_bytes {
+            return Err(capacity_exhausted());
+        }
         let operation = OperationRecord {
             operation_ref: id("op"),
             request_id: input.request_id.to_string(),
@@ -1178,9 +1183,16 @@ impl Journal {
         if self.metadata_bytes()? <= limit {
             return Ok(());
         }
-        if deleted > 0 {
-            self.db.execute_batch("VACUUM")?;
-            self.checkpoint_wal()?;
+        // WAL contains copies of database pages, not additional retained
+        // records. Reclaim it before declaring metadata exhausted, even when
+        // the retention cutoff did not delete anything.
+        self.checkpoint_wal()?;
+        if self.metadata_bytes()? > limit {
+            let free_pages: u64 = self.db.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            if free_pages > 0 {
+                self.db.execute_batch("VACUUM")?;
+                self.checkpoint_wal()?;
+            }
         }
         if for_new_intent && self.metadata_bytes()? > limit {
             return Err(capacity_exhausted());

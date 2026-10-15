@@ -996,10 +996,13 @@ impl OperatorDirectory {
         let saved: Option<String>=tx.query_row("SELECT value FROM directory_meta WHERE key=?",[&key],|r|r.get(0)).optional()?;
         let saved: Option<Value>=saved.map(|s|serde_json::from_str(&s)).transpose().map_err(|_|fail("Invalid saved begin route."))?;
         if let Some(saved)=&saved {
-            if saved["fingerprint"]!=fingerprint {
-                return Err(IbaraError::new("REQUEST_CONFLICT","request_id already names different begin arguments; use a fresh request_id for new work.",false));
-            }
             let target=saved["computer"].as_str().ok_or_else(||fail("Invalid saved begin route."))?;
+            if saved["fingerprint"]!=fingerprint {
+                return Err(crate::error::unresolved_request("request_id already names different begin arguments; the earlier acquisition must be reconciled.",None,None)
+                    .with("computer_ref",target)
+                    .with("next",format!("Inspect computer_status({{ref: \"{target}\"}}) and recover the earlier begin with its original request_id and arguments. Do not issue a replacement request_id while its acquisition is unresolved."))
+                    .with("suggested_tool_calls",json!([{"name":"computer_status","arguments":{"ref":target}}])));
+            }
             if refused!=Some(target) || candidate.is_none() {return Ok(Some(target.into()));}
         }
         let Some(candidate)=candidate else {return Ok(None)};

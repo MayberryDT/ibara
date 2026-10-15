@@ -19,7 +19,7 @@ pub const CODES: &[(&str, &str)] = &[
     ("AMBIGUOUS_TARGET", "More than one match. Choose one of the listed candidates."),
     ("BLOCKED_BY_DIALOG", "A dialog is in the way. Handle or close the dialog first."),
     ("CAPABILITY_UNAVAILABLE", "This route is not available here; the message says why. Reach the same result another way: by element, by keys, or with another tool."),
-    ("REQUEST_CONFLICT", "This request_id was already used in this session with different arguments, or its earlier request has not finished. Use a new request_id; to retry a request, resend the same request_id with the same arguments."),
+    ("REQUEST_CONFLICT", "This request_id conflicts with an earlier request. Inspect its operation or task with computer_status before deciding on another intention. To recover the original request, resend its original request_id and arguments; do not replace an unresolved effect with a new ID."),
     ("OUTCOME_UNKNOWN", "ibara cannot tell whether the effect happened. Check its state with computer_status; never repeat it blindly."),
     ("POSTCONDITION_FAILED", "The action ran but its expectation was not seen. Observe, then decide."),
     ("BUDGET_EXCEEDED", "A task budget ran out. Finish, or ask a person to extend it."),
@@ -123,4 +123,22 @@ pub fn unavailable(message: impl Into<String>) -> IbaraError {
 }
 pub fn internal(message: impl Into<String>) -> IbaraError {
     IbaraError::new("INTERNAL_ERROR", message, false)
+}
+
+/// A conflicting effect is still running, held or unknown. Never recommend
+/// replacing its identity; point at retained state even before journalling.
+pub fn unresolved_request(message: impl Into<String>, operation: Option<&str>, task: Option<&str>) -> IbaraError {
+    let reference = operation.or(task);
+    let next = match reference {
+        Some(reference) => format!("Inspect computer_status({{ref: \"{reference}\"}}). Reconcile the earlier outcome before another intention; recover it only with its original request_id and arguments. Do not issue a replacement request_id."),
+        None => "The earlier request is still queued. Retry only its original request_id and arguments to recover its operation; do not issue a replacement request_id.".to_string(),
+    };
+    let mut error = IbaraError::new("REQUEST_CONFLICT", message, false)
+        .requires_reconciliation().with("next", next);
+    if let Some(operation) = operation { error = error.with("operation_ref", operation); }
+    if let Some(task) = task { error = error.with("task_ref", task); }
+    if let Some(reference) = reference {
+        error = error.with("suggested_tool_calls", json!([{"name":"computer_status","arguments":{"ref":reference}}]));
+    }
+    error
 }

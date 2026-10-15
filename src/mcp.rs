@@ -255,11 +255,15 @@ impl Server {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools_list_json() })),
             "tools/call" => self.call(params, handler).await,
-            other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
+            other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"), None)),
         };
         Some(match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => error_response(id, code, &message),
+            Err((code, message, data)) => {
+                let mut reply = error_response(id, code, &message);
+                if let Some(data) = data { reply["error"]["data"] = data; }
+                reply
+            },
         })
     }
 
@@ -272,24 +276,35 @@ impl Server {
         initialize_result(params["protocolVersion"].as_str())
     }
 
-    async fn call<H: ToolHandler>(&self, params: Value, handler: &H) -> Result<Value, (i64, String)> {
+    async fn call<H: ToolHandler>(&self, params: Value, handler: &H) -> Result<Value, (i64, String, Option<Value>)> {
         let Value::Object(mut params) = params else {
-            return Err((INVALID_PARAMS, "tools/call needs params {name, arguments}".into()));
+            return Err((INVALID_PARAMS, "tools/call needs params {name, arguments}".into(), None));
         };
         let Some(Value::String(name)) = params.shift_remove("name") else {
-            return Err((INVALID_PARAMS, "tools/call needs a tool name".into()));
+            return Err((INVALID_PARAMS, "tools/call needs a tool name".into(), None));
         };
         if !tool_definitions().iter().any(|t| t.name == name) {
-            return Err((INVALID_PARAMS, format!("unknown tool: {name}")));
+            return Err((INVALID_PARAMS, format!("unknown tool: {name}"), Some(unknown_tool_data())));
         }
         let arguments = match params.shift_remove("arguments") {
             None | Some(Value::Null) => Value::Object(Map::new()),
             Some(args @ Value::Object(_)) => args,
-            Some(_) => return Err((INVALID_PARAMS, "arguments must be an object".into())),
+            Some(_) => return Err((INVALID_PARAMS, "arguments must be an object".into(), None)),
         };
         let outcome = handler.call(name, arguments, self.client.clone()).await;
         Ok(call_result(&outcome))
     }
+}
+
+/// Both direct target MCP and the operator router reject unknown tools
+/// before dispatch and offer the same bounded discovery path.
+pub(crate) fn unknown_tool_data() -> Value {
+    let available: Vec<&str> = tool_definitions().iter().map(|tool| tool.name).collect();
+    json!({
+        "available_tools": available,
+        "next": "Call tools/list to discover valid names and input schemas. For a known tool, computer_status({ref: \"help:<tool>\"}) gives help and an example. No tool was run.",
+        "suggested_tool_calls": [{"method":"tools/list","params":{}}]
+    })
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {
@@ -392,7 +407,7 @@ mod tests {
             let r = c.request(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#).await;
             let tools = r["result"]["tools"].as_array().unwrap();
             assert_eq!(tools.len(), 11);
-            assert!(serde_json::to_vec(tools).unwrap().len() <= 10 * 1024);
+            assert!(serde_json::to_vec(tools).unwrap().len() <= 64 * 1024);
             assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
         })
         .await;

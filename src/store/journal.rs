@@ -561,18 +561,22 @@ impl Journal {
         if let Some(op) = seen().find(|op| self.same_request(op, &input, &fingerprint)) {
             return Ok(replayed(op.clone()));
         }
-        let conflict = |message: &str| {
-            IbaraError::new("REQUEST_CONFLICT", message, false)
-                .with("requires_reconciliation", false)
-                .with("recovery", "Issue a new request_id for a new intention.")
-        };
-        if seen().any(|op| op.session.as_deref() == Some(input.session)) {
-            return Err(conflict("This request_id was already used in this session with different arguments."));
+        // Reconcile unresolved effects before the same-session argument rule:
+        // otherwise a new-ID hint can accidentally replace a running effect.
+        let same_session = seen().any(|op| op.session.as_deref() == Some(input.session));
+        for op in seen() {
+            if !self.request_finished(op)? {
+                let message = if same_session {
+                    "This request_id was already used in this session with different arguments."
+                } else {
+                    "An earlier request with this request_id and different arguments has not finished yet."
+                };
+                return Err(crate::error::unresolved_request(message, Some(&op.operation_ref), op.task_ref.as_deref()));
+            }
         }
-        if let Some(current) = &current
-            && !self.request_finished(current)?
-        {
-            return Err(conflict("An earlier request with this request_id and different arguments has not finished yet."));
+        if same_session {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "This request_id was already used in this session with different arguments.", false)
+                .with("next", "The earlier request has finished. Inspect its result before starting a separate intention with a new request_id. To recover the earlier result, resend its original request_id and arguments."));
         }
         // Finishing releases work; reserve headroom for its durable receipt.
         // All new goal effects still use the lower admission limit.
@@ -688,7 +692,7 @@ impl Journal {
     /// Whether the request `op` began has finished: its whole answer was
     /// stored, and neither it nor any of its later steps (`<request_id>#<n>`)
     /// is running, of unknown outcome or waiting for a person's approval.
-    fn request_finished(&self, op: &OperationRecord) -> Result<bool> {
+    pub(crate) fn request_finished(&self, op: &OperationRecord) -> Result<bool> {
         let open = |o: &OperationRecord| receipt_needs_retention(&o.receipt, o.dispatched) || o.receipt.get("held").is_some();
         if open(op) || op.receipt.get("call").is_none_or(|call| call.get("held").is_some()) {
             return Ok(false);

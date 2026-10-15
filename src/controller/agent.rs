@@ -430,7 +430,12 @@ impl Controller {
         let source = fingerprint_source(args);
         let running = self.in_flight.borrow().get(&key).map(|existing| *existing == source);
         match running {
-            Some(false) => return Err(fail("REQUEST_CONFLICT", "An earlier request with this request_id and different arguments has not finished yet.", false)),
+            Some(false) => {
+                let op = self.journal.get_mutation_operation(principal, task_ref, request_id)?;
+                return Err(crate::error::unresolved_request(
+                    "An earlier request with this request_id and different arguments has not finished yet.",
+                    op.as_ref().map(|op| op.operation_ref.as_str()), Some(task_ref)));
+            }
             Some(true) => {
                 let op_ref = self.journal.get_mutation_operation(principal, task_ref, request_id)?.map(|o| o.operation_ref);
                 let next = match &op_ref {
@@ -3358,7 +3363,15 @@ impl Controller {
         if let Some(op) = self.journal.get_mutation_operation(principal, &task_ref, &request_id)? {
             let fingerprint = self.journal.fingerprint(&json!({ "tool": "computer_finish", "args": fingerprint_source(args) }));
             if op.tool != "computer_finish" || !self.journal.fingerprints_equal(&op.fingerprint, &fingerprint) {
-                return Err(fail("REQUEST_CONFLICT", "This request_id was already used with different arguments.", false));
+                if !self.journal.request_finished(&op)? {
+                    return Err(crate::error::unresolved_request(
+                        "This request_id names an unresolved operation with different arguments.",
+                        Some(&op.operation_ref), Some(&task_ref)));
+                }
+                return Err(fail("REQUEST_CONFLICT", "This request_id was already used with different arguments.", false)
+                    .with("operation_ref", &op.operation_ref)
+                    .with("task_ref", &task_ref)
+                    .with("next", format!("Inspect computer_status({{ref: \"{}\"}}) for the finished result before starting a separate intention with a new request_id. Recover the original only with its original request_id and arguments.", op.operation_ref)));
             }
             return self.stored_call(&op, &task_ref).unwrap_or_else(|| Err(fail("OUTCOME_UNKNOWN", "An earlier finish with this request_id was interrupted; check the task with computer_status.", false)));
         }

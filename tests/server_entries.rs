@@ -793,3 +793,48 @@ fn a_second_session_of_the_same_agent_cannot_take_a_live_sessions_control() {
     assert_eq!(wrote["status"], "ok", "{wrote}");
     assert_eq!(std::fs::read_to_string(workspace.join("note.txt")).unwrap(), "first\n");
 }
+
+/// Real stdio MCP + daemon + managed process; retain the advertised contract
+/// and independently observable output, not just implementation-shaped asserts.
+#[test]
+fn mcp_contract_recovery_retains_one_effect_and_actionable_errors() {
+    let daemon = Daemon::start_with("mcp-contract-recovery", true);
+    let mut agent = Agent::start(&daemon, "codex");
+    agent.next_id += 1;
+    let catalog = agent.request(json!({"jsonrpc":"2.0","id":agent.next_id,"method":"tools/list"}));
+    work_artifact("mcp-contract-catalog", catalog.clone());
+    agent.next_id += 1;
+    let unknown = agent.request(json!({"jsonrpc":"2.0","id":agent.next_id,"method":"tools/call","params":{"name":"computer_typo","arguments":{}}}));
+    let (task, workspace) = begin_when_ready(&mut agent);
+    let malformed = agent.call("computer_act", json!({"task_ref":task,"request_id":"bad-type","action":{"kind":"type"}}));
+    assert_eq!(malformed["error"]["field"], "action.text", "{malformed}");
+    let args = json!({"task_ref":task,"request_id":"write-once","background":true,
+        "command":["/bin/sh","-c","echo started >> starts; while [ ! -f release ]; do sleep 0.05; done; printf verified > output"]});
+    let launched = agent.call("computer_exec", args.clone());
+    assert_eq!(launched["status"], "pending", "{launched}");
+    let op = launched["result"]["op_ref"].as_str().unwrap().to_string();
+    let conflict = agent.call("computer_exec", json!({"task_ref":task,"request_id":"write-once","command":["true"]}));
+    let finish_conflict = agent.call("computer_finish", json!({"task_ref":task,"request_id":"write-once","outcome":"complete","summary":"Must not cancel the running original operation"}));
+    // Simulate a reply unavailable to the consumer: recover from the same ID.
+    let replay = agent.call("computer_exec", args);
+    assert_eq!(replay["result"]["op_ref"], op, "{replay}");
+    std::fs::write(workspace.join("release"), "go").unwrap();
+    let waited = agent.call("computer_wait", json!({"task_ref":task,"for":{"op":op},"deadline_ms":5000}));
+    assert_eq!(waited["status"], "ok", "{waited}");
+    let output = std::fs::read_to_string(workspace.join("output")).unwrap();
+    let starts = std::fs::read_to_string(workspace.join("starts")).unwrap();
+    let finished = agent.call("computer_finish", json!({"task_ref":task,"request_id":"finish","outcome":"complete","summary":"Verified one managed effect and replay"}));
+    work_artifact("mcp-contract-recovery", json!({"native_input":false,"unknown":unknown,"malformed":malformed,"launched":launched,"conflict":conflict,"finish_conflict":finish_conflict,"replay":replay,"waited":waited,"finished":finished,"output":output,"starts":starts}));
+    assert_eq!(output, "verified");
+    assert_eq!(starts, "started\n");
+    assert_eq!(finished["status"], "ok", "{finished}");
+    assert_eq!(finish_conflict["error"]["operation_ref"], op, "{finish_conflict}");
+    assert_eq!(finish_conflict["error"]["requires_reconciliation"], true, "{finish_conflict}");
+    assert_eq!(conflict["error"]["operation_ref"], op, "{conflict}");
+    assert_eq!(conflict["error"]["requires_reconciliation"], true, "{conflict}");
+    assert!(conflict["error"]["next"].as_str().unwrap().contains(&op), "{conflict}");
+    assert!(!conflict["error"]["next"].as_str().unwrap().contains("Use a new request_id"), "{conflict}");
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    assert!(unknown["error"]["data"]["available_tools"].as_array().unwrap().iter().any(|n| n == "computer_act"), "{unknown}");
+    assert!(unknown["error"]["data"]["next"].as_str().unwrap().contains("tools/list"), "{unknown}");
+}

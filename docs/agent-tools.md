@@ -34,6 +34,8 @@ For shell-facing clients, `ibara work [--computer NAME] [--agent NAME] run --goa
 - Every effect is recorded before it happens, and a request retried with the same `request_id` never repeats it.
 - Outcomes are honest. When ibara cannot prove that a step worked, the outcome is `unknown`, never `done`.
 
+Each tool advertises a self-contained input schema, including nested action and expectation variants. `oneOf` branches retain the fields required by that variant and reject unrelated fields; coordinate targets advertise `x`, `y` and optional `frame`. Tool consumers must preserve these constraints rather than flattening alternatives or replacing them with prose references. The catalog keeps presentation metadata compact without removing validation rules. Cross-field rules enforced by the parser remain described in tool help.
+
 The Rust types in `src/contract/` are the source of truth. The JSON Schemas, the tool list and `help:<tool>` are generated from them. This page describes them. There is no version negotiation: every computer and console in a fleet speaks contract 4.
 
 ## Shape of every response
@@ -112,6 +114,11 @@ Any reference resolves through `computer_status({ref})` to its current state, or
 | `logins` | With `logins`: for each site `{site, state, attention?, last_result?}` (see [Logins](#logins)) |
 
 It is idempotent by `request_id`. Replaying a `request_id` with the same arguments returns the original result, or the original error, in any session. A `request_id` names one request within an MCP session: different arguments under a `request_id` already used in this session return `REQUEST_CONFLICT`. In a later session, different arguments are a new request, once the earlier one under that `request_id` has finished; while it is still running, of unknown outcome or waiting for a person's approval, they return `REQUEST_CONFLICT`. This holds for every tool that takes a `request_id`.
+
+When changed arguments conflict with unresolved work, `REQUEST_CONFLICT` includes `requires_reconciliation: true`, the original `operation_ref` and `task_ref` when known, and an exact `computer_status` call in `next` and `suggested_tool_calls`. Inspect that state before another intention; recover the original request only with its original ID and arguments. A queued request without an operation yet points to the task. Automatic begin routing can know only the selected computer, so its conflict points there and preserves the earlier acquisition identity. Do not replace unresolved work with a new request ID. Once the earlier request is finished, changed-argument reuse in the same session instead explains how to inspect its result and start a separate intention.
+
+Unknown tool names remain JSON-RPC `-32602` errors. Their `data` gives `available_tools`, a `tools/list` discovery call and the help route. Both the operator router and direct target entry reject them before remote dispatch or effects.
+
 
 While ibara itself holds the computer back, `computer_begin` returns `BUSY` with `retry_safe: true` and says why: for a few seconds after ibara starts (after an update, a restart or a crash) it is starting, and when earlier work did not finish stopping it is settling that work first. Begin again after the wait it names, with a new `request_id`. When ibara cannot resume by itself (a repair needs a person, or this computer's settings leave resuming to a person), the refusal says so and is not retry-safe. `HUMAN_CONTROL` is only ever a person: they paused the computer or hold it through Take Control. A step cut off by a restart says ibara restarted: the task's control has ended, so check what the step did and begin again.
 

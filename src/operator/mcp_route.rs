@@ -271,7 +271,11 @@ fn on_client_line(
             let known = |name: &str| tools.as_array().is_some_and(|t| t.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)));
             match params.get("name").and_then(Value::as_str) {
                 None => Some(rpc_error(id, INVALID_PARAMS, "tools/call needs a tool name")),
-                Some(name) if !known(name) => Some(rpc_error(id, INVALID_PARAMS, &format!("unknown tool: {name}"))),
+                Some(name) if !known(name) => {
+                    let mut reply = rpc_error(id, INVALID_PARAMS, &format!("unknown tool: {name}"));
+                    reply["error"]["data"] = crate::mcp::unknown_tool_data();
+                    Some(reply)
+                },
                 Some(_) => {
                     running.fetch_add(1, Ordering::SeqCst);
                     // Registered before the task starts, so a cancellation that follows at once is seen.

@@ -3,7 +3,7 @@
 use super::tools::*;
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 /// One MCP tool.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +130,6 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             s.meta_schema = None;
         })
         .into_generator();
-    let mut seen = Vec::new();
     TOOLS
         .iter()
         .map(|t| {
@@ -142,11 +141,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 if root.get("description").and_then(Value::as_str).is_some_and(|d| !d.starts_with("By ")) {
                     root.shift_remove("description");
                 }
-                // Unknown fields are refused everywhere by the parser; saying so
-                // once at the root keeps the list small.
-                root.insert("additionalProperties".into(), false.into());
-                for (name, prop) in root.get_mut("properties").and_then(Value::as_object_mut).into_iter().flatten() {
-                    refer_repeats(t.name, name, prop, &mut seen);
+                // FilesInput is a union of strict objects; closing the union
+                // root without properties would reject every variant.
+                if root.contains_key("properties") {
+                    root.insert("additionalProperties".into(), false.into());
                 }
             }
             ToolDef { name: t.name, description: t.summary, input_schema: schema, read_only: READ_ONLY.contains(&t.name) }
@@ -160,52 +158,13 @@ pub fn help(tool: &str) -> Option<String> {
     Some(format!("{}\n\n{}\n\nExample: {}({})", t.summary, t.long, t.name, t.example))
 }
 
-/// Shortest subschema worth replacing by a pointer to its first occurrence.
-const REPEAT_MIN: usize = 120;
-
-/// A large subschema already seen: its value, tool and path.
-type Seen = Vec<(Value, &'static str, String)>;
-
-/// Replace a large subschema that already appeared earlier in the list (e.g.
-/// `steps[].action` after `action`, or `expect` after computer_act's) with a
-/// short pointer to it. Plain text rather than `$ref`, which some harnesses do
-/// not resolve; the parser still checks the full shape.
-fn refer_repeats(tool: &'static str, path: &str, v: &mut Value, seen: &mut Seen) {
-    if !v.is_object() {
-        return;
-    }
-    if v.to_string().len() >= REPEAT_MIN {
-        if let Some((_, first_tool, first)) = seen.iter().find(|(s, _, _)| s == v) {
-            let kind = v.get("type").cloned().unwrap_or(Value::from("object"));
-            let place = if *first_tool == tool { first.clone() } else { format!("{first} in {first_tool}") };
-            *v = json!({ "type": kind, "description": format!("Same shape as {place}.") });
-            return;
-        }
-        seen.push((v.clone(), tool, path.to_string()));
-    }
-    let Value::Object(map) = v else { return };
-    if let Some(Value::Object(props)) = map.get_mut("properties") {
-        for (name, prop) in props.iter_mut() {
-            refer_repeats(tool, &format!("{path}.{name}"), prop, seen);
-        }
-    }
-    if let Some(items) = map.get_mut("items") {
-        refer_repeats(tool, &format!("{path}[]"), items, seen);
-    }
-}
-
-/// Remove what an agent does not need: titles, formats, defaults, the null
-/// alternative of optional fields, zero minimums, `type` beside a string
-/// `enum`, `$defs` left empty, and
-/// `additionalProperties: false` (restored at the root by the caller).
+/// Remove presentation-only metadata. Keep validation constraints and each
+/// nested shape intact so a tool works when a harness selects it alone.
 fn compact(v: &mut Value) {
     match v {
         Value::Object(map) => {
             for key in ["$schema", "title", "format", "default", "examples"] {
                 map.shift_remove(key);
-            }
-            if map.get("additionalProperties") == Some(&Value::Bool(false)) {
-                map.shift_remove("additionalProperties");
             }
             if let Some(Value::Array(types)) = map.get_mut("type") {
                 types.retain(|t| t != "null");
@@ -213,9 +172,6 @@ fn compact(v: &mut Value) {
                     let only = types.remove(0);
                     map.insert("type".into(), only);
                 }
-            }
-            if map.get("minimum") == Some(&json!(0)) {
-                map.shift_remove("minimum");
             }
             // A list of string values already says the type.
             if map.get("type") == Some(&json!("string"))
@@ -251,53 +207,18 @@ fn compact(v: &mut Value) {
     }
 }
 
-/// One object schema for a union tagged by `tag`: the tag is an `enum`, the
-/// properties are the union of every variant's, and the description lists
-/// each kind's own fields (`*` marks required ones). Far smaller than `oneOf`
-/// and accepted by every harness.
-pub(crate) fn flat_union(tag: &str, variants: &[(&str, Schema)]) -> Schema {
-    let kinds: Vec<&str> = variants.iter().map(|(k, _)| *k).collect();
-    let fields: Vec<(Map<String, Value>, Vec<String>)> = variants
-        .iter()
-        .map(|(_, s)| {
-            let props = s.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
-            let required = s
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|r| r.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default();
-            (props, required)
-        })
-        .collect();
-    let in_all = |name: &str| fields.iter().all(|(p, _)| p.contains_key(name));
-
-    let mut properties = Map::new();
-    properties.insert(tag.into(), json!({ "enum": kinds }));
-    let mut required = vec![Value::from(tag)];
-    let mut parts = Vec::with_capacity(variants.len());
-    for ((kind, _), (props, req)) in variants.iter().zip(&fields) {
-        let own: Vec<String> = props
-            .keys()
-            .filter(|name| !in_all(name))
-            .map(|name| if req.contains(name) { format!("{name}*") } else { name.clone() })
-            .collect();
-        parts.push(if own.is_empty() { kind.to_string() } else { format!("{kind}({})", own.join(" ")) });
-        for (name, schema) in props {
-            properties.entry(name.clone()).or_insert_with(|| schema.clone());
-        }
-    }
-    if let Some((first, _)) = fields.first() {
-        for name in first.keys() {
-            if in_all(name) && fields.iter().all(|(_, r)| r.contains(name)) {
-                required.push(name.as_str().into());
-            }
-        }
-    }
-    let description = format!("By {tag}, * required: {}", parts.join(" "));
-    let mut schema = Map::new();
-    schema.insert("type".into(), "object".into());
-    schema.insert("description".into(), description.into());
-    schema.insert("properties".into(), Value::Object(properties));
-    schema.insert("required".into(), Value::Array(required));
-    Schema::from(schema)
+/// Self-contained discriminated alternatives. Each branch retains its own
+/// required fields and denies fields from other variants, just like parsing.
+pub(crate) fn tagged_schema(tag: &str, variants: &[(&str, Schema)]) -> Schema {
+    let branches: Vec<Value> = variants.iter().map(|(kind, schema)| {
+        let mut branch = schema.clone().to_value();
+        let object = branch.as_object_mut().expect("tagged variant is an object");
+        object.entry("properties").or_insert_with(|| json!({})).as_object_mut()
+            .expect("variant properties").insert(tag.into(), json!({"const": kind}));
+        object.entry("required").or_insert_with(|| json!([]))
+            .as_array_mut().expect("required array").push(tag.into());
+        object.insert("additionalProperties".into(), false.into());
+        branch
+    }).collect();
+    schemars::json_schema!({"type":"object", "oneOf":branches})
 }

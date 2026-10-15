@@ -324,6 +324,14 @@ fn selected_relay_answers_locally_and_opens_one_route_on_first_call() {
     assert!(names.contains(&"computer_status"), "{names:?}");
     relay.send(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
     assert_eq!(relay.reply(), json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    let unknown = tool(&mut relay, json!("unknown"), "computer_typo", json!({}));
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    assert!(unknown["error"]["data"]["available_tools"].as_array().unwrap().iter().any(|name| name == "computer_act"), "{unknown}");
+    assert!(f.invocations().is_empty(), "unknown tool must not open a remote route");
+    if let Some(dir) = std::env::var_os("IBARA_E2E_ARTIFACTS") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(std::path::PathBuf::from(dir).join("operator-unknown-tool.json"), serde_json::to_vec_pretty(&unknown).unwrap()).unwrap();
+    }
     assert!(f.invocations().is_empty(), "no ssh before the first tools/call");
 
     let first = call(&mut relay, json!("call-a"));

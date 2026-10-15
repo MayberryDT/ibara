@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — 2026-10-14 MCP contract and recovery
+
+- Advertise complete per-tool schemas with strict action/expectation/file variants and coordinate shapes; retain nested validation constraints instead of cross-tool prose pointers.
+- Direct unresolved request conflicts to the original operation/task/computer before another intention; preserve exact-ID replay. Unknown tool names return discovery data without dispatch, through both MCP entry paths.
+- Verification and reproducible artifact commands: [MCP contract repair](docs/evidence/mcp-contract-recovery.md). This branch does not change installed packages.
+
 ## Unreleased — Console Desktop Identity
 
 - Package an `io.zet.ibara` desktop entry and hicolor icons (the ibara mark, plus a symbolic 16-pixel version for bars). The entry opens the console from the app launcher and gives its window ibara's name and icon in window lists that match a shell window's title to an entry, where it showed as Quickshell before: the console is drawn by Omarchy's shell, so its window carries the shell's `org.quickshell` app id.

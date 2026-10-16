@@ -3,7 +3,7 @@
 [![Test](https://github.com/MayberryDT/omarchy-ibara/actions/workflows/test.yml/badge.svg)](https://github.com/MayberryDT/omarchy-ibara/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-This is the console for [ibara](https://ibara.app), which gives your agents computer use across the Omarchy machines you own. You can use every one of those computers from any other one too. ibara's core is in [MayberryDT/ibara](https://github.com/MayberryDT/ibara).
+This is the console for [ibara](https://ibara.app), the best computer use for Omarchy: it gives your agents computer use across the Omarchy computers you own, built into Omarchy itself. You can use every one of those computers from any other one too. ibara's core is in [MayberryDT/ibara](https://github.com/MayberryDT/ibara).
 
 The console lives in Omarchy's bar: one glance tells you whether anything needs you, and one click opens a wall with a live picture of every computer.
 

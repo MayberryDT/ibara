@@ -1,8 +1,8 @@
 # ibara
 
-**Give your agents a computer you own.**
+**The best computer use for Omarchy.**
 
-ibara gives your agents computer use across the Omarchy machines you own. Put a spare computer to work: your agent gets its own desktop, browser and apps, and you keep working on yours.
+ibara gives your agents computer use across the Omarchy computers you own, built into Omarchy itself. Put a spare computer to work: your agent gets its own desktop, browser and apps, and you keep working on yours.
 
 [ibara.app](https://ibara.app) · [Docs](https://ibara.app/docs) · [Benchmarks](https://ibara.app/docs/benchmarks) · [Roadmap](https://ibara.app/docs/roadmap)
 
@@ -14,9 +14,9 @@ ibara gives your agents computer use across the Omarchy machines you own. Put a 
 Every computer you add shows up as a live picture in a console on the others, where you can watch it, send it files and take control of it.
 Your agents work on those computers' real desktops, with their own cursor, while you approve what matters and step in whenever you like.
 
-ibara runs on [Omarchy](https://omarchy.org) (Arch Linux with Hyprland). Ubuntu 26.04 amd64 has separate standalone Console and GNOME target packages; see [Ubuntu installation and compatibility](packaging/deb/README.md). Your computers reach each other over your own [Tailscale](https://tailscale.com) network. It is free and open source.
+ibara is built for [Omarchy](https://omarchy.org) (Arch Linux with Hyprland), on real computers or in virtual machines. No other platform is supported or planned; the Ubuntu 26.04 packages published with 0.3.0 and 0.3.1 are no longer supported or updated. Your computers reach each other over your own [Tailscale](https://tailscale.com) network. It is free and open source.
 
-Want it set up for you? [Cirlet](https://cirlet.com/any-agent) offers paid setup and support.
+Want it set up for you? See [setup and support](https://ibara.app/support).
 
 ## Install
 

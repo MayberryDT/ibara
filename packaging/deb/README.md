@@ -1,5 +1,7 @@
 # Ubuntu 26.04 packages
 
+> **No longer supported (15 October 2026).** ibara is Omarchy-only. These scripts and the Ubuntu packages published with 0.3.0 and 0.3.1 are kept as history; they get no further maintenance, qualification or releases.
+
 The shipping candidate is 0.3.0-1, for Ubuntu 26.04 amd64 with GNOME50 on Wayland. Qualification and publication are recorded in the project living plan; the presence of these scripts is not a support claim.
 
 There are two installed roles, both using Package: ibara. `ibara-operator_VERSION_amd64.deb` provides the standalone Console, portable viewer and operator service. It creates no target accounts, SSH entry, input permissions or compositor integration. `ibara-target_VERSION_amd64.deb` additionally provides target services, the browser reader and GNOME helper; its exact dependencies include all four maintained native components. Target setup requires one output at scale1 and an unlocked matching session. Other displays and signed-in browser profiles remain outside current qualification.

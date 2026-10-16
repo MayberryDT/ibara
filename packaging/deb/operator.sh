@@ -19,7 +19,7 @@ if [[ -n ${IBARA_PKGREL:-} ]]; then
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$core=/usr/src/ibara --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/usr/src/cargo"
   stage_id="release-$IBARA_PKGREL"
 else
-  : "${IBARA_BUILD_ID:?Choose a fresh private build ID}"
+  : "${IBARA_BUILD_ID:?Choose a fresh private build ID: <branch>.r<n>.<commit>, no hyphens}"
   stage_id=$IBARA_BUILD_ID
 fi
 export IBARA_BUILD_ID
@@ -41,6 +41,7 @@ install -d "$stage/DEBIAN" "$stage/usr/lib/ibara/bin" "$stage/usr/bin" \
 install -m755 "$CARGO_TARGET_DIR/$profile/ibara" "$CARGO_TARGET_DIR/$profile/ibarad" "$stage/usr/lib/ibara/bin/"
 ln -s ../lib/ibara/bin/ibara "$stage/usr/bin/ibara"
 ln -s ../lib/ibara/bin/ibarad "$stage/usr/bin/ibarad"
+bash "$core/packaging/cua/stage.sh" "$stage/usr/lib/ibara/cua" "$build/cua-cache"
 # The active portable viewer is shared with the existing screen protocol.
 # GNOME mechanisms are proven separately; operator setup grants no target access.
 install -m755 "$build/screen-target/$profile/ibara-screen" "$stage/usr/lib/ibara/bin/ibara-screen"
@@ -53,6 +54,7 @@ install -m644 "$core/packaging/systemd/ibara-operator.service" "$stage/usr/lib/s
 install -m644 "$core/packaging/deb/io.zet.ibara.desktop" "$stage/usr/share/applications/"
 install -m644 "$core/packaging/icons/io.zet.ibara.svg" "$stage/usr/share/icons/hicolor/scalable/apps/"
 install -m644 "$core/LICENSE" "$stage/usr/share/doc/ibara/copyright"
+install -Dm644 "$core/skills/ibara/SKILL.md" "$stage/usr/share/ibara/skills/ibara/SKILL.md"
 install -m644 "$IBARA_QUICKSHELL_SOURCE/LICENSE" "$stage/usr/share/doc/ibara/quickshell-LICENSE"
 install -m644 "$plugin/LICENSE" "$stage/usr/share/doc/ibara/console-LICENSE"
 cat > "$stage/DEBIAN/control" <<CONTROL

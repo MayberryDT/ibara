@@ -31,6 +31,11 @@ pub struct Gnome { env: Arc<[(OsString, OsString)]> }
 pub struct State {
     #[serde(default)] pub input_readiness_api: u32,
     #[serde(default)] pub shell_input_blocked: bool,
+    /// A shell dialog, secure prompt, overview or shell menu holds input.
+    /// Absent from an older helper.
+    #[serde(default)] pub shell_modal: Option<bool>,
+    /// An application's open menu or popup holds a grab (no shell modal).
+    #[serde(default)] pub popup_grab: Option<bool>,
     #[serde(default)] pub capture_api: u32,
     #[serde(default)]
     pub guarded_input_api: u32,
@@ -45,6 +50,55 @@ pub struct State {
     pub monitors: Vec<Monitor>,
     pub windows: Vec<Window>,
     pub focused: Option<String>,
+}
+impl State {
+    /// The window whose open menu or popup holds input while another window
+    /// has focus. Mutter accepts input only for the window that owns a popup
+    /// grab, so until that window is focused again even the Escape that
+    /// closes the menu is refused.
+    pub fn stranded_menu(&self) -> Option<&Window> {
+        if !self.shell_input_blocked { return None; }
+        self.menu_owner().filter(|owner| self.focused.as_deref() != Some(owner.address.as_str()))
+    }
+    /// The window whose open menu holds an application grab while focused;
+    /// focusing another window would strand it ([`Self::stranded_menu`]).
+    pub fn open_menu(&self) -> Option<&Window> {
+        if self.shell_input_blocked { return None; }
+        self.menu_owner().filter(|owner| self.focused.as_deref() == Some(owner.address.as_str()))
+    }
+    /// Owner of the topmost menu window, only while the helper reports an
+    /// application grab and no shell modal. Windows arrive bottom to top.
+    fn menu_owner(&self) -> Option<&Window> {
+        if self.popup_grab != Some(true) || self.shell_modal != Some(false) { return None; }
+        let popup = self.windows.iter().rev()
+            .find(|w| w.menu && w.visible && !w.hidden && !w.modal && w.transient_for.is_some())?;
+        let owner = popup.transient_for.as_deref()?;
+        self.windows.iter().find(|w| w.address == owner && w.visible && !w.hidden)
+    }
+    /// Why GNOME input is refused, and what releases it.
+    pub fn blocked(&self) -> IbaraError {
+        let error = if self.input_readiness_api != 1 {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "The GNOME input readiness helper needs a session reload.", true)
+        } else if let Some(owner) = self.stranded_menu() {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", format!(
+                "An open menu or popup in {} holds input while another window has focus. Focus that window (allowed now), then press Escape or choose a menu item.",
+                named(owner)), true).with("reason", "menu_holds_input")
+        } else if self.shell_modal == Some(true) {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "A GNOME Shell dialog, secure prompt or overview holds input. A person must dismiss it before agent work.", true)
+                .with("reason", "shell_modal")
+        } else {
+            IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any shell dialog or secure prompt before agent work.", true)
+        };
+        error.with("execution_not_started", true)
+    }
+}
+fn named(window: &Window) -> String {
+    match (window.class.is_empty(), window.title.is_empty()) {
+        (false, false) => format!("{} \"{}\"", window.class, window.title),
+        (false, true) => window.class.clone(),
+        (true, false) => format!("\"{}\"", window.title),
+        (true, true) => window.address.clone(),
+    }
 }
 impl Gnome {
     pub fn selected(env: &[(OsString, OsString)]) -> bool {
@@ -114,6 +168,29 @@ impl Gnome {
             if state.locked { return Err(IbaraError::new("HUMAN_CONTROL", "The GNOME session is locked.", false)); }
             if !state.windows.iter().any(|window| window.is(surface)) {
                 return Err(IbaraError::new("STALE_TARGET", "GNOME window/process/session identity changed.", true).with("execution_not_started", true));
+            }
+            if method=="Focus" && state.shell_input_blocked
+                && state.stranded_menu().is_none_or(|owner| owner.address != surface.address) {
+                return Err(state.blocked());
+            }
+            if method=="Focus" && let Some(owner) = state.open_menu().filter(|owner| owner.address != surface.address) {
+                return Err(IbaraError::new("STALE_TARGET", format!(
+                    "An open menu or popup in {} holds input; focusing another window would leave it stranded. Press Escape or choose a menu item first.",
+                    named(owner)), true).with("execution_not_started", true).with("reason", "menu_holds_input"));
+            }
+            if method=="Focus" {
+                for modal in state.windows.iter().filter(|w|w.modal && w.visible && !w.hidden && w.address!=surface.address) {
+                    let mut parent=modal.transient_for.as_deref();
+                    let mut seen=std::collections::HashSet::new();
+                    while let Some(address)=parent {
+                        if !seen.insert(address) || seen.len()>512 {return Err(unavailable("Invalid GNOME modal ancestry; no activation sent."));}
+                        if address==surface.address {
+                            return Err(IbaraError::new("STALE_TARGET", "A modal child blocks this window. Observe and handle the dialog before focusing its parent.", true)
+                                .with("execution_not_started",true).with("reason","modal_focus_blocked"));
+                        }
+                        parent=state.windows.iter().find(|w|w.address==address).and_then(|w|w.transient_for.as_deref());
+                    }
+                }
             }
             let identity = json!({"epoch":state.epoch,"address":surface.address,"pid":surface.pid,"class":surface.class}).to_string();
             let proxy = zbus::Proxy::new(&connection, owner.as_str(), PATH, SERVICE).await.map_err(|e| unavailable(e.to_string()))?;
@@ -194,7 +271,7 @@ impl Gnome {
                         }
                     };
                     let (reason,): (String,) = message.body().deserialize().map_err(|e| unavailable(e.to_string()))?;
-                    let _ = events.send(DesktopEvent::Resync);
+                    let _ = events.send(DesktopEvent::StateChanged);
                     if reason == "displays" || reason == "session" { let _ = events.send(DesktopEvent::DisplayChanged); }
                 }
                 Ok::<(), IbaraError>(())
@@ -261,12 +338,42 @@ async fn begin_input_on(connection: zbus::Connection, owner: String, surface: &S
             let proxy = zbus::Proxy::new(&connection, owner.as_str(), PATH, SERVICE).await
                 .map_err(|e| unavailable(e.to_string()))?;
             DISPATCHED.fetch_add(1, Ordering::SeqCst);
-            proxy.call("InputBegin", &(identity.to_string(), generation)).await
-                .map_err(|e| input_unknown(format!("Input begin was not acknowledged: {e}")))?
+            proxy.call("InputBegin", &(identity.to_string(), generation)).await.map_err(|e| match e {
+                // The helper raises every InputBegin refusal before it starts
+                // any input (extension.js InputBeginAsync): nothing was sent.
+                zbus::Error::MethodError(name, detail, _) if name.as_str() == "org.ibara.Gnome.InputRefused" =>
+                    IbaraError::new("STALE_TARGET", format!("The window could not take the input; nothing was sent. {}. Observe again.",
+                        detail.unwrap_or_default().trim_start_matches("Error: ").chars().take(120).collect::<String>()), true)
+                        .with("execution_not_started", true),
+                e => input_unknown(format!("Input begin was not acknowledged: {e}")),
+            })?
         };
         if uuid::Uuid::parse_str(&token).is_err() { return Err(input_unknown("Invalid input transaction receipt.")); }
         Ok(InputTransaction { persistent_cursor: cursor_lease.is_some(), connection: Some(connection), owner, token })
     }).await.map_err(|_| input_unknown("Input begin timed out; do not replay."))?
+}
+
+/// Why guarded input stopped, from the helper's receipt. The helper counts
+/// as accepted only events it sent to the exact target in this transaction
+/// (`ibara-input.c`); a rejected event is consumed. So with none accepted and
+/// none held, nothing reached the window. Only the helper's person reasons
+/// name a person.
+fn stopped(receipt: &InputReceipt) -> IbaraError {
+    let person = matches!(receipt.reason.as_str(), "person_input" | "target_or_person_changed");
+    if receipt.accepted == 0 && receipt.held == 0 {
+        let error = if person {
+            let who = if receipt.reason == "person_input" { "A person used the mouse or keyboard" } else { "A person, or a focus or window change," };
+            IbaraError::new("HUMAN_CONTROL", format!("{who} stopped the input before any of it reached the window; nothing was delivered."), false)
+                .with("reason", "interrupted")
+        } else {
+            IbaraError::new("STALE_TARGET", "The window under the input changed before any of it was delivered; nothing was sent to it. Observe again.", true)
+                .with("reason", receipt.reason.clone())
+        };
+        return error.with("execution_not_started", true);
+    }
+    let error = IbaraError::new("OUTCOME_UNKNOWN", "Guarded input stopped before completion.", false).requires_reconciliation();
+    let error = if person { error.with("reason", "interrupted") } else { error.with("reason", receipt.reason.clone()) };
+    error.with("execution_not_started", false)
 }
 
 impl InputTransaction {
@@ -289,10 +396,6 @@ impl InputTransaction {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let receipt = self.receipt().await?;
-                if !receipt.active || receipt.rejected > previous.rejected {
-                    return Err(IbaraError::new("HUMAN_CONTROL", "Guarded input stopped before completion.", false)
-                        .with("reason", "interrupted").with("execution_not_started", false));
-                }
                 let advanced = match kind {
                     "key" => receipt.key_events > previous.key_events,
                     "button" => receipt.button_events > previous.button_events,
@@ -301,10 +404,36 @@ impl InputTransaction {
                     "scroll" => receipt.scroll_events > previous.scroll_events,
                     _ => false,
                 };
-                if advanced { return Ok(receipt); }
+                // A final released event can close its own modal and retire
+                // the token. Its dispatch counter still proves that event;
+                // it does not authorize another input on the ended token.
+                let released_end = receipt.reason == "ended" && receipt.held == 0;
+                if advanced && receipt.rejected == previous.rejected && (receipt.active || released_end) {
+                    return Ok(receipt);
+                }
+                if !receipt.active || receipt.rejected > previous.rejected {
+                    eprintln!("ibara guarded_input_stopped reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
+                    return Err(stopped(&receipt));
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.map_err(|_| input_unknown("Queued input has no dispatch receipt; do not replay."))?
+    }
+    /// The helper refused to queue an event: it emitted nothing for it
+    /// (`ibara-input.c` returns before notifying). Labelled from the receipt
+    /// as a guarded stop; unreadable receipt stays a person-attributed stop.
+    async fn refused(&self, kind: &str) -> IbaraError {
+        match self.receipt().await {
+            Ok(mut receipt) => {
+                eprintln!("ibara guarded_input_refused kind={kind} reason={} accepted={} rejected={} held={}", receipt.reason, receipt.accepted, receipt.rejected, receipt.held);
+                // Still active: the helper refused only this event (a point
+                // outside the window, an invalid key), not the transaction.
+                if receipt.active { receipt.reason = "refused_before_queue".into(); }
+                stopped(&receipt)
+            }
+            Err(_) => input_unknown(format!("Guarded {kind} refused; its transaction state could not be read."))
+                .with("execution_not_started", false),
+        }
     }
     pub async fn key(&self, key: u32, pressed: bool) -> Result<InputReceipt> {
         let result = self.key_inner(key, pressed).await;
@@ -320,7 +449,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputKey", &(self.token.as_str(), key, pressed)).await
                 .map_err(|e| input_unknown(format!("Key acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Key acknowledgement timed out; do not replay."))??;
-        if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded key refused.", false).with("reason", "interrupted")); }
+        if !queued { return Err(self.refused("key").await); }
         self.admitted(&previous, "key").await
     }
     pub async fn scroll(&self, dx: i32, dy: i32) -> Result<InputReceipt> {
@@ -337,8 +466,7 @@ impl InputTransaction {
                         self.proxy().await?.call("InputScroll", &(self.token.as_str(), direction)).await
                             .map_err(|e| input_unknown(format!("Wheel acknowledgement lost: {e}")))
                     }).await.map_err(|_| input_unknown("Wheel acknowledgement timed out; do not replay."))??;
-                    if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded wheel refused.", false)
-                        .with("reason", "interrupted").with("execution_not_started", false)); }
+                    if !queued { return Err(self.refused("wheel").await); }
                     receipt = self.admitted(&receipt, "scroll").await?;
                 }
             }
@@ -386,7 +514,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputMotion", &(self.token.as_str(), x, y)).await
                 .map_err(|e| input_unknown(format!("Motion acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Motion acknowledgement timed out; do not replay."))??;
-        if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded motion refused.", false).with("reason", "interrupted")); }
+        if !queued { return Err(self.refused("motion").await); }
         self.admitted(&previous, "motion").await
     }
     pub async fn button(&self, button: u32, pressed: bool) -> Result<InputReceipt> {
@@ -403,7 +531,7 @@ impl InputTransaction {
             self.proxy().await?.call("InputButton", &(self.token.as_str(), button, pressed)).await
                 .map_err(|e| input_unknown(format!("Button acknowledgement lost: {e}")))
         }).await.map_err(|_| input_unknown("Button acknowledgement timed out; do not replay."))??;
-        if !queued { return Err(IbaraError::new("HUMAN_CONTROL", "Guarded button refused.", false).with("reason", "interrupted")); }
+        if !queued { return Err(self.refused("button").await); }
         self.admitted(&previous, "button").await
     }
     pub async fn finish(mut self) -> Result<InputReceipt> {

@@ -159,9 +159,10 @@ impl DesktopPort for LiveDesktop {
                         workspace_id: w.workspace.id,
                         fullscreen: w.fullscreen != 0,
                         rect: rect(g),
+                        tiled: false,
                     }
                 })
-                .collect())
+                .map(|w| (w, true)).collect::<Vec<_>>()).map(|windows| tiles(self.desktop.tiling(), windows))
         })
     }
 
@@ -173,11 +174,12 @@ impl DesktopPort for LiveDesktop {
         Box::pin(async move {
             Ok(self.desktop.windows().await?.into_iter().map(|w| {
                 let g = w.geometry();
-                Win { address: w.address, pid: w.pid, class: w.class, title: w.title,
+                let shown = w.mapped && !w.hidden;
+                (Win { address: w.address, pid: w.pid, class: w.class, title: w.title,
                     process_start_ticks: w.process_start_ticks, compositor_instance: w.compositor_instance,
                     focused: false, floating: w.floating, workspace: w.workspace.name,
-                    workspace_id: w.workspace.id, fullscreen: w.fullscreen != 0, rect: rect(g) }
-            }).collect())
+                    workspace_id: w.workspace.id, fullscreen: w.fullscreen != 0, rect: rect(g), tiled: false }, shown)
+            }).collect::<Vec<_>>()).map(|windows| tiles(self.desktop.tiling(), windows))
         })
     }
 
@@ -207,7 +209,7 @@ impl DesktopPort for LiveDesktop {
                     let target = ClickTarget::Point { x: *x, y: *y, surface: key.as_ref().map(surface) };
                     self.desktop.click(&target, button(*b), *double, Some(cancel)).await.map(|point| Done { point, ..Done::default() })
                 }
-                Effect::Type { surface: key, text, cursor } => self.desktop.type_text(&surface(key), text, *cursor, Some(cancel)).await.map(|_| Done::default()),
+                Effect::Type { surface: key, text, cursor } => self.desktop.type_text(&surface(key), text, *cursor, Some(cancel)).await.map(|note| Done { halts: note.is_some(), note, ..Done::default() }),
                 Effect::Key { surface: key, combo } => self.desktop.key(&surface(key), combo, Some(cancel)).await.map(|_| Done::default()),
                 Effect::Scroll { at, dx, dy } => {
                     let at = at.map(|(x, y)| desktop::Point { x, y });
@@ -351,6 +353,10 @@ impl DesktopPort for LiveDesktop {
         self.desktop.set_agent(label);
     }
 
+    fn emits_window_open_events(&self) -> bool {
+        self.desktop.emits_window_open_events()
+    }
+
     fn set_idle_inhibited(&self, on: bool) -> LocalFuture<'_, Result<()>> {
         Box::pin(async move {
             if !session_env() {
@@ -491,4 +497,13 @@ impl Drop for LiveDesktop {
             handle.abort();
         }
     }
+}
+
+/// Mark the shown tiled windows that share a workspace with another shown
+/// tiled window (see [`Win::tiled`]); none on a desktop that does not tile.
+fn tiles(tiling: bool, windows: Vec<(Win, bool)>) -> Vec<Win> {
+    let laid = |(w, shown): &(Win, bool)| *shown && !w.floating && !w.fullscreen;
+    let marks: Vec<bool> = windows.iter().map(|w| tiling && laid(w)
+        && windows.iter().any(|o| o.0.address != w.0.address && o.0.workspace_id == w.0.workspace_id && laid(o))).collect();
+    windows.into_iter().zip(marks).map(|((mut w, _), tiled)| { w.tiled = tiled; w }).collect()
 }

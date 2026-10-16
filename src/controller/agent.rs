@@ -281,6 +281,7 @@ impl Controller {
     /// runs to completion and the outcome is stored as usual. Keep polling the
     /// future to completion rather than dropping it.
     pub async fn call(&self, principal: &str, connection_id: &str, client_name: &str, tool: &str, args: Value, cancel: Cancel) -> CallOutcome {
+        let recording_started = std::time::Instant::now();
         let agent = agent_label(client_name, principal);
         let outcome = self.dispatch(principal, connection_id, client_name, &agent, tool, &args, &cancel).await;
         let hint = match &outcome {
@@ -307,6 +308,9 @@ impl Controller {
             .map(|i| crate::mcp::Image { mime: i.mime, base64: base64::engine::general_purpose::STANDARD.encode(&i.bytes) })
             .collect();
         budget::fit(&mut envelope, &mut images, budget::MAX_RESULT_BYTES);
+        self.record_fact("call", task.as_ref().map(|t| t.task_ref.as_str()).unwrap_or(connection_id), principal, "bot",
+            json!({"tool": if crate::contract::tool_definitions().iter().any(|t| t.name == tool) { tool } else { "unknown" },
+                "status": envelope.to_value()["status"], "duration_ms": recording_started.elapsed().as_millis() as u64}), tool == "computer_finish" && envelope.to_value()["status"] == "ok");
         CallOutcome { envelope: envelope.to_value(), images }
     }
 
@@ -408,7 +412,7 @@ impl Controller {
             "computer_finish" => {
                 let input: FinishInput = parse_input(tool, args)?;
                 let (task_ref, request_id) = (input.task_ref.to_string(), input.request_id.to_string());
-                self.finish_lease(principal, connection_id, &task_ref)?;
+                self.require_readable_task(principal, &task_ref)?;
                 self.once(principal, &task_ref, &request_id, args, self.finish(principal, connection_id, agent, args, input)).await
             }
             "computer_procedures" => self.procedures_tool(principal, parse_input(tool, args)?),
@@ -426,7 +430,12 @@ impl Controller {
         let source = fingerprint_source(args);
         let running = self.in_flight.borrow().get(&key).map(|existing| *existing == source);
         match running {
-            Some(false) => return Err(fail("REQUEST_CONFLICT", "An earlier request with this request_id and different arguments has not finished yet.", false)),
+            Some(false) => {
+                let op = self.journal.get_mutation_operation(principal, task_ref, request_id)?;
+                return Err(crate::error::unresolved_request(
+                    "An earlier request with this request_id and different arguments has not finished yet.",
+                    op.as_ref().map(|op| op.operation_ref.as_str()), Some(task_ref)));
+            }
             Some(true) => {
                 let op_ref = self.journal.get_mutation_operation(principal, task_ref, request_id)?.map(|o| o.operation_ref);
                 let next = match &op_ref {
@@ -541,6 +550,11 @@ impl Controller {
     }
 
     pub(super) fn timeline(&self, kind: &str, task_ref: Option<&str>, actor: &str, summary: &str, data: Value) {
+        self.record_fact("transition", task_ref.unwrap_or("system"), "system", "system",
+            json!({"event":kind,
+                "outcome": data.get("outcome").and_then(Value::as_str).filter(|v| matches!(*v,"done"|"unknown"|"failed"|"completed"|"partial"|"cancelled"|"verified"|"refused")),
+                "effect_class": data.get("effect_class").and_then(Value::as_str).filter(|v| matches!(*v,"observe"|"change"|"send"|"spend"|"destructive"|"access")),
+                "replay":data.get("replay").and_then(Value::as_bool), "complete":data.get("complete").and_then(Value::as_bool)}), kind == "task_finished");
         let at = self.now_iso();
         if let Err(e) = self.journal.append_event(NewEvent { at: &at, kind, task_ref, actor, summary, data: &data }) {
             super::log_event("timeline_write_failed", &e.to_string());
@@ -797,7 +811,7 @@ impl Controller {
         } else if reference.starts_with("op_") {
             self.op_status(principal, &reference)?
         } else if reference.starts_with("att_") {
-            self.attention_status(principal, &reference)?
+            self.attention_status(principal, agent, &reference)?
         } else if reference.starts_with("art_") || reference.starts_with("artifact_") {
             self.artifact_status(principal, &reference)?
         } else if reference.starts_with("frame_") {
@@ -957,9 +971,9 @@ impl Controller {
         ))
     }
 
-    fn attention_status(&self, principal: &str, reference: &str) -> Result<(RefStatus, Option<String>)> {
+    fn attention_status(&self, principal: &str, agent: &str, reference: &str) -> Result<(RefStatus, Option<String>)> {
         let item = self.journal.get_attention(reference)?;
-        let Some(item) = item.filter(|i| self.require_readable_task(principal, &i.task_ref).is_ok()) else {
+        let Some(item) = item.filter(|i| (i.principal == agent && i.task_ref == format!("access:{agent}")) || self.require_readable_task(principal, &i.task_ref).is_ok()) else {
             return Ok((self.ended(reference, "attention", "No such attention item."), None));
         };
         let summary = match &item.answer {
@@ -990,7 +1004,7 @@ impl Controller {
                 children: item.operation_ref.iter().cloned().collect(),
                 next,
             },
-            Some(item.task_ref),
+            (!item.task_ref.starts_with("access:")).then_some(item.task_ref),
         ))
     }
 
@@ -1270,8 +1284,8 @@ impl Controller {
         if self.journal.get_control()?.unsettled || self.settling.get() || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
             self.journal.set_control(crate::store::ControlPatch { unsettled: Some(true), ..Default::default() })?;
             if (self.disposable_desktop)() && self.journal.desktop_reset()?["state"] == "blocked" {
-                return Err(fail("CONTROL_UNSETTLED", "The disposable desktop has not reached zero windows.", false)
-                    .requires_reconciliation().with("next", "Ask the person to save/close the resisting app through existing recovery, then hand back. No task was started; do not force-kill apps."));
+                return Err(fail("CONTROL_UNSETTLED", "The disposable desktop has not reached zero windows, even after ending the apps left open.", false)
+                    .requires_reconciliation().with("next", "No task was started. Begin on another ready computer; this one retries cleanup on its own."));
             }
             return Err(fail("CONTROL_UNSETTLED", "Previous controllable work has not settled.", false).requires_reconciliation());
         }
@@ -1533,6 +1547,7 @@ impl Controller {
     async fn run_steps(&self, ctx: &CallCtx<'_>, op0: OperationRecord, steps: &[StepSpec], start: usize, mut results: Vec<StepResult>, approved_first: bool) -> Result<Reply> {
         let mut receipt0: Map<String, Value> = op0.receipt.as_object().cloned().unwrap_or_default();
         let mut stop = false;
+        let mut halted = false;
         let mut attention: Option<(usize, String)> = None;
         let mut touched_desktop = false;
         let mut late_windows: Option<(WinKey, Vec<Win>)> = None;
@@ -1542,7 +1557,9 @@ impl Controller {
         for (i, spec) in steps.iter().enumerate().skip(start) {
             if stop || ctx.gone.is_cancelled() {
                 stop = true;
-                let why = if ctx.gone.is_cancelled() { "not run: the caller went away" } else { "not run: an earlier step did not complete" };
+                let why = if ctx.gone.is_cancelled() { "not run: the caller went away" }
+                    else if halted { "not run: the app left a completion selected in the typed field; check it first" }
+                    else { "not run: an earlier step did not complete" };
                 results.push(step_result(i, StepOutcome::NotRun, why, None));
                 continue;
             }
@@ -1734,6 +1751,10 @@ impl Controller {
                         }
                         None => (StepOutcome::Done, String::new()),
                     };
+                    if done.halts && outcome == StepOutcome::Done {
+                        stop = true;
+                        halted = true;
+                    }
                     // What the step itself saw happen (where a clicked page went), then the expectation.
                     let detail = match done.note {
                         Some(note) if awaited.is_empty() => note,
@@ -1753,7 +1774,7 @@ impl Controller {
                 }
             };
             if outcome == StepOutcome::Done {
-                self.await_launched_window(ctx.task_ref, &windows, &resolved, launched, ctx.gone).await;
+                self.await_launched_window(&ctx, &windows, &resolved, launched).await;
             }
             receipt.insert("elapsed_ms".into(), json!(started.elapsed().as_millis() as u64));
             receipt.insert("step".into(), json!({ "index": i, "describe": resolved.describe, "outcome": outcome_name(outcome) }));
@@ -2012,8 +2033,9 @@ impl Controller {
             }
             Action::Close(s) => {
                 let win = self.resolve_surface(frame, windows, &s.surface)?;
+                self.track_job_windows(task_ref, windows).map_err(|e| e.with("execution_not_started", true))?;
                 let owned = self.journal.task_windows(task_ref).map_err(|e| e.with("execution_not_started", true))?;
-                if !(self.disposable_desktop)() && !owned.iter().any(|o| o.address == win.address && o.pid == win.pid) {
+                if !(self.disposable_desktop)() && !owned.iter().any(|o| o.address == win.address && o.pid == win.pid && o.process_start_ticks == win.process_start_ticks && o.compositor_instance == win.compositor_instance) {
                     return Err(denied(format!("surface: close only closes windows this task opened; {} was not", s.surface)).with("execution_not_started", true));
                 }
                 let describe = format!("close {} \"{}\"", win.class, squash(&win.title, 40));
@@ -2544,21 +2566,56 @@ impl Controller {
     /// later. Wait for it, up to `LAUNCH_WINDOW_WAIT`, so it becomes the
     /// task's (finishing closes it) and the frame shows it. Window events
     /// until it maps are the launch's, not a person's.
-    async fn await_launched_window(&self, task_ref: &str, before: &[Win], resolved: &Resolved, launched: Option<u32>, gone: &Cancel) {
+    async fn await_launched_window(&self, ctx: &CallCtx<'_>, before: &[Win], resolved: &Resolved, launched: Option<u32>) {
+        let (task_ref, gone) = (ctx.task_ref, ctx.gone);
         // A launch with neither a pid nor a known class has no window to look for.
         let owner = match step_owner(resolved, None, launched) {
             Some(Owner::Launch { pid: None, class: None }) | Some(Owner::Process(_)) | None => return,
             Some(owner) => owner,
         };
         let started = Instant::now();
+        let (abort, _) = self.abort_handles();
         self.mark_effect(Some(task_ref));
         loop {
-            let mapped = self.desktop.windows().await.is_ok_and(|now| now.iter().any(|w| self.claims(&owner, before, w)));
-            if mapped || started.elapsed() >= LAUNCH_WINDOW_WAIT || pause(LAUNCH_WINDOW_POLL, gone).await {
+            let mapped = self.desktop.windows().await.ok().and_then(|now| now.into_iter().find(|w| self.claims(&owner, before, w)));
+            if let Some(window) = &mapped {
+                self.room_for_launched(ctx, &owner, window, &abort).await;
+            }
+            if mapped.is_some() || started.elapsed() >= LAUNCH_WINDOW_WAIT || abort.is_cancelled() || pause(LAUNCH_WINDOW_POLL, gone).await {
                 break;
             }
         }
         self.mark_effect(None);
+    }
+
+    /// As a focus step would: the launched program's own window, mapped
+    /// tiled beside others, is focused and so maximized. Only a window of
+    /// the launched process tree (never one claimed by class alone), once
+    /// the compositor has given it focus, and only past the same person,
+    /// authority and abort gates as any step. A refusal is an event.
+    async fn room_for_launched(&self, ctx: &CallCtx<'_>, owner: &Owner, window: &Win, abort: &Cancel) {
+        let Owner::Launch { pid: Some(root), .. } = owner else { return };
+        if !window.tiled || !self.descends_from(window.pid, *root) { return; }
+        let mut focused = window.focused;
+        for _ in 0..5 {
+            if focused || abort.is_cancelled() { break; }
+            if pause(Duration::from_millis(100), ctx.gone).await { return; }
+            focused = self.desktop.windows().await.is_ok_and(|now| now.iter().any(|w| w.address == window.address && w.focused));
+        }
+        if !focused || abort.is_cancelled() { return; }
+        // Read the person's turn without clearing it: the agent's next step
+        // must still be told to look again.
+        if self.turns.borrow().person_involved() {
+            self.push_event(Some(ctx.task_ref), "launched window left at its tile size: a person used this computer");
+            return;
+        }
+        let result = match self.assert_authority(ctx.lease) {
+            Ok(()) => self.desktop.act(&Effect::Focus(window.key()), abort).await.map(drop),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            self.push_event(Some(ctx.task_ref), &format!("launched window left at its tile size: {}", error.code));
+        }
     }
 
     /// Windows that appeared during a step and belong to it are the task's
@@ -3105,7 +3162,9 @@ impl Controller {
                 }
             }
             WaitFor::Attention(att) => {
-                let item = self.journal.get_attention(att.as_str())?.filter(|a| a.task_ref == task.task_ref);
+                let subject = self.task_subject(&task.task_ref, principal);
+                let item = self.journal.get_attention(att.as_str())?.filter(|a| a.task_ref == task.task_ref
+                    || a.principal == subject && a.task_ref == format!("access:{subject}"));
                 if item.is_none() {
                     return Err(invalid(format!("for.attention: {att} is not an attention item of this task")));
                 }
@@ -3298,6 +3357,24 @@ impl Controller {
     async fn finish(&self, principal: &str, connection_id: &str, agent: &str, args: &Value, input: FinishInput) -> Result<Reply> {
         let task_ref = input.task_ref.to_string();
         let request_id = input.request_id.to_string();
+        self.require_readable_task(principal, &task_ref)?;
+        // A completed finish has released its lease. Replay its retained receipt
+        // before requiring control, without creating an intent or repeating cleanup.
+        if let Some(op) = self.journal.get_mutation_operation(principal, &task_ref, &request_id)? {
+            let fingerprint = self.journal.fingerprint(&json!({ "tool": "computer_finish", "args": fingerprint_source(args) }));
+            if op.tool != "computer_finish" || !self.journal.fingerprints_equal(&op.fingerprint, &fingerprint) {
+                if !self.journal.request_finished(&op)? {
+                    return Err(crate::error::unresolved_request(
+                        "This request_id names an unresolved operation with different arguments.",
+                        Some(&op.operation_ref), Some(&task_ref)));
+                }
+                return Err(fail("REQUEST_CONFLICT", "This request_id was already used with different arguments.", false)
+                    .with("operation_ref", &op.operation_ref)
+                    .with("task_ref", &task_ref)
+                    .with("next", format!("Inspect computer_status({{ref: \"{}\"}}) for the finished result before starting a separate intention with a new request_id. Recover the original only with its original request_id and arguments.", op.operation_ref)));
+            }
+            return self.stored_call(&op, &task_ref).unwrap_or_else(|| Err(fail("OUTCOME_UNKNOWN", "An earlier finish with this request_id was interrupted; check the task with computer_status.", false)));
+        }
         let lease = self.finish_lease(principal, connection_id, &task_ref)?;
         let mut task = self.task(&task_ref)?;
         if lease.is_some() {
@@ -3389,7 +3466,7 @@ impl Controller {
                     notes.push("Cleanup resolved known task-owned dialogs; saved files were not overwritten. Save required work before finishing.".into());
                 }
                 if reset["state"] != "verified" {
-                    notes.push(format!("Zero-window reset not verified: {}. Computer remains unavailable; no forced termination.",
+                    notes.push(format!("Zero-window reset not verified: {}. Computer remains unavailable until a retry closes them.",
                         reset["reason"].as_str().unwrap_or("window close or settlement did not complete")));
                 }
             } else {

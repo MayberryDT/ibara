@@ -54,6 +54,9 @@ pub struct Win {
     pub workspace_id: i64,
     pub fullscreen: bool,
     pub rect: Rect,
+    /// A tiled window sharing its workspace with another tiled window on a
+    /// tiling desktop (Hyprland): focusing it maximizes it there.
+    pub tiled: bool,
 }
 
 impl Win {
@@ -141,6 +144,8 @@ pub struct Done {
     pub note: Option<String>,
     /// Where a click landed, as a fraction of the screen showing it.
     pub point: Option<(f64, f64)>,
+    /// The rest of the batch waits for the agent to read `note`.
+    pub halts: bool,
 }
 
 /// What to capture.
@@ -235,6 +240,8 @@ pub trait DesktopPort {
     }
     /// The agent whose named cursor this computer shows while it holds control.
     fn set_agent(&self, _label: Option<String>) {}
+    /// Whether WindowOpened events mark browser windows (not on GNOME).
+    fn emits_window_open_events(&self) -> bool { true }
     /// The headless output change (§12.3) the outputs need, if any.
     fn output_change(&self) -> LocalFuture<'_, Result<Option<OutputChange>>>;
     /// Create or remove `IbaraVirtual`.

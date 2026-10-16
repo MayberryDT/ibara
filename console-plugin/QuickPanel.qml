@@ -24,11 +24,11 @@ Panel {
   readonly property Tokens tokens: Tokens {}
   readonly property var computers: service && Array.isArray(service.computers) ? service.computers.filter(function(c) { return !!(c && c.computer_id) }) : []
   readonly property bool stopped: !!service && service.serviceStopped === true
-  // Approvals, login requests and agents' questions, oldest first; the first two show here.
+  // Undismissed requests, oldest first; deferred requests stay in the full console.
   readonly property var approvals: service && Array.isArray(service.approvals) ? service.approvals : []
   readonly property var logins: service && Array.isArray(service.logins) ? service.logins : []
   readonly property var questions: service && Array.isArray(service.questions) ? service.questions : []
-  readonly property var asks: stopped ? [] : approvals.concat(logins, questions, service && service.needsYou ? service.needsYou.filter(function(n) { return n.unsupported }) : []).sort(function(a, b) { return a.at - b.at || (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0) })
+  readonly property var asks: stopped || !service || !Array.isArray(service.dropdownRequests) ? [] : service.dropdownRequests.filter(function(item) { return root.service.requestNeedsAlert(item) })
   property int askOffset: 0
   onAsksChanged: if (askOffset >= asks.length) askOffset = 0
   readonly property var shownAsks: asks.slice(askOffset, askOffset + 2)
@@ -200,6 +200,13 @@ Panel {
           width: parent.width
           text: root.service ? "ibara " + root.service.updateAvailable + " available" : ""
           font.pixelSize: Style.font.bodySmall
+        }
+        ActionButton {
+          visible: root.asks.length > 0
+          label: "Dismiss requests"
+          size: "small"
+          role: "quiet"
+          onClicked: if (root.service) root.service.dismissRequests()
         }
         Repeater {
           id: askCards

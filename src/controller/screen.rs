@@ -143,7 +143,7 @@ impl ScreenStream {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(3), wait).await.map_err(|_| unavailable("The screen sender did not become ready within 3 seconds."))?
+        tokio::time::timeout(Duration::from_secs(10), wait).await.map_err(|_| unavailable("The screen sender did not become ready within 10 seconds."))?
     }
 
     pub async fn settle(&self) -> Result<()> {

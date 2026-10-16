@@ -23,18 +23,18 @@ if debian.exists():
     if not text.startswith('mutter (50.1-0ubuntu2.4) '):
         raise SystemExit('This Ubuntu integration requires source 50.1-0ubuntu2.4')
     changelog.write_text(text.replace('mutter (50.1-0ubuntu2.4) ',
-                                     'mutter (50.1-0ubuntu2.4+ibara2) ', 1))
+                                     'mutter (50.1-0ubuntu2.4+ibara3) ', 1))
     symbols = debian / 'libmutter-18-0.symbols'
     text = symbols.read_text()
     anchor = ' meta_display_is_grabbed@Base 44.0'
     assert text.count(anchor) == 1
-    entries = ''.join(f' meta_display_ibara_input_{name}@Base 50.1-0ubuntu2.4+ibara2\n'
+    entries = ''.join(f' meta_display_ibara_input_{name}@Base 50.1-0ubuntu2.4+ibara3\n'
                       for name in ['begin', 'button', 'end', 'idle', 'key', 'motion', 'scroll', 'state', 'text'])
     text = text.replace(anchor, entries + anchor)
     # Ubuntu backported this symbol while retaining its later upstream version.
     # The candidate must declare the actual package providing it.
     text = text.replace('clutter_backend_get_global_cursor_type@Base 50.1-0ubuntu3~',
-                        'clutter_backend_get_global_cursor_type@Base 50.1-0ubuntu2.4+ibara2')
+                        'clutter_backend_get_global_cursor_type@Base 50.1-0ubuntu2.4+ibara3')
     symbols.write_text(text)
 
 def change(path, before, after, count=1):
@@ -355,3 +355,7 @@ for name in ['notify_scroll', 'notify_discrete_scroll']:
                         '      g_object_get_data (G_OBJECT (input_device), "ibara-input-id"))')
     file.write_text(s[:start] + part + s[end:])
 print('Applied private ibara guard v1 to Mutter 50.1; not qualified.')
+
+# Add the exact-handler popup inspection used by the guarded module.
+import subprocess
+subprocess.run([sys.executable, str(here / "popup.py"), str(root)], check=True)

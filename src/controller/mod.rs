@@ -342,6 +342,7 @@ pub struct Controller {
     watchdog: RefCell<watchdog::Watchdog>,
     /// One watchdog pass at a time.
     watchdog_turn: AsyncMutex<()>,
+    facts: RefCell<crate::facts::Recorder>,
     state_dir: PathBuf,
     /// A person asked for ibarad to restart (`repair restart_ibara`).
     restart: tokio::sync::Notify,
@@ -386,7 +387,9 @@ impl Controller {
             let ibara = [storage.root_dir.as_path(), storage.state_dir.as_path(), options.state_dir.as_path()];
             checks::HomeRule::new(&options.home_dir, &ibara, &std::fs::read_to_string("/etc/passwd").unwrap_or_default())
         };
+        let facts = RefCell::new(crate::facts::Recorder::new(&options.state_dir));
         Ok(Controller {
+            facts,
             journal,
             storage: options.storage,
             desktop: options.desktop,
@@ -535,6 +538,7 @@ impl Controller {
         }
         let _ = self.desktop.set_idle_inhibited(false).await;
         self.storage.close();
+        self.facts.borrow_mut().close();
     }
 
     /// Resolves once a person asked for ibarad to restart; the server then
@@ -555,12 +559,25 @@ impl Controller {
 
     /// The gateway `transfer` kind (`storage.transfer`).
     pub async fn transfer(&self, principal: &str, connection_id: &str, request: Value) -> Result<Value> {
-        self.ensure_open()?;
-        self.assert_identity(principal, connection_id)?;
-        self.storage.transfer(principal, &request, Some(connection_id))
+        let result = (|| {
+            self.ensure_open()?;
+            self.assert_identity(principal, connection_id)?;
+            self.storage.transfer(principal, &request, Some(connection_id))
+        })();
+        self.record_fact("transfer", connection_id, principal, "bot",
+            serde_json::json!({"status":if result.is_ok() {"ok"} else {"error"}}), false);
+        result
     }
 
     // ---- shared helpers -----------------------------------------------------
+
+    pub(super) fn record_fact(&self, kind: &str, session: &str, actor: &str, who: &str, fields: Value, finish: bool) {
+        let active = self.journal.get_active_lease().ok().flatten().map(|l| l.task_ref);
+        let mut recorder = self.facts.borrow_mut();
+        recorder.protect(active);
+        recorder.event(kind, session, actor, who, fields, finish);
+    }
+    pub(crate) fn retire_recording_connection(&self, connection: &str) { self.facts.borrow_mut().retire(connection); }
 
     pub(crate) fn now_ms(&self) -> i64 {
         (self.clock)()

@@ -3,6 +3,7 @@ import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
+import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -87,7 +88,17 @@ export default class IbaraIdentity extends Extension {
         this._impl?.emit_signal('Changed', new GLib.Variant('(s)', [reason]));
     }
     _locked() { return Main.sessionMode.isLocked || Main.sessionMode.isGreeter; }
+    // A shell dialog, secure prompt, overview or shell menu: always a person's.
+    _shellModal() {
+        return Main.modalCount > 0 || !!global.stage.get_key_focus() || Main.actionMode !== Shell.ActionMode.NORMAL;
+    }
+    // A grab the shell did not take: an application's open menu or popup.
+    _popupGrab() { return !this._shellModal() && !!global.stage.get_grab_actor(); }
     _shellInputBlocked() {
+        if (typeof global.display.ibara_input_state === 'function') {
+            const state = JSON.parse(global.display.ibara_input_state());
+            if (typeof state.shell_blocked === 'boolean') return state.shell_blocked;
+        }
         return typeof global.stage.get_grab_actor !== 'function' ||
             !!global.stage.get_grab_actor() || !!global.stage.get_key_focus();
     }
@@ -105,17 +116,23 @@ export default class IbaraIdentity extends Extension {
         const windows = global.display.sort_windows_by_stacking(global.get_window_actors().map(actor => actor.meta_window).filter(Boolean)).map(window => {
             const frame = window.get_frame_rect();
             const client = window.get_client_content_rect();
+            const buffer = window.get_buffer_rect();
             return { address: `gnome:${window.get_stable_sequence()}`, pid: window.get_pid(),
                 class: window.get_wm_class() || window.get_gtk_application_id() || '', title: window.get_title() || '',
                 at: [frame.x, frame.y], size: [frame.width, frame.height], monitor: window.get_monitor(),
                 clientRect: [client.x, client.y, client.width, client.height],
+                bufferRect: [buffer.x, buffer.y, buffer.width, buffer.height],
+                modal: window.get_window_type() === Meta.WindowType.MODAL_DIALOG,
+                transientFor: window.get_transient_for() ? `gnome:${window.get_transient_for().get_stable_sequence()}` : null,
                 workspace: { id: (window.get_workspace()?.index() ?? -1) + 1 },
                 mapped: true, hidden: window.minimized || !window.showing_on_its_workspace(),
                 visible: window.showing_on_its_workspace() && !window.minimized,
-                acceptsInput: !this._locked() && !shellInputBlocked, focusHistoryID: window === global.display.focus_window ? 0 : 1 };
+                acceptsInput: !this._locked() && !shellInputBlocked, focusHistoryID: window === global.display.focus_window ? 0 : 1,
+                menu: [Meta.WindowType.DROPDOWN_MENU, Meta.WindowType.POPUP_MENU, Meta.WindowType.MENU, Meta.WindowType.COMBO].includes(window.get_window_type()) };
         });
         return JSON.stringify({ epoch: this._epoch, session_generation: this._sessionGeneration, locked: this._locked(),
             capture_api: 1, input_readiness_api: 1, shell_input_blocked: shellInputBlocked,
+            shell_modal: this._shellModal(), popup_grab: this._popupGrab(),
             cursor_api: this._personSignal ? 1 : 0,
             cursor_visible: !!this._cursor?.inhibited, last_person_us: this._personAt,
             guarded_input_api: ['begin', 'key', 'motion', 'button', 'scroll', 'text', 'end', 'state', 'idle']
@@ -182,6 +199,7 @@ export default class IbaraIdentity extends Extension {
     }
     Focus(encoded) {
         const window = this._target(encoded);
+        if (this._shellModal()) return false;
         Main.activateWindow(window);
         return global.display.focus_window === window;
     }

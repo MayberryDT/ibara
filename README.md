@@ -231,7 +231,7 @@ Within what ibara can see, no step that asks first runs without an approval, and
 
 ### Can I use ibara without Omarchy
 
-Not yet. ibara relies on Omarchy's Hyprland setup, bar and commands, and we test only there.
+Ubuntu26.04 amd64 also has a standalone Console and a guarded GNOME50 Wayland target. The target requires the exact maintained Mutter packages and currently has software-VM, single-output scale1 qualification. See [Ubuntu installation and limits](packaging/deb/README.md). macOS and Windows remain planned.
 
 ### How do I update or remove ibara
 

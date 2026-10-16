@@ -32,6 +32,15 @@ fn n(action: &Value, key: &str, default: f64) -> f64 {
 impl Controller {
     /// One administrator operation (`admin.sock`).
     pub async fn admin(&self, action: Value) -> Result<Value> {
+        let started = std::time::Instant::now();
+        let op = crate::facts::category(action["op"].as_str().unwrap_or("")).to_owned();
+        let session = action["task_ref"].as_str().unwrap_or("admin").to_owned();
+        let result = self.admin_inner(action).await;
+        self.record_fact("admin", &session, "admin", "system",
+            json!({"op":op, "status":if result.is_ok() { "ok" } else { "error" }, "duration_ms":started.elapsed().as_millis() as u64}), false);
+        result
+    }
+    async fn admin_inner(&self, action: Value) -> Result<Value> {
         self.ensure_open()?;
         self.reconcile().await?;
         let op = s(&action, "op").to_string();

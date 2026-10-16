@@ -18,6 +18,7 @@
 #include "wayland/meta-wayland-seat.h"
 #include "wayland/meta-wayland-text-input.h"
 #include "wayland/meta-wayland-input.h"
+#include "wayland/meta-wayland-popup.h"
 #include "wayland/meta-wayland-surface-private.h"
 #include "core/ibara-input.h"
 
@@ -91,16 +92,27 @@ get_input (MetaDisplay *display)
 }
 
 static gboolean
-target_ready (IbaraInput *input)
+shell_ready (MetaDisplay *display, MetaWindow *target)
 {
-  MetaContext *context = meta_display_get_context (input->display);
+  MetaContext *context = meta_display_get_context (display);
   MetaBackend *backend = meta_context_get_backend (context);
   ClutterStage *stage = CLUTTER_STAGE (meta_backend_get_stage (backend));
+  MetaWaylandCompositor *compositor = meta_context_get_wayland_compositor (context);
+  MetaWaylandSeat *seat;
+  if (!META_IS_BACKEND_NATIVE (backend) || !compositor || !compositor->seat) return FALSE;
+  seat = compositor->seat;
+  if (clutter_stage_get_key_focus (stage)) return FALSE;
+  if (!clutter_stage_get_grab_actor (stage)) return TRUE;
+  return meta_wayland_popup_grab_is_target (seat, target);
+}
+
+static gboolean
+target_ready (IbaraInput *input)
+{
   return input->target && !input->target->unmanaging &&
     !input->target->minimized && meta_window_showing_on_its_workspace (input->target) &&
     input->display->focus_window == input->target &&
-    !clutter_stage_get_grab_actor (stage) &&
-    !clutter_stage_get_key_focus (stage);
+    shell_ready (input->display, input->target);
 }
 
 static gboolean
@@ -256,18 +268,19 @@ char *
 meta_display_ibara_input_state (MetaDisplay *display)
 {
   IbaraInput *input = get_input (display);
-  if (!input) return g_strdup ("{\"version\":1,\"person_signal\":true,\"active\":false,\"settled\":true}");
+  const char *blocked = shell_ready (display, display->focus_window) ? "false" : "true";
+  if (!input) return g_strdup_printf ("{\"version\":1,\"person_signal\":true,\"active\":false,\"settled\":true,\"shell_blocked\":%s}", blocked);
   if (input->active && !authorized (input, input->generation)) {}
   return g_strdup_printf (
     "{\"version\":1,\"person_signal\":true,\"generation\":\"%s\",\"active\":%s,"
     "\"accepted\":%u,\"rejected\":%u,\"held\":%u,\"native_held\":%u,"
     "\"key_events\":%u,\"button_events\":%u,\"motion_events\":%u,\"text_events\":%u,\"scroll_events\":%u,"
-    "\"settled\":%s,\"reason\":\"%s\"}", input->generation ? input->generation : "",
+    "\"settled\":%s,\"reason\":\"%s\",\"shell_blocked\":%s}", input->generation ? input->generation : "",
     input->active ? "true" : "false", input->accepted, input->rejected,
     held_count (input), meta_virtual_input_device_native_ibara_get_held (),
     input->key_events, input->button_events, input->motion_events, input->text_events, input->scroll_events,
     !input->active && !held_count (input) && !meta_virtual_input_device_native_ibara_get_held () ? "true" : "false",
-    input->reason ? input->reason : "unavailable");
+    input->reason ? input->reason : "unavailable", blocked);
 }
 
 /* Guarded events bypass Shell capture, accessibility and global keybindings.
@@ -381,7 +394,8 @@ meta_ibara_input_delivery_allowed (MetaWaylandSeat *seat, const ClutterEvent *ev
   surface = key ? meta_wayland_keyboard_get_focus_surface (seat->keyboard) :
     meta_wayland_pointer_get_focus_surface (seat->pointer);
   if (!surface || meta_wayland_surface_get_toplevel_window (surface) != input->target ||
-      !meta_wayland_input_is_current_handler (seat->input_handler, seat->default_handler))
+      !(meta_wayland_input_is_current_handler (seat->input_handler, seat->default_handler) ||
+        meta_wayland_popup_grab_is_target (seat, input->target)))
     {
       stop_input (input, !surface ? "wayland_recipient_missing" :
         meta_wayland_surface_get_toplevel_window (surface) != input->target ?

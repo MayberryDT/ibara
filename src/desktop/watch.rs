@@ -42,6 +42,8 @@ pub enum DesktopEvent {
     MonitorRemoved { name: String },
     /// Outputs may differ: reconcile the display (output-watch's trigger).
     DisplayChanged,
+    /// A live provider notification changed desktop state; reobserve it.
+    StateChanged,
     /// The event stream (re)started; anything before it may have been missed.
     Resync,
 }

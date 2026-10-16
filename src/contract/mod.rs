@@ -92,7 +92,7 @@ impl JsonSchema for Ref {
         true
     }
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        json_schema!({ "type": "string" })
+        json_schema!({ "type": "string", "pattern": REF_PATTERN })
     }
 }
 
@@ -233,8 +233,7 @@ where
 
 /// A union discriminated by a string field (`kind` or `op`). Each variant holds
 /// a struct with the variant's fields. Generates the enum, `Serialize`, a
-/// path-preserving `Deserialize` and a flat JSON Schema (one object whose tag
-/// is an `enum`, with a description listing each kind's fields).
+/// path-preserving `Deserialize` and a self-contained discriminated schema.
 macro_rules! tagged_union {
     (
         $(#[$meta:meta])*
@@ -275,7 +274,7 @@ macro_rules! tagged_union {
                 true
             }
             fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-                $crate::contract::schema::flat_union($tag, &[$( ($lit, <$ty as schemars::JsonSchema>::json_schema(g)) ),+])
+                $crate::contract::schema::tagged_schema($tag, &[$( ($lit, <$ty as schemars::JsonSchema>::json_schema(g)) ),+])
             }
         }
     };

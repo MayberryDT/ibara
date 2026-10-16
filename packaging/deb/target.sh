@@ -9,7 +9,7 @@ if [[ -n ${IBARA_PKGREL:-} ]]; then
   profile=release
   stage_id="release-$IBARA_PKGREL"
 else
-  : "${IBARA_BUILD_ID:?Choose a fresh private build ID}"
+  : "${IBARA_BUILD_ID:?Choose a fresh private build ID: <branch>.r<n>.<commit>, no hyphens}"
   stage_id=$IBARA_BUILD_ID
 fi
 bash "$core/packaging/deb/operator.sh"
@@ -43,15 +43,22 @@ python3 - "$stage" "$version" <<'PY'
 from pathlib import Path
 import json,sys
 stage=Path(sys.argv[1]);version=sys.argv[2]
-(stage/'usr/lib/ibara/gnome-target.json').write_text(json.dumps({'schema':1,'candidate_version':version,'mutter_version':'50.1-0ubuntu2.4+ibara2','development_only':'-dev.' in version})+'\n')
+(stage/'usr/lib/ibara/gnome-target.json').write_text(json.dumps({'schema':1,'candidate_version':version,'mutter_version':'50.1-0ubuntu2.4+ibara3','development_only':'-dev.' in version})+'\n')
 (stage/'usr/lib/ibara/gnome-target.json').chmod(0o644)
 control=stage/'DEBIAN/control';text=control.read_text()
-text=text.replace('libpipewire-0.3-0t64\n','libpipewire-0.3-0t64, libatspi2.0-0t64, openssh-server, acl, sudo, tailscale, gnome-text-editor, ptyxis, nautilus, libmutter-18-0 (= 50.1-0ubuntu2.4+ibara2), mutter-common (= 50.1-0ubuntu2.4+ibara2), mutter-common-bin (= 50.1-0ubuntu2.4+ibara2), gir1.2-mutter-18 (= 50.1-0ubuntu2.4+ibara2)\n')
+text=text.replace('libpipewire-0.3-0t64\n','libpipewire-0.3-0t64, libatspi2.0-0t64, openssh-server, acl, sudo, tailscale, gnome-text-editor, ptyxis, nautilus, libmutter-18-0 (= 50.1-0ubuntu2.4+ibara3), mutter-common (= 50.1-0ubuntu2.4+ibara3), mutter-common-bin (= 50.1-0ubuntu2.4+ibara3), gir1.2-mutter-18 (= 50.1-0ubuntu2.4+ibara3)\n')
 text=text[:text.index('Description:')]+'Description: ibara GNOME target and operator Console for Ubuntu 26.04\n Requires explicit matching Mutter/helper activation and Tailscale enrollment.\n Desktop services and compositor activation remain explicit setup operations.\n'
+text='\n'.join(line+', python3' if line.startswith('Depends: ') and 'python3' not in line else line for line in text.splitlines())+'\n'
 control.write_text(text)
 PY
 # No postinst enables services/accounts, loads the helper or restarts GDM.
 # Explicit setup checks the exact native tuple and live guard before effects.
 install -d "$build/packages/target"
+# Private facts uploading is opt-in: provisioning a token does not enable the timer.
+install -Dm755 "$core/scripts/facts-upload.py" "$stage/usr/lib/ibara/ops/facts-upload.py"
+install -Dm644 "$core/facts.md" "$stage/usr/share/ibara/facts.md"
+install -Dm644 -t "$stage/usr/lib/systemd/user" "$core/packaging/systemd/ibara-facts-upload.service" "$core/packaging/systemd/ibara-facts-upload.timer"
+
 dpkg-deb --threads-max=2 -Zzstd -z3 --root-owner-group --build "$stage" "$build/packages/target/${asset_name}_${version}_amd64.deb"
 sha256sum "$build/packages/target/${asset_name}_${version}_amd64.deb"
+

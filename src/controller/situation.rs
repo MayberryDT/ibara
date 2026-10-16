@@ -382,6 +382,9 @@ fn window_line(id: &str, w: &Win) -> String {
     if w.floating {
         line.push_str(" floating");
     }
+    if w.tiled {
+        line.push_str(" tiled; focus maximizes it");
+    }
     line
 }
 
@@ -551,6 +554,7 @@ impl Controller {
                 self.display_changed();
                 return;
             }
+            DesktopEvent::StateChanged => "desktop changed; observe current state".to_string(),
             DesktopEvent::Resync => "desktop events restarted; some changes may be missing".to_string(),
         };
         events.push(true, None, text);
@@ -645,11 +649,25 @@ impl Controller {
         }
     }
 
+    /// Managed commands can map windows after their tool reply. Claim only
+    /// windows in a still-verified job process group, with exact process and
+    /// compositor incarnation. Existing touched/ownership records are retained.
+    pub(crate) fn track_job_windows(&self, task_ref: &str, windows: &[Win]) -> Result<()> {
+        let processes = self.storage.task_processes(task_ref)?;
+        for w in windows {
+            if !w.compositor_instance.is_empty() && w.process_start_ticks.is_some_and(|ticks| processes.contains(&(w.pid, ticks))) {
+                self.journal.own_window(task_ref, &w.address, w.pid, &w.class, &w.title, w.process_start_ticks, &w.compositor_instance)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Observe and store a frame for `task` (`lease` binds its choices).
     pub(crate) async fn build_frame(&self, task: &TaskRecord, lease: &LeaseRecord, spec: &FrameSpec) -> Result<(Rc<FrameState>, Option<Image>)> {
         let observed_at = self.now_ms();
         let previous = self.frames.borrow().latest(&task.task_ref);
         let windows = self.desktop.windows().await?;
+        self.track_job_windows(&task.task_ref, &windows)?;
         let mut ordered: Vec<Win> = windows.clone();
         ordered.sort_by_key(|w| (!w.focused, !w.floating));
         let listed: Vec<(String, Win)> = ordered.iter().enumerate().map(|(i, w)| (format!("w{}", i + 1), w.clone())).collect();

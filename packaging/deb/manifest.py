@@ -9,7 +9,7 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('directory',type=Path)
 parser.add_argument('version')
 parser.add_argument('role',choices=['operator','target'])
-parser.add_argument('--native-version',default='50.1-0ubuntu2.4+ibara2')
+parser.add_argument('--native-version',default='50.1-0ubuntu2.4+ibara3')
 args=parser.parse_args()
 names=['ibara'] if args.role=='operator' else ['ibara','libmutter-18-0','mutter-common','mutter-common-bin','gir1.2-mutter-18']
 packages=[]

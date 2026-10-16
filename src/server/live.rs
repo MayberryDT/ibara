@@ -31,7 +31,9 @@ impl Engine for crate::controller::Controller {
         crate::controller::Controller::heartbeat(self, principal, connection_id, answering).await
     }
     async fn disconnect(&self, principal: &str, connection_id: &str) -> Result<()> {
-        crate::controller::Controller::disconnect(self, principal, connection_id).await
+        let result = crate::controller::Controller::disconnect(self, principal, connection_id).await;
+        self.retire_recording_connection(connection_id);
+        result
     }
     async fn admin(&self, action: Value) -> Result<Value> {
         crate::controller::Controller::admin(self, action).await

@@ -85,10 +85,15 @@ pub struct Window {
     pub hidden: bool,
     pub visible: bool,
     pub accepts_input: bool,
+    /// Trusted compositor modal relationship, used only by GNOME focus preflight.
+    pub modal: bool,
+    pub transient_for: Option<String>,
     pub at: [i32; 2],
     pub size: [i32; 2],
     /// Trusted compositor content bounds for AT-SPI WINDOW coordinates.
     pub client_rect: Option<[i32; 4]>,
+    /// GNOME surface buffer including client-side shadows, for GTK WINDOW coordinates.
+    pub buffer_rect: Option<[i32; 4]>,
     pub workspace: WorkspaceRef,
     pub floating: bool,
     pub monitor: i64,
@@ -101,6 +106,9 @@ pub struct Window {
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i64,
     pub stable_id: Option<String>,
+    /// GNOME types this window as a menu (dropdown, popup or combo), not a
+    /// tooltip; used only to find a menu that holds input.
+    pub menu: bool,
     /// Local /proc and compositor provenance, never accepted from client JSON.
     #[serde(skip_deserializing)]
     pub process_start_ticks: Option<u64>,
@@ -507,6 +515,19 @@ impl Hyprland {
             lua_string(&surface.address), surface.pid, lua_string(&surface.class)
         );
         bound.window_dispatch(lua, &surface.address, "close").await
+    }
+
+    /// Maximize a window within its workspace (Hyprland's internal
+    /// fullscreen mode 1, which keeps the bar); the client is not told it is
+    /// full screen. Address, PID and class must still match.
+    pub async fn maximize_surface(&self, surface: &SurfaceId) -> Result<()> {
+        let bound = self.surface_session(surface).await?;
+        let lua = format!(
+            "local target; for _, w in ipairs(hl.get_windows()) do if w.address == {} and w.pid == {} and w.class == {} then target = w break end end; \
+             if not target then error('window not found') end; hl.dispatch(hl.dsp.window.fullscreen_state({{ internal = 1, client = 0, window = target }}))",
+            lua_string(&surface.address), surface.pid, lua_string(&surface.class)
+        );
+        bound.window_dispatch(lua, &surface.address, "maximize").await
     }
 
     /// Move a window to workspace `workspace` without following it (the

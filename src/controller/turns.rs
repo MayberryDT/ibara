@@ -45,6 +45,11 @@ impl Turns {
     pub fn observed_since(&mut self, started_ms: i64) {
         if self.person.is_none() && self.previous.is_some_and(|(_, ended)| started_ms >= ended) { self.previous = None; }
     }
+    /// Whether a person is using the computer or used it since the agent
+    /// last looked; unlike [`Self::before_action`], nothing is cleared, so
+    /// an effect ibara makes on the agent's behalf leaves the refusal for
+    /// the agent's next step.
+    pub fn person_involved(&self) -> bool { self.person.is_some() || self.previous.is_some() }
     pub fn before_action(&mut self) -> Result<()> {
         let error = |reason: &str, message: String| IbaraError::new("CAPABILITY_UNAVAILABLE", message, true)
             .with("reason", reason).with("execution_not_started", true);
@@ -260,6 +265,41 @@ impl Controller {
                 "ticket":ticket,"input":input,"expires_in_ms":60_000}}))
     }
 
+    pub(crate) async fn take_screen_control(&self, operator: &str, action: &Value, authorize: &dyn Fn() -> Result<super::OperatorGrant>) -> Result<Value> {
+        authorize()?;
+        if !self.screen_input_allowed(operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "This operator may watch but may not take control.", false));
+        }
+        if action["expected_owner"].as_str() != Some(self.viewer_owner_name()?.as_str())
+            || action["expected_ownership_revision"].as_str() != Some(self.viewer_revision_name()?.as_str()) {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Desktop owner changed; refresh explicit confirmation.", true));
+        }
+        if self.turns.borrow().person.as_ref().is_some_and(|p| p.operator != operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "Another person already controls this computer.", true));
+        }
+        let mut reply = self.join_screen(operator, action, authorize).await?;
+        let _lock = self.viewer_lock.lock().await;
+        let grant = authorize()?;
+        if !self.screen_input_allowed(operator)
+            || !self.screen_admissions.borrow().get(operator).is_some_and(|(_, generation)| *generation == grant.generation)
+            || action["expected_owner"].as_str() != Some(self.viewer_owner_name()?.as_str())
+            || action["expected_ownership_revision"].as_str() != Some(self.viewer_revision_name()?.as_str()) {
+            return Err(IbaraError::new("REQUEST_CONFLICT", "Control authorization or ownership changed during admission.", true));
+        }
+        let cert = self.viewer_identity(operator, &grant).ok_or_else(|| IbaraError::new("ACCESS_DENIED", "Viewer identity changed during admission.", false))?;
+        if let Err(error) = self.sender_event(json!({"t":"turn_request","operator_cert_sha256":cert})).await {
+            self.screen_fallback(&error.message).await;
+            return Err(error.requires_reconciliation());
+        }
+        if !self.turns.borrow().person.as_ref().is_some_and(|p| p.operator == operator) {
+            return Err(IbaraError::new("ACCESS_DENIED", "The person turn was not admitted.", true));
+        }
+        reply["owner"] = json!(self.viewer_owner_name()?);
+        reply["ownership_revision"] = json!(self.viewer_revision_name()?);
+        reply["turn"] = json!("person");
+        Ok(reply)
+    }
+
     async fn sender_event(&self, event: Value) -> Result<()> {
         let screen = self.screen.as_ref().unwrap();
         match event["t"].as_str().or_else(|| event["type"].as_str()) {
@@ -363,6 +403,10 @@ pub(crate) async fn screen_watch(me: Weak<Controller>) {
             if last_status.elapsed() >= Duration::from_secs(1) {
                 last_status = std::time::Instant::now();
                 let _ = screen.command(json!({"t":"status"})).await;
+                // Zero can arrive before explicit takeover; reconcile it after admission too.
+                if screen.status().is_some_and(|s| s["viewers"] == 0) {
+                    controller.turns.borrow_mut().viewers(0, controller.now_ms());
+                }
                 if screen.status().is_some_and(|s| s["viewers"] == 0) && controller.stream_warm_until.get() <= controller.now_ms() {
                     screen.stop().await;
                     controller.screen_generation.set(0);

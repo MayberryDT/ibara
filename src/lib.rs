@@ -11,6 +11,7 @@ pub mod ids;
 pub mod install;
 pub mod harness;
 pub mod mcp;
+pub mod facts;
 pub mod operator;
 pub mod server;
 pub mod storage;
@@ -29,7 +30,9 @@ pub mod wake;
 pub mod theme;
 
 /// Packaged releases and private builds are visibly distinct. The build caller
-/// can bind a private build to its source manifest with IBARA_BUILD_ID.
+/// can bind a private build to its source manifest with IBARA_BUILD_ID, named
+/// `<branch>.r<n>.<commit>` without hyphens. After a release, the package
+/// version moves to the next one so private builds never read as older.
 pub fn version() -> String {
     match option_env!("IBARA_PKGREL") {
         Some(rel) if !rel.is_empty() => format!("{}-{rel}", env!("CARGO_PKG_VERSION")),

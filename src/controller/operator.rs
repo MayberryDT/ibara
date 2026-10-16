@@ -99,6 +99,15 @@ fn denied(message: &str) -> IbaraError {
 impl Controller {
     /// Called only after the transport verified an operator credential.
     pub async fn operator_call(&self, operator_id: &str, action: Value) -> Result<Value> {
+        let started = std::time::Instant::now();
+        let op = crate::facts::category(action["op"].as_str().unwrap_or("")).to_owned();
+        let session = action["task_ref"].as_str().unwrap_or("operator").to_owned();
+        let result = self.operator_call_inner(operator_id, action).await;
+        self.record_fact("operator", &session, operator_id, "human",
+            json!({"op":op, "status":if result.is_ok() { "ok" } else { "error" }, "duration_ms":started.elapsed().as_millis() as u64}), false);
+        result
+    }
+    async fn operator_call_inner(&self, operator_id: &str, action: Value) -> Result<Value> {
         self.ensure_open()?;
         let op = action.get("op").and_then(Value::as_str).unwrap_or("").to_string();
         let known = matches!(
@@ -302,6 +311,7 @@ impl Controller {
                     "owner":self.viewer_owner_name()?,"ownership_revision":self.viewer_revision_name()?,
                     "screen_engine":"ibara","turn":"agent","agent_resumed":self.journal.get_active_lease()?.is_some()}))
             }
+            "take_control" if self.own_screen() || self.native_screen_only => self.take_screen_control(operator_id, &action, &authorize).await,
             "take_control" | "handback" => self.operator_control(operator_id, op == "take_control", &action, &authorize).await,
             // Only the holder, who was allowed control when taking it.
             "warm" => {

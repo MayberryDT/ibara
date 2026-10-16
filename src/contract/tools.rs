@@ -32,16 +32,16 @@ impl JsonSchema for Target {
     fn inline_schema() -> bool {
         true
     }
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "type": ["string", "object"],
-            "description": "Element e12 or picture pixel {x, y, frame?}."
+            "description": "Element e12 or picture pixel {x, y, frame?}.",
+            "anyOf": [g.subschema_for::<Ref>(), g.subschema_for::<Point>()]
         })
     }
 }
 
 // A point in the pixels of a picture (computer_observe view image or screen).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Point {
     pub x: i32,
@@ -739,8 +739,7 @@ pub enum WaitFor {
     Expect(Expectation),
 }
 
-/// One object with three optional properties, of which exactly one is given:
-/// flatter than `oneOf`, which some harnesses drop.
+/// Exactly one wait target, with its complete shape.
 impl JsonSchema for WaitFor {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "WaitFor".into()
@@ -752,12 +751,11 @@ impl JsonSchema for WaitFor {
         schemars::json_schema!({
             "type": "object",
             "description": "Exactly one of op, attention or expect.",
-            "properties": {
-                "op": g.subschema_for::<Ref>(),
-                "attention": g.subschema_for::<Ref>(),
-                "expect": g.subschema_for::<Expectation>(),
-            },
-            "additionalProperties": false
+            "oneOf": [
+                {"type":"object", "properties":{"op":g.subschema_for::<Ref>()}, "required":["op"], "additionalProperties":false},
+                {"type":"object", "properties":{"attention":g.subschema_for::<Ref>()}, "required":["attention"], "additionalProperties":false},
+                {"type":"object", "properties":{"expect":g.subschema_for::<Expectation>()}, "required":["expect"], "additionalProperties":false}
+            ]
         })
     }
 }
@@ -807,13 +805,13 @@ impl JsonSchema for FilesInput {
     }
     fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let mut schema = FilesOp::json_schema(g);
-        let obj = schema.ensure_object();
-        if let Some(Value::Object(props)) = obj.get_mut("properties") {
-            let r = serde_json::to_value(g.subschema_for::<Ref>()).unwrap_or(Value::Null);
+        for branch in schema.ensure_object().get_mut("oneOf").and_then(Value::as_array_mut).expect("files variants") {
+            let obj = branch.as_object_mut().expect("files object");
+            let props = obj.get_mut("properties").and_then(Value::as_object_mut).expect("files properties");
+            let r = g.subschema_for::<Ref>().to_value();
             props.insert("task_ref".into(), r.clone());
             props.insert("request_id".into(), r);
-        }
-        if let Some(Value::Array(required)) = obj.get_mut("required") {
+            let required = obj.get_mut("required").and_then(Value::as_array_mut).expect("files required");
             required.push("task_ref".into());
             required.push("request_id".into());
         }

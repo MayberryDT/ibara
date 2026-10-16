@@ -1084,7 +1084,7 @@ Item {
   }
   function hideRequestPopup(ref) {
     var next = Object.assign({}, hiddenRequestPopups)
-    var item = requestItems.filter(function(item) { return item.ref === ref })[0]
+    var item = dropdownRequests.filter(function(item) { return item.ref === ref })[0]
     next[ref] = { at: Date.now(), signature: requestAlertSignature(item) }
     var refs = Object.keys(next).sort(function(a,b) { return Number(next[b].at) - Number(next[a].at) })
     refs.slice(512).forEach(function(key) { delete next[key] })
@@ -1092,11 +1092,21 @@ Item {
     requestDismissals.setText(JSON.stringify(next))
     closeStaleApprovalNotices()
   }
+  function dismissRequests() {
+    dropdownRequests.forEach(function(item) { root.hideRequestPopup(item.ref) })
+    return JSON.stringify({ remaining: dropdownRequests.filter(function(item) { return root.requestNeedsAlert(item) }).length })
+  }
   function openRequest(item) {
     if (shell && item) shell.summon("io.zet.ibara", JSON.stringify({ route: "computer", computerId: item.computer_id, focus: "request", ref: item.ref }))
   }
   function openRequestSettings() { if (shell) shell.summon("io.zet.ibara", JSON.stringify({ route: "logins" })) }
   readonly property var requestItems: approvals.concat(logins, questions).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
+  readonly property var dropdownRequests: requestItems.concat(needsYou.filter(function(item) { return item.unsupported }).map(function(item) {
+    var original = root.attention.filter(function(request) {
+      return String(request.computer_id || "") === item.computer_id && request.ref && request.kind !== "repair" && ["approval", "login", "question"].indexOf(request.kind) === -1
+    })[0]
+    return original ? Object.assign({}, item, { ref: original.ref, at: original.at }) : null
+  }).filter(function(item) { return !!item })).sort(function(a, b) { return a.at - b.at || a.ref.localeCompare(b.ref) })
   readonly property var popupRequests: requestDismissalsReady && !serviceStopped && requestBool("request_popups") && !requestsInConsole && dndReady && (!requestDnd || requestBool("popup_dnd"))
     ? requestItems.filter(function(item) {
         return root.requestNeedsAlert(item) && root.requestKindEnabled(item.kind) && (item.kind !== "login" || (root.loginNeedsNotification(item) && (item.login.assistance || !root.loginSourceElsewhere(item))))
@@ -2254,7 +2264,7 @@ Item {
     var code = String(error && error.code || ""), message = String(error && (error.message || error.code) || "Preview refused.")
     // ibara on this computer stopped, not the computer: it keeps its last picture and state.
     if (code === "DAEMON_UNAVAILABLE") return
-    var offline = ["TIMEOUT", "OPERATOR_TRANSPORT_UNAVAILABLE"].indexOf(code) !== -1 || /^Selected operator transport (timed out|closed)/.test(message)
+    var offline = StatusModel.transportUnavailable(error)
     // A locked screen refuses pictures (HUMAN_CONTROL): the computer answers and is Locked, not refused.
     var locked = /\bHUMAN_CONTROL\b/.test(code + " " + message) && /\blocked\b/i.test(message)
     var updated = Object.assign({}, sessions)
@@ -4098,7 +4108,7 @@ Item {
         if (String(error.code || "") === "DAEMON_UNAVAILABLE") return
         // No reply is not a refusal: like a preview that timed out or lost its transport, the
         // computer is offline and keeps its last frame, grayed.
-        var unreachable = String(error.code || "") === "TIMEOUT" || /^Selected operator transport (timed out|closed|failed)/.test(String(error.message || ""))
+        var unreachable = StatusModel.transportUnavailable(error)
         if (unreachable && sessions[request.ref]) {
           var offlineSessions = Object.assign({}, sessions)
           offlineSessions[request.ref] = Object.assign({}, sessions[request.ref], { connection: "offline", frame_error: plainError(String(error.message || error.code), request.ref, true) })
@@ -4161,8 +4171,7 @@ Item {
         var bootError = parsed.error || ({}), bootMessage = String(bootError.message || bootError.code || "ibara couldn't connect to this computer. It will try again.")
         var bootSession = sessions[request.ref]
         if (bootSession) {
-          var bootDenied = /^(PERMISSION_DENIED|UNAUTHORIZED|AUTH_REQUIRED|GRANT_REVOKED|OPERATOR_TRANSPORT_UNAVAILABLE)\b/.test(bootMessage) ||
-            ["PERMISSION_DENIED", "UNAUTHORIZED", "AUTH_REQUIRED", "GRANT_REVOKED"].indexOf(String(bootError.code || "")) !== -1
+          var bootDenied = !StatusModel.transportUnavailable(bootError) && StatusModel.accessDenied(parsed)
           invalidateTargetPreviews(request.ref)
           if (bootDenied) forgetComputerCaches(request.ref)
           var bootSessions = Object.assign({}, sessions)
@@ -4769,12 +4778,15 @@ Item {
     target: "io.zet.ibara"
     function refresh(): void { root.refresh() }
     function previewStats(): string { return root.previewStats() }
+    function dismissRequests(): string { return root.dismissRequests() }
     function status(): string {
       return JSON.stringify({
         connection: root.connectionState,
         error: root.lastError,
         computers: root.computers.length,
         needs_you: root.needsYouCount,
+        visible_requests: root.dropdownRequests.filter(function(item) { return root.requestNeedsAlert(item) }).length,
+        dismissals_ready: root.requestDismissalsReady,
         questions: root.questions.length,
         problems: root.problems.map(function(p) { return p.heading })
       })

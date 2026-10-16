@@ -51,6 +51,15 @@ const PREVIEW_DEADLINE: Duration = Duration::from_millis(2000);
 /// How long a menu level may take to close after Escape.
 const MENU_CLOSE: Duration = Duration::from_secs(1);
 const MENU_POLL: Duration = Duration::from_millis(50);
+/// After admitted text, how long new read-only observations may start
+/// (LibreOffice on Hyprland fetches a pasted clipboard seconds later, and
+/// a Writer field read takes 2.5 s). A read already started finishes under
+/// its own helper bound.
+const READBACK_WINDOW: Duration = Duration::from_secs(8);
+/// At least this many complete observations, each starting after the last,
+/// before readback gives up, unless [`READBACK_LIMIT`] has passed.
+const READBACK_OBSERVATIONS: usize = 2;
+const READBACK_LIMIT: Duration = Duration::from_secs(14);
 /// Tries of a shortcut after its menu closed (at [`MENU_POLL`]).
 const MENU_RELEASE_TRIES: u32 = 20;
 /// Moves at most to reach a menu item (open, walk, open a submenu, …).
@@ -102,7 +111,12 @@ impl DesktopConfig {
             hyprctl: tool("IBARA_TEST_HYPRCTL", "hyprctl"),
             hyprland_instance: "0".into(),
             grim: tool("IBARA_TEST_GRIM", "/usr/bin/grim"),
-            cua: tool("IBARA_TEST_CUA", "/usr/bin/cua-driver"),
+            cua: std::env::var_os("IBARA_CUA_DRIVER").filter(|p| !p.is_empty()).map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    if test_tools { return tool("IBARA_TEST_CUA", "/usr/bin/cua-driver"); }
+                    let bundled = release_root.join("cua/cua-driver");
+                    if bundled.is_file() { bundled } else { "/usr/bin/cua-driver".into() }
+                }),
             idle_binary: tool("IBARA_TEST_IDLE", "/usr/bin/omarchy-toggle-idle"),
             wf_recorder: tool("IBARA_TEST_WF_RECORDER", "/usr/bin/wf-recorder"),
             idle_state: state_dir.join("idle-owned.json"),
@@ -526,6 +540,9 @@ impl Desktop {
     /// from now until control ends or a person takes over ([`handover`]), or
     /// none. With none, the screen goes back to the person's pointer within
     /// [`handover::POLL`], and at once through [`Desktop::release_input`].
+    /// GNOME reports inventory changes, never per-window open events.
+    pub fn emits_window_open_events(&self) -> bool { self.gnome_control.is_none() }
+
     pub fn set_agent(&self, label: Option<String>) {
         if let Some(control) = &self.gnome_control {
             control.set_agent(label);
@@ -621,13 +638,21 @@ impl Desktop {
     }
 
     async fn effect<T>(&self, cancel: Option<&Cancel>, work: impl Future<Output = Result<T>>) -> Result<T> {
+        self.gated(cancel, false, work).await
+    }
+
+    /// `focus` is true for a window focus, which may return to a window whose
+    /// stranded menu holds input ([`gnome::State::stranded_menu`]).
+    async fn gated<T>(&self, cancel: Option<&Cancel>, focus: bool, work: impl Future<Output = Result<T>>) -> Result<T> {
         cua::unless_cancelled(cancel)?;
         if self.gnome_control.is_none() && self.uses_dispatchers().await {
             // The passive seat pointer must exist before hiding it. Launch
             // and window management still work if wheel support is missing.
             let _ = self.prepare_dispatchers().await;
         }
-        if let Some(control) = &self.gnome_control { control.to_agent().await?; }
+        if let Some(control) = &self.gnome_control {
+            if focus { control.to_agent_for_focus().await?; } else { control.to_agent().await?; }
+        }
         else { self.handover.to_agent().await?; }
         cua::unless_cancelled(cancel)?;
         let before = (run::mutating_spawn_count(), cua::dispatch_count(), compositor_input::dispatch_count(), gnome::dispatch_count());
@@ -677,15 +702,43 @@ impl Desktop {
     }
 
     pub async fn focus(&self, surface: &SurfaceId, cancel: Option<&Cancel>) -> Result<()> {
-        self.effect(cancel, async {
+        self.gated(cancel, true, async {
             self.live(surface).await?.ok_or_else(|| stale("Cannot focus a missing surface."))?;
             // Hyprland may move the pointer onto the window it focuses.
             let motion = self.cua.motion();
             let _moving = motion.begin();
             if let Some(gnome) = self.hypr.gnome() { return gnome.mutate("Focus", surface).await; }
-            self.hypr.focus_address(&surface.address).await
+            self.hypr.focus_address(&surface.address).await?;
+            self.give_room(surface).await
         })
         .await
+    }
+
+    /// Whether windows tile here (Hyprland), rather than overlap (GNOME).
+    pub fn tiling(&self) -> bool { self.hypr.gnome().is_none() }
+
+    /// A tiled window that shares its workspace with another tiled window
+    /// can be too small to work in (a 466x245 dwindle tile). Maximize it
+    /// there, then wait (at most 2 s) until its geometry holds still, so
+    /// later reads and clicks bind to where it is. Floating, maximized,
+    /// full-screen and lone windows are left as they are.
+    async fn give_room(&self, surface: &SurfaceId) -> Result<()> {
+        let windows = self.hypr.clients().await?;
+        let Some(window) = windows.iter().find(|w| w.is(surface)) else { return Err(stale("Cannot focus a missing surface.")) };
+        let laid = |w: &hyprland::Window| w.mapped && !w.hidden && !w.floating && w.fullscreen == 0;
+        if !laid(window) || !windows.iter().any(|o| o.address != window.address && o.workspace.id == window.workspace.id && laid(o)) {
+            return Ok(());
+        }
+        self.hypr.maximize_surface(surface).await?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut last, mut since) = (None, Instant::now());
+        while Instant::now() < deadline {
+            let now = self.live(surface).await?.map(|w| (w.geometry(), w.fullscreen));
+            if now != last { (last, since) = (now, Instant::now()); }
+            else if last.as_ref().is_some_and(|(_, mode)| *mode != 0) && since.elapsed() >= Duration::from_millis(300) { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 
     /// Ask a window to close (like its close button); the address **and**
@@ -815,8 +868,17 @@ impl Desktop {
     /// [`MENU_CLOSE`] for the menu to show it; when the item cannot be
     /// reached, the menu is closed again and nothing is chosen.
     async fn choose_menu_item(&self, element: &ElementTarget, pid: i64, window: u64, screens: &Screens, cancel: Option<&Cancel>) -> Result<()> {
+        // Cua reports a check or radio entry's `selected` as checked, so
+        // nothing shows which of them is highlighted: Return could choose
+        // another entry.
+        if matches!(element.role.as_str(), "check menu item" | "radio menu item") {
+            return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "Nothing was sent: ibara cannot see which check or radio menu entry is highlighted, so it cannot choose one safely.", true)
+                .with("execution_not_started", true)
+                .with("next", "Use the app's keyboard shortcut or the dialog that sets this option, then observe to confirm it."));
+        }
         let read = || self.cua.menu_move(&element.selector, &element.role, &element.name);
         let surface = &element.surface;
+        let mut entered = Vec::new();
         let mut next = read().await?;
         for moved in 0..MENU_MOVES {
             // Once a move went out, a refusal no longer means nothing was sent.
@@ -834,8 +896,23 @@ impl Desktop {
                     cua::unless_cancelled(cancel).map_err(sent)?;
                     return self.menu_keys(surface, "Return", 1).await.map_err(sent);
                 }
-                cua::MenuMove::Open(token) => self.cua.click_token(pid, window, token).await.map_err(sent)?,
-                cua::MenuMove::Keys(key, count) => self.menu_keys(surface, key, *count).await.map_err(sent)?,
+                // A menu opened again starts with no submenu entered.
+                cua::MenuMove::Open(token) => {
+                    entered.clear();
+                    self.cua.click_token(pid, window, token).await.map_err(sent)?
+                }
+                cua::MenuMove::Keys(key, count) => {
+                    if *key == "Escape" { entered.clear(); }
+                    self.menu_keys(surface, key, *count).await.map_err(sent)?
+                }
+                // Into a submenu that opened under its highlighted entry, once:
+                // if it asks again the keyboard is already inside it, on an
+                // entry Cua marks nothing on, so walk down instead.
+                cua::MenuMove::Enter { level, down } if entered.contains(level) => self.menu_keys(surface, "Down", *down).await.map_err(sent)?,
+                cua::MenuMove::Enter { level, .. } => {
+                    entered.push(*level);
+                    self.menu_keys(surface, "Right", 1).await.map_err(sent)?
+                }
             }
             let done = next.clone();
             let start = Instant::now();
@@ -1057,10 +1134,12 @@ impl Desktop {
         }).await
     }
 
-    pub async fn type_text(&self, surface: &SurfaceId, text: &str, cursor: TypingCursor, cancel: Option<&Cancel>) -> Result<()> {
+    /// Returns a note when the application left a completion selected after
+    /// the typed text.
+    pub async fn type_text(&self, surface: &SurfaceId, text: &str, cursor: TypingCursor, cancel: Option<&Cancel>) -> Result<Option<String>> {
         if let Some(control) = &self.gnome_control {
             input::check_text(text)?;
-            if text.is_empty() { return Ok(()); }
+            if text.is_empty() { return Ok(None); }
             return self.effect(cancel,async {
                 let live=self.ensure_focused(surface).await?;
                 let mut before=native_field::read(&live,&self.env,cancel).await?;
@@ -1078,7 +1157,8 @@ impl Desktop {
                 if fresh!=before { return Err(stale("The native field changed before insertion.").with("execution_not_started",true)); }
                 let mut admitted=0usize;
                 let mut confirmed=0usize;
-                let result: Result<()>=async {
+                let mut completed=None;
+                let result: Result<Option<String>>=async {
                     let mut offset=0;
                     while offset<text.len() {
                         cua::unless_cancelled(cancel)?;
@@ -1089,20 +1169,22 @@ impl Desktop {
                         let expected=before.after_insertion(piece)?;
                         transaction.text(piece).await?;
                         admitted+=piece.chars().count();
-                        let observed=tokio::time::timeout(Duration::from_secs(3),async {
-                            loop {
-                                let observed=native_field::read(&live,&self.env,cancel).await?;
-                                if expected.confirms_insertion(&observed) { return Ok::<_,IbaraError>(observed); }
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                        }).await.map_err(|_| IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted, but exact field/caret/selection readback was not confirmed. Reobserve before retrying.", false)
-                            .with("execution_not_started",false).requires_reconciliation())??;
+                        let mut last_readback=None;
+                        let (observed,added)=read_back(&live,&self.env,cancel,&expected,&mut last_readback).await
+                            .map_err(|mut error| {
+                                let diagnostic=last_readback.as_ref().map(Value::to_string).unwrap_or_else(||"no complete observation".into());
+                                error.message=format!("{} Native readback: {diagnostic}. Reobserve before further input.",error.message);
+                                error.with("execution_not_started",false).with("native_readback",last_readback.unwrap_or(Value::Null)).requires_reconciliation()
+                            })?;
                         confirmed+=piece.chars().count();
+                        // A later piece replaces a selected completion.
+                        completed=added;
                         before=observed;
                         offset=end;
                     }
                     transaction.finish().await?;
-                    Ok(())
+                    Ok(completed.map(|n| format!("the app completed {n} more character{} after it and left {} selected; typing replaces {}, Return accepts {}",
+                        if n==1 {""} else {"s"}, if n==1 {"it"} else {"them"}, if n==1 {"it"} else {"them"}, if n==1 {"it"} else {"them"})))
                 }.await;
                 *self.typed_at.lock().unwrap_or_else(|p|p.into_inner())=Some(Instant::now());
                 result.map_err(|mut error| {
@@ -1135,6 +1217,7 @@ impl Desktop {
                         cua::unless_cancelled(cancel)?;
                     }
                     let before = native_field::read(&live, &self.env, cancel).await?;
+                    let expected=before.after_paste(text)?;
                     let display = selection::display()?;
                     let mut saved = tokio::task::spawn_blocking(move || selection::set_aside(&display)).await
                         .map_err(|e| crate::error::internal(format!("clipboard: {e}")))??;
@@ -1157,12 +1240,16 @@ impl Desktop {
                         } else {
                             self.cua.key(live.pid, window, &keys).await?;
                         }
-                        async {
-                            let after = native_field::read(&live, &self.env, cancel).await?;
-                            if after.path == before.path && after.role == before.role && after.frame == before.frame && after.value != before.value && after.value.contains(text) { Ok(()) }
-                            else { Err(IbaraError::new("OUTCOME_UNKNOWN", "Native paste was sent once, but changed exact text in the focused field was not confirmed. Observe before acting again.", false)) }
-                        }.await
-                            .map_err(|mut e| { e.retry_safe = false; e.with("execution_not_started", false).requires_reconciliation() })
+                        let mut last_readback = None;
+                        read_back(&live, &self.env, cancel, &expected, &mut last_readback).await.map(drop)
+                            .map_err(|mut e| {
+                                if e.code == "OUTCOME_UNKNOWN" {
+                                    let diagnostic = last_readback.as_ref().map(Value::to_string).unwrap_or_else(|| "no complete observation".into());
+                                    e.message = format!("Native paste was sent once, but changed exact text in the focused field was not confirmed. Native readback: {diagnostic}. Observe before acting again.");
+                                }
+                                e.retry_safe = false;
+                                e.with("execution_not_started", false).with("native_readback", last_readback.unwrap_or(Value::Null)).requires_reconciliation()
+                            })
                     }.await;
                     let restored = tokio::task::spawn_blocking(move || saved_back.put_back()).await
                         .map_err(|e| crate::error::internal(format!("clipboard: {e}")))?;
@@ -1180,6 +1267,7 @@ impl Desktop {
             result
         })
         .await
+        .map(|()| None)
     }
 
     /// Before a point click: put the real pointer where the named cursor is,
@@ -1546,8 +1634,7 @@ impl Desktop {
                 row("native.gnome", "gnome-shell+ibara-identity".into(), state.as_ref().map(|_|true).map_err(Clone::clone)),
                 row("session", "gnome-session-mode".into(), ready),
                 row("native.input", "mutter-ibara-guard+gnome-shell".into(), state.as_ref().map_err(Clone::clone).and_then(|s| {
-                    if s.input_readiness_api!=1 { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME input readiness helper needs a session reload.", true)); }
-                    if s.shell_input_blocked { return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "GNOME Shell holds input. A person must dismiss any secure prompt before agent work.", true)); }
+                    if s.input_readiness_api!=1 || s.shell_input_blocked { return Err(s.blocked()); }
                     Ok(!s.locked && s.guarded_input_api==1 && s.cursor_api==1 && s.monitors.len()==1 && s.monitors[0].scale==1.0)
                 })),
                 row("native.capture", "gnome-shell+ibara-snapshot".into(), state.as_ref().map(|s|
@@ -1714,6 +1801,58 @@ pub(crate) fn write_script(path: &Path, body: &str) {
         .unwrap();
     sh.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
     assert!(sh.wait().unwrap().success(), "could not write {}", path.display());
+}
+
+/// After text was admitted once, read the focused field until it shows
+/// exactly `expected`. Each read is awaited to its own helper bound, so no
+/// helper is left running; no new read starts after [`READBACK_WINDOW`]. A
+/// reader refusal or helper timeout is read again; cancellation and any
+/// other error stop at once. `last` keeps only boolean comparisons of the
+/// last complete observation. Sends no input. Also accepts the exact text
+/// followed by a completion the application left selected, returning its
+/// length ([`native_field::Field::completion_after`]).
+async fn read_back(live: &Window, env: &[(OsString, OsString)], cancel: Option<&Cancel>, expected: &native_field::Field, last: &mut Option<Value>) -> Result<(native_field::Field, Option<usize>)> {
+    let start = Instant::now();
+    let mut observations = 0;
+    let mut reads = 0u32;
+    loop {
+        let refused = match native_field::read_at(live, env, cancel, &expected.path).await {
+            Ok(observed) => {
+                observations += 1;
+                *last = Some(serde_json::json!({"window_matches":expected.window_frame==observed.window_frame,
+                    "path_matches":expected.path==observed.path,"role_matches":expected.role==observed.role,
+                    "value_matches":expected.value==observed.value,"caret_matches":expected.caret==observed.caret,
+                    "selection_matches":expected.selections==observed.selections,"paragraphs_match":expected.paragraphs==observed.paragraphs}));
+                if expected.confirms_insertion(&observed) { return Ok((observed, None)); }
+                if let Some(added) = expected.completion_after(&observed) { return Ok((observed, Some(added))); }
+                false
+            }
+            Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => {
+                // Reader refusals carry no field text; keep the last one for the diagnostic.
+                if observations == 0 { *last = Some(serde_json::json!({"reader_refused": clip_string(&error.message, 200), "reads": reads + 1})); }
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        // Refused at the expected path: the application may have scrolled
+        // the typed paragraph to another index. Find the unique focused
+        // field instead.
+        if refused { match native_field::read(live, env, cancel).await {
+            Ok(observed) if expected.confirms_scrolled(&observed) => {
+                *last = Some(serde_json::json!({"scrolled": true, "path_shift": expected.path.last().zip(observed.path.last()).map(|(a, b)| i64::from(*a) - i64::from(*b))}));
+                return Ok((observed, None));
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.code, "CAPABILITY_UNAVAILABLE" | "TIMEOUT") && !cancel.is_some_and(Cancel::is_cancelled) => {}
+            Err(error) => return Err(error),
+        } }
+        reads += 1;
+        let elapsed = start.elapsed();
+        if elapsed >= READBACK_LIMIT || (elapsed >= READBACK_WINDOW && observations >= READBACK_OBSERVATIONS) {
+            return Err(IbaraError::new("OUTCOME_UNKNOWN", "Native text was admitted; readback deadline expired.", false).with("reader_refused_last", refused));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]

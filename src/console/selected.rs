@@ -292,7 +292,7 @@ pub async fn selected_control(ctx: &Ctx) -> Handled {
         json!({"expected_owner": owner, "expected_ownership_revision": revision})
     };
     let mut engine = "sunshine".to_string();
-    if op == "join" || op == "warm" {
+    if ["join", "warm", "take_control", "screen_failed"].contains(&op) {
         if let Ok(Ok(status)) = tokio::time::timeout(ctx.timeout, ctx.console.sessions.call(&computer, Some(&epoch), "status", json!({"stream_only":true}))).await {
             engine = status["result"]["screen_engine"].as_str().unwrap_or("sunshine").into();
         }

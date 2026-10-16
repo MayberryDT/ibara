@@ -5,7 +5,7 @@
 # computer, ibara-operator.service for the console), sysusers, tmpfiles, the
 # /dev/uinput rule, the pacman hooks (set up again after an upgrade; rebuild
 # Cua's Hyprland plugin after Hyprland changes), the plugin's source and the
-# console plugin for Omarchy's bar. No Node or Python. Take Control comes with
+# console plugin for Omarchy's bar. Python supports the opt-in facts uploader. Take Control comes with
 # it: ibara-stream and ibara-view are built at the same version from their
 # forks by packaging/release.sh, and installed together with it.
 #
@@ -20,7 +20,7 @@ _core=${IBARA_CORE_DIR:-$startdir/..}
 _plugin=${IBARA_PLUGIN_DIR:-}
 
 pkgname=ibara
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=${IBARA_PKGREL:-1}
 pkgdesc='Use your computers from any other, by you and your agents'
 arch=('x86_64')
@@ -47,10 +47,11 @@ depends=(
 optdepends=(
   'ufw: firewall rules keeping the agent entry, pairing and streaming on the tailnet'
   'chromium: web pages agents can read and use'
+  'python: opt-in private facts uploader'
 )
 makedepends=('cargo' 'git' 'clang')
 install=ibara.install
-options=('!lto' '!debug')
+options=('!lto' '!debug' '!strip')
 
 
 prepare() {
@@ -88,6 +89,9 @@ package() {
   install -Dm755 "$built/ibara" "$lib/bin/ibara"
   install -Dm755 "$built/ibarad" "$lib/bin/ibarad"
   install -Dm755 "$built/ibara-screen" "$lib/bin/ibara-screen"
+  # Keep the pinned external toolkit byte-identical to its upstream archive.
+  strip --strip-all "$lib/bin/ibara" "$lib/bin/ibarad" "$lib/bin/ibara-screen"
+  bash packaging/cua/stage.sh "$lib/cua" "$srcdir/cua-cache"
   install -d "$pkgdir/usr/bin"
   ln -s ../lib/ibara/bin/ibara "$pkgdir/usr/bin/ibara"
   ln -s ../lib/ibara/bin/ibarad "$pkgdir/usr/bin/ibarad"
@@ -98,9 +102,9 @@ package() {
   done
 
   # Cua's Hyprland plugin source (built on each computer) and the browser page reader.
-  git ls-files -z vendor/cua-hyprland-plugin | while IFS= read -r -d '' file; do
-    install -Dm644 "$file" "$lib/cua-hyprland-plugin/${file#vendor/cua-hyprland-plugin/}"
-  done
+  # Source archives intentionally carry no Git metadata. Copy the vendored
+  # tree itself; a missing source directory fails package construction.
+  cp -a vendor/cua-hyprland-plugin "$lib/cua-hyprland-plugin"
   install -Dm644 -t "$lib/chrome-extension" chrome-extension/manifest.json chrome-extension/worker.js chrome-extension/document.js
 
   install -Dm644 -t "$pkgdir/usr/lib/systemd/system" \
@@ -115,6 +119,10 @@ package() {
   install -Dm644 packaging/60-ibara-uinput.rules "$pkgdir/usr/lib/udev/rules.d/60-ibara-uinput.rules"
   install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" packaging/ibara-refresh.hook packaging/ibara-cua.hook
   install -Dm644 skills/ibara/SKILL.md "$pkgdir/usr/share/ibara/skills/ibara/SKILL.md"
+  # Provisioning a token never enables this opt-in timer.
+  install -Dm755 scripts/facts-upload.py "$lib/ops/facts-upload.py"
+  install -Dm644 facts.md "$pkgdir/usr/share/ibara/facts.md"
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" packaging/systemd/ibara-facts-upload.service packaging/systemd/ibara-facts-upload.timer
   # The console runs inside Omarchy's shell, so its window carries the shell's
   # app id; this entry gives it ibara's name, icon and a launcher to open it.
   install -Dm644 packaging/io.zet.ibara.desktop "$pkgdir/usr/share/applications/io.zet.ibara.desktop"

@@ -231,7 +231,7 @@ Within what ibara can see, no step that asks first runs without an approval, and
 
 ### Can I use ibara without Omarchy
 
-Ubuntu26.04 amd64 also has a standalone Console and a guarded GNOME50 Wayland target. The target requires the exact maintained Mutter packages and currently has software-VM, single-output scale1 qualification. See [Ubuntu installation and limits](packaging/deb/README.md). macOS and Windows remain planned.
+ibara is built for Omarchy, on real computers or in virtual machines. No other platform is supported or planned. The Ubuntu 26.04 packages published with 0.3.0 and 0.3.1 are historical and are no longer supported or updated. See the [historical Ubuntu installation notes and limits](packaging/deb/README.md).
 
 ### How do I update or remove ibara
 

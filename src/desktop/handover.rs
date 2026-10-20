@@ -1711,7 +1711,7 @@ mv "$dir/elements.new" "$dir/elements"
     }
 
     /// A Save As path into a folder of tasks, 99 characters.
-    const SAVE_AS: &str = "/tmp/ibara-synthetic-save/dogfood.txt";
+    const SAVE_AS: &str = "/tmp/ibara-synthetic-save/launch-proof/desktop-checks/saved-output/native-editor-checks/dogfood.txt";
 
     #[tokio::test]
     async fn typing_goes_on_where_it_stopped_when_a_display_change_ends_cuas_input_connection() {

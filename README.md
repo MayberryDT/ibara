@@ -215,7 +215,7 @@ At full memory on 28 September, on one of the test computers: ibara idle 17.8 Mi
 
 ### Does ibara send my screen or files to anyone else
 
-No. Pictures, files and commands go directly between your computers over Tailscale's encrypted network. ibara has no server of its own and no account to sign up for. The only thing ibara fetches from the internet is its own signed releases, when you install or update.
+Pictures, files and commands pass directly between your computers over Tailscale's encrypted network. ibara has no server of its own and no account to sign up for. Your agent can also send the screens, text and file contents it reads to its model provider. What leaves your computers depends on where your agent and its model run. ibara fetches its own signed releases when you install or update.
 
 ### Which agents work with ibara
 

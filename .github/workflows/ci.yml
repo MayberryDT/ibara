@@ -24,4 +24,4 @@ jobs:
         run: |
           useradd --create-home builder
           chown -R builder: "$GITHUB_WORKSPACE"
-          su builder -c 'cd "$GITHUB_WORKSPACE" && cargo test --locked'
+          su builder -c 'cd "$GITHUB_WORKSPACE" && IBARA_E2E_EVIDENCE="$GITHUB_WORKSPACE/target/ci-evidence" cargo test --locked'

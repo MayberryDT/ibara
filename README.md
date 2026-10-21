@@ -215,7 +215,7 @@ At full memory on 28 September, on one of the test computers: ibara idle 17.8 Mi
 
 ### Does ibara send my screen or files to anyone else
 
-No. Pictures, files and commands go directly between your computers over Tailscale's encrypted network. ibara has no server of its own and no account to sign up for. The only thing ibara fetches from the internet is its own signed releases, when you install or update.
+Pictures, files and commands pass directly between your computers over Tailscale's encrypted network. ibara has no server of its own and no account to sign up for. Your agent can also send the screens, text and file contents it reads to its model provider. What leaves your computers depends on where your agent and its model run. ibara fetches its own signed releases when you install or update.
 
 ### Which agents work with ibara
 
@@ -231,7 +231,7 @@ Within what ibara can see, no step that asks first runs without an approval, and
 
 ### Can I use ibara without Omarchy
 
-Ubuntu26.04 amd64 also has a standalone Console and a guarded GNOME50 Wayland target. The target requires the exact maintained Mutter packages and currently has software-VM, single-output scale1 qualification. See [Ubuntu installation and limits](packaging/deb/README.md). macOS and Windows remain planned.
+ibara is built for Omarchy, on real computers or in virtual machines. No other platform is supported or planned. The Ubuntu 26.04 packages published with 0.3.0 and 0.3.1 are historical and are no longer supported or updated. See the [historical Ubuntu installation notes and limits](packaging/deb/README.md).
 
 ### How do I update or remove ibara
 

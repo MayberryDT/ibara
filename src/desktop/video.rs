@@ -264,6 +264,12 @@ fn encoder_args(node: &Path, display: &str, width: u32, height: u32, fps: u32, e
     args
 }
 
+// nvidia-vaapi-driver implements decoding only. Launching wf-recorder as an
+// encode capability probe can abort inside its failure path on these systems.
+fn vaapi_probe_allowed(vendor: &str, driver: Option<&std::ffi::OsStr>) -> bool {
+    vendor.trim() != "0x10de" && driver != Some(std::ffi::OsStr::new("nvidia"))
+}
+
 /// VA-API render nodes, in order.
 fn render_nodes() -> Vec<PathBuf> {
     let mut nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
@@ -325,7 +331,19 @@ impl Video {
         if !super::on_path(&self.0.program) {
             return Err(NOT_INSTALLED.into());
         }
+        let driver = self.0.env.iter().rev()
+            .find(|(key, _)| key == "LIBVA_DRIVER_NAME")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os("LIBVA_DRIVER_NAME"));
         for node in render_nodes() {
+            let vendor = node.file_name()
+                .and_then(|name| std::fs::read_to_string(
+                    Path::new("/sys/class/drm").join(name).join("device/vendor")
+                ).ok())
+                .unwrap_or_default();
+            if !vaapi_probe_allowed(&vendor, driver.as_deref()) {
+                continue;
+            }
             if self.encodes(&node, display).await {
                 return Ok(node);
             }
@@ -482,6 +500,21 @@ impl Video {
 
 #[cfg(test)]
 mod tests {
+    // Failure cases: NVIDIA vendor (including whitespace) must never reach
+    // wf-recorder; a forced NVIDIA VA driver must not probe any node; Intel,
+    // AMD and unknown devices must retain the existing probe without that override.
+    #[test]
+    fn vaapi_probe_rejects_decode_only_nvidia() {
+        use std::ffi::OsStr;
+        assert!(!super::vaapi_probe_allowed("0x10de\n", None));
+        assert!(!super::vaapi_probe_allowed("0x8086", Some(OsStr::new("nvidia"))));
+        assert!(!super::vaapi_probe_allowed("", Some(OsStr::new("nvidia"))));
+        for vendor in ["0x8086", "0x1002", ""] {
+            assert!(super::vaapi_probe_allowed(vendor, None));
+            assert!(super::vaapi_probe_allowed(vendor, Some(OsStr::new("iHD"))));
+        }
+    }
+
     use super::*;
 
     fn packets(n: usize, fill: u8) -> Vec<u8> {

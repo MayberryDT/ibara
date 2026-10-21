@@ -137,3 +137,7 @@ The first public release.
 - `ibara uninstall` also removes setup's `ibara` and `ibarad` links in `~/.local/bin`, and with `--delete-data` the viewer's settings and cache; it names the 3 packages it removes and says `cua-driver-bin` stays.
 - A first install shows only setup's own output: the package no longer says to run `ibara setup` while the installer is about to run it.
 - No Node or Python at run time.
+
+## 2026-10-21 — NVIDIA preview probe
+
+Skip the legacy wf-recorder VAAPI encode probe on NVIDIA render nodes and when LIBVA_DRIVER_NAME=nvidia is effective. This avoids the unsupported encode attempt and reported crash notification (#9); NVENC screen capture is unchanged.

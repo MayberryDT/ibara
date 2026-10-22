@@ -60,6 +60,8 @@ The prompt has the agent do three things itself, so ibara never edits any agent'
 
 The agent gets 11 tools, described in [agent tools](docs/agent-tools.md).
 
+Once your agent can see the spare, [run your first task](https://ibara.app/docs/first-task). The no-login practice task has it open a page, try the Settings menu with the mouse and keyboard, and return a screenshot and a short pass/fail report. Watch the spare’s screen and check the result before moving on to your own work.
+
 ## Compositors
 
 Hypoland is also supported through optional compositor input. ibara selects it

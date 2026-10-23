@@ -21,6 +21,10 @@ Start with the console. ibara repairs most problems by itself, and when it canno
    journalctl -u ibara-agent-sshd.service -n 50          # the agent entry
    ```
 
+On an NVIDIA-only spare, legacy **Live Video (Preview)** is unsupported. Its VAAPI path needs an encoder that the NVIDIA VAAPI driver does not provide. [Issue #9](https://github.com/MayberryDT/ibara/issues/9) tracks an invalid preview probe; [the source change](https://github.com/MayberryDT/ibara/pull/10) skips that probe without adding NVENC to legacy Live Video. The change was not verified on physical NVIDIA hardware, and a source merge alone does not show which installed package includes it.
+
+If you report a preview problem, include `pacman -Q ibara`, the GPU model, which console view failed and the relevant log lines. Say whether still-image previews worked and whether the agent could finish its task. Remove private information from logs and screenshots before posting.
+
 ## The bar icon is missing or the console is empty
 
 - Run `ibara setup` again. It links the plugin into Omarchy, enables it and restarts the shell once if needed.

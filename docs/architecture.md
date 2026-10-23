@@ -173,3 +173,22 @@ The journal is SQLite and changes only by additive migrations. Before an update,
 ## Releases and updates
 
 A release is 3 packages at one version (`ibara`, `ibara-stream` and `ibara-view`), a signed manifest (`stable.json` and `stable.json.sig`), the installer and the full source. `packaging/release.sh` builds them, and `packaging/publish.sh` uploads them as a GitHub release. `ibara update` checks the manifest's signature against the key built into ibara and each package's digest before one `pacman -U` of all 3. [Release verification](release-verification.md) shows how to check the same things by hand.
+
+
+## Stream and viewer forks
+
+Take Control uses separate GPL-3.0 programs based on Sunshine and Moonlight. Their sources are included in ibara’s release archive.
+
+### Streaming host
+
+`ibara-stream` is a [Sunshine](https://github.com/LizardByte/Sunshine) fork. It removes the web interface, tray, UPnP, mDNS and gamepad support.
+
+It admits a viewer through a single-use ticket bound to that viewer’s certificate. It confirms when access is revoked and caps software encoding.
+
+### Viewer
+
+`ibara-view` is a [Moonlight Qt](https://github.com/moonlight-stream/moonlight-qt) 6.1.0 fork. It connects to one computer using a ticket and its own viewer identity.
+
+Super+Alt+Escape moves keyboard input between the 2 computers. A label shows which computer receives keys. The viewer supports file drop and closes when the stream ends.
+
+It downloads nothing from Moonlight’s servers. The forks have no separate repositories; their source, submodules and changes are in the release source archive.

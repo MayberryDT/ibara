@@ -1,5 +1,12 @@
 # Changelog
 
+## Documentation updated on 23 October 2026
+
+- Rewrite the README in plain English, with requirements, installation, agent connection and a first task in order.
+- Correct the release download size and browser discovery status. Keep September measurements in a dated reference page and move compositor settings into their own guide.
+- Align the README and contribution guide with the maintainer’s policy for reviewing proposed fixes independently.
+
+
 ## Unreleased — 2026-10-14 MCP contract and recovery
 
 - Advertise complete per-tool schemas with strict action/expectation/file variants and coordinate shapes; retain nested validation constraints instead of cross-tool prose pointers.

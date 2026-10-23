@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.3.1-2 — 23 October 2026
+## 0.3.1-3 — 23 October 2026
 
+- Correct exact stream/view dependency pins when repackaging the console hotfix.
 - Hotfix the white, unreadable Omarchy console: explicitly qualify the window background through Commons.Color. Repackage stable 0.3.1-1 binaries unchanged; no driver or backend changes.
 
 ## Unreleased — Console Desktop Identity

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1-2 — 23 October 2026
+
+- Hotfix the white, unreadable Omarchy console: explicitly qualify the window background through Commons.Color. Repackage stable 0.3.1-1 binaries unchanged; no driver or backend changes.
+
 ## Unreleased — Console Desktop Identity
 
 - Package an `io.zet.ibara` desktop entry and hicolor icons (the ibara mark, plus a symbolic 16-pixel version for bars). The entry opens the console from the app launcher and gives its window ibara's name and icon in window lists that match a shell window's title to an entry, where it showed as Quickshell before: the console is drawn by Omarchy's shell, so its window carries the shell's `org.quickshell` app id.

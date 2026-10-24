@@ -8,4 +8,4 @@ All three packages must be version0.3.2-1, with exact sibling dependency pins. P
 
 Preserve browser profiles, identities, grants, journals and pending login intents during update or rollback. Existing explicit metadata caps stay hard unless a growth ceiling is configured. Fresh defaults are1GiB with bounded growth to4GiB while keeping disk reserve. Do not restore an old journal snapshot to roll software back. The browser extension updates at its next check/restart, and older reader evidence can refuse assistance safely until the new reader is active.
 
-Release readiness evidence and exact package hashes accompany the prepared candidate. Public publishing is a separate final action.
+Published as [ibara 0.3.2](https://github.com/MayberryDT/ibara/releases/tag/v0.3.2), tagged `v0.3.2`, on 24 October 2026. All seven public assets match the verified candidate bytes. Package revision suffixes remain technical Arch metadata, not the public release name.

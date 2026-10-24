@@ -2,7 +2,7 @@
 
 Quiet login declarations, automatic journal recovery and clearer recording diagnostics. Requires Omarchy on x86_64; no Ubuntu, Windows, macOS or experimental input-driver support is added.
 
-Use the existing browser session and verify its account before requesting assistance. Assistance is not authentication. Recording is local and content-free; uploads remain explicitly configured and opt-in. A crash, unavailable disk or pre-dispatch protocol refusal can leave recording gaps. No new full benchmark or reliability-rate claim is made.
+Use the existing browser session and verify its account before requesting assistance. Assistance is not authentication. Recording is local and content-free; uploads remain explicitly configured and opt-in. The uploader requires your archive URL through `--url` or `IBARA_FACTS_URL` (the timer reads `~/.config/ibara/facts/upload.env`); no archive is selected by default. A crash, unavailable disk or pre-dispatch protocol refusal can leave recording gaps. No new full benchmark or reliability-rate claim is made.
 
 All three packages must be version0.3.2-1, with exact sibling dependency pins. Preserve the white-console fix from0.3.1-3. Update through the signed installer or `ibara update`; verify the effective executable, because a private service drop-in may still select an older controller. Review and archive the specific development override before activating the package; do not remove unrelated user configuration.
 

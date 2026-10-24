@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Upload immutable facts; retain a local file until the archive verifies its hash."""
 import argparse, hashlib, json, os, pathlib, time, urllib.request, urllib.error, urllib.parse
-p=argparse.ArgumentParser();p.add_argument('--dir',default=os.environ.get('IBARA_FACTS_DIR',str(pathlib.Path(os.environ.get('IBARA_STATE_DIR',str(pathlib.Path.home()/'.local/state/agent-computer')))/'facts')),type=pathlib.Path);p.add_argument('--url',default=os.environ.get('IBARA_FACTS_URL','https://ibara-facts.mayberrydt.workers.dev'));p.add_argument('--token-file',default=pathlib.Path.home()/'.config/ibara/facts/write.token',type=pathlib.Path);p.add_argument('--keep',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--dir',default=os.environ.get('IBARA_FACTS_DIR',str(pathlib.Path(os.environ.get('IBARA_STATE_DIR',str(pathlib.Path.home()/'.local/state/agent-computer')))/'facts')),type=pathlib.Path);p.add_argument('--url',default=os.environ.get('IBARA_FACTS_URL'));p.add_argument('--token-file',default=pathlib.Path.home()/'.config/ibara/facts/write.token',type=pathlib.Path);p.add_argument('--keep',action='store_true');a=p.parse_args()
+if not a.url or not a.url.strip(): p.error('set --url or IBARA_FACTS_URL to your archive endpoint')
+a.url=a.url.strip()
+endpoint=urllib.parse.urlsplit(a.url)
+if endpoint.scheme not in ('https','http') or not endpoint.netloc: p.error('archive URL must be an absolute HTTP or HTTPS URL')
 if a.token_file.stat().st_mode & 0o077: p.error('token file must be private (0600)')
 token=a.token_file.read_text().strip(); saved=failed=total=0; errors={}
 for file in sorted(a.dir.glob('raw/v1/**/*.jsonl.gz')):

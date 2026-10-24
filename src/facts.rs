@@ -12,22 +12,33 @@ pub struct Recorder {
     sender: Option<SyncSender<Message>>,
     worker: Option<thread::JoinHandle<()>>,
     lost: Arc<AtomicU64>,
+    lost_total: Arc<AtomicU64>,
     sessions: HashMap<String, (String, HashMap<String, usize>, u64)>,
     sequence: u64,
     protected: Option<String>,
     build: String,
+    dir: PathBuf,
+    written_ms: Arc<AtomicU64>,
+    spool_bytes: Arc<AtomicU64>,
+    polls: HashMap<(String,String,String), (u64,u64)>,
+    polls_since: Instant,
 }
 impl Recorder {
     pub fn new(state: &Path) -> Self {
         let lost = Arc::new(AtomicU64::new(0));
+        let lost_total=Arc::new(AtomicU64::new(0));
         let build = option_env!("IBARA_FACTS_BUILD").unwrap_or("unattributed-development").to_owned();
-        if std::env::var("IBARA_FACTS_DISABLED").as_deref() == Ok("1") {
-            return Self { sender: None, worker: None, lost, sessions: HashMap::new(), sequence: 0, protected: None, build };
-        }
         let dir = std::env::var_os("IBARA_FACTS_DIR").map(PathBuf::from).unwrap_or_else(|| state.join("facts"));
+        let written_ms=Arc::new(AtomicU64::new(0));
+        let spool_bytes=Arc::new(AtomicU64::new(spool_size(&dir).unwrap_or(0)));
+        if std::env::var("IBARA_FACTS_DISABLED").as_deref() == Ok("1") {
+            return Self { sender: None, worker: None, lost, lost_total, sessions: HashMap::new(), sequence: 0, protected: None, build, dir, written_ms, spool_bytes, polls:HashMap::new(),polls_since:Instant::now() };
+        }
+        let worker_dir=dir.clone(); let written=written_ms.clone(); let disk_bytes=spool_bytes.clone();
         let (sender, receiver) = mpsc::sync_channel(1024);
-        let losses = lost.clone();
+        let losses = lost.clone(); let total_losses=lost_total.clone();
         let worker = thread::spawn(move || {
+            let dir=worker_dir;
             // Recover complete lines left by a killed process before accepting new work.
             for raw in pending_files(&dir).unwrap_or_default() {
                 if let Ok(mut bytes) = fs::read(&raw) {
@@ -54,10 +65,10 @@ impl Recorder {
                     if let Some(path) = raw.as_ref().filter(|_| writable) {
                         let mut line = line; line.push(b'\n');
                         match append(path, &line) {
-                            Ok(()) => bytes.extend(line),
-                            Err(_) => { losses.fetch_add(1, Ordering::Relaxed); writable = false; eprintln!("ibara facts: spool unavailable; facts loss counted"); }
+                            Ok(()) => { written.store(crate::ids::now_millis() as u64,Ordering::Relaxed); disk_bytes.fetch_add(line.len() as u64,Ordering::Relaxed); bytes.extend(line); },
+                            Err(_) => { losses.fetch_add(1, Ordering::Relaxed); total_losses.fetch_add(1,Ordering::Relaxed); writable = false; eprintln!("ibara facts: spool unavailable; facts loss counted"); }
                         }
-                    } else { losses.fetch_add(1, Ordering::Relaxed); }
+                    } else { losses.fetch_add(1, Ordering::Relaxed); total_losses.fetch_add(1,Ordering::Relaxed); }
                 }
                 if !bytes.is_empty() && (stop || end || bytes.len() >= MAX_BYTES || since.elapsed() >= FLUSH) {
                     let count = losses.swap(0, Ordering::Relaxed);
@@ -69,10 +80,12 @@ impl Recorder {
                     }
                     if seal(&dir, raw.as_ref().unwrap(), &bytes).is_err() { eprintln!("ibara facts: compression failed; pending JSONL retained for restart"); }
                     bytes.clear(); raw = None; since = Instant::now();
-                    writable = spool_size(&dir).unwrap_or(MAX_SPOOL) < MAX_SPOOL;
+                    let size=spool_size(&dir).unwrap_or(MAX_SPOOL); disk_bytes.store(size,Ordering::Relaxed);
+                    writable = size < MAX_SPOOL;
                 }
                 if !writable && since.elapsed() >= FLUSH {
-                    writable = spool_size(&dir).unwrap_or(MAX_SPOOL) < MAX_SPOOL;
+                    let size=spool_size(&dir).unwrap_or(MAX_SPOOL); disk_bytes.store(size,Ordering::Relaxed);
+                    writable = size < MAX_SPOOL;
                     since = Instant::now();
                 }
                 if stop {
@@ -82,11 +95,17 @@ impl Recorder {
                 }
             }
         });
-        Self { sender: Some(sender), worker: Some(worker), lost, sessions: HashMap::new(), sequence: 0, protected: None, build }
+        Self { sender: Some(sender), worker: Some(worker), lost, lost_total, sessions: HashMap::new(), sequence: 0, protected: None, build, dir, written_ms, spool_bytes, polls:HashMap::new(),polls_since:Instant::now() }
     }
     /// Caller supplies only internal categories, never request/response bodies.
     pub fn event(&mut self, kind: &str, session: &str, actor: &str, who: &str, fields: Value, finish: bool) {
         if self.sender.is_none() { return; }
+        if self.polls_since.elapsed() >= Duration::from_secs(60) || self.polls.len()>=256 { self.flush_polls(); }
+        let op=fields["op"].as_str().unwrap_or("");
+        if kind=="operator" && matches!(op,"login_pending"|"attention") && fields["status"]=="ok" && fields["samples"].is_null() {
+            let count=self.polls.entry((session.into(),actor.into(),op.into())).or_default();
+            count.0+=1;count.1+=fields["duration_ms"].as_u64().unwrap_or(0);return;
+        }
         self.sequence += 1;
         if self.sessions.len() >= 1024 && !self.sessions.contains_key(session) {
             let oldest = self.sessions.iter().filter(|(key,_)| Some(key.as_str()) != self.protected.as_deref()).min_by_key(|(_,v)| v.2).map(|(key,_)|key.clone());
@@ -102,13 +121,30 @@ impl Recorder {
         let who = if who == "bot" && std::env::var("IBARA_FACTS_TEST_AGENT").as_deref() == Ok("1") { "agent" } else { who };
         let mut fact = json!({"kind":kind,"t":crate::ids::now_millis(),"session":session_id,"actor":number.to_string(),"who":who,"build":self.build,"schema":1,"fields":fields});
         if let Some(n) = fact.get_mut("fields") { if n.is_null() { *n = json!({}); } }
-        if self.sender.as_ref().unwrap().try_send(Message::Fact(fact, finish)).is_err() { self.lost.fetch_add(1, Ordering::Relaxed); }
+        if self.sender.as_ref().unwrap().try_send(Message::Fact(fact, finish)).is_err() { self.lost.fetch_add(1, Ordering::Relaxed); self.lost_total.fetch_add(1,Ordering::Relaxed); }
         // Retired episodes use a fresh UUID if read later, never reused actor slots.
         if finish && kind == "call" { self.sessions.remove(session); }
+    }
+    fn flush_polls(&mut self) {
+        self.polls_since=Instant::now();
+        for ((session,actor,op),(samples,total)) in std::mem::take(&mut self.polls) {
+            self.event("operator",&session,&actor,"human",json!({"op":op,"status":"ok","samples":samples,"duration_ms_total":total,"aggregation":"poll_summary"}),false);
+        }
+    }
+    pub fn health(&self) -> Value {
+        let upload=fs::read(self.dir.join(".upload-status.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok());
+        let last=upload.as_ref().and_then(|v|v["at_ms"].as_u64());
+        let age=last.map(|t|(crate::ids::now_millis() as u64).saturating_sub(t));
+        json!({"enabled":self.sender.is_some(),"test_agent":std::env::var("IBARA_FACTS_TEST_AGENT").as_deref()==Ok("1"),
+            "lost_since_start":self.lost_total.load(Ordering::Relaxed),"lost_pending":self.lost.load(Ordering::Relaxed),"spool_bytes":self.spool_bytes.load(Ordering::Relaxed),
+            "spool_limit_bytes":MAX_SPOOL,"last_written_ms":self.written_ms.load(Ordering::Relaxed),
+            "upload_state":if upload.as_ref().is_some_and(|v|v["ok"]==false){"failed"}else if age.is_some_and(|a|a<=900_000){"recent"}else{"stale_or_not_configured"},
+            "last_upload_ms":last,"upload_age_ms":age,"pending_poll_samples":self.polls.values().map(|v|v.0).sum::<u64>()})
     }
     pub fn protect(&mut self, session: Option<String>) { self.protected = session; }
     pub fn retire(&mut self, session: &str) { self.sessions.remove(session); }
     pub fn close(&mut self) {
+        self.flush_polls();
         if let Some(sender) = self.sender.take() { let _ = sender.send(Message::Stop); }
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
     }

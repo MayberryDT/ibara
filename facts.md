@@ -2,11 +2,10 @@
 facts: 1
 name: ibara
 source:
-  kind: http
-  list: https://ibara-facts.mayberrydt.workers.dev/v1/archive?prefix=raw/v1/
-  get: https://ibara-facts.mayberrydt.workers.dev/v1/archive/{key}
-  token_file: ~/.config/ibara/facts/read.token
+  kind: dir
+  path: ~/.local/state/agent-computer/facts
 environment: private
+fresh_hours: 24
 admin_kinds: [admin]
 kinds:
   call: A production agent or test agent tool call, its status and elapsed milliseconds; unknown tools are redacted.
@@ -29,6 +28,7 @@ checks:
     level: fail
     sql: SELECT session, t FROM facts_all WHERE (data->>'$.text') IS NOT NULL OR (data->>'$.url') IS NOT NULL OR (data->>'$.path') IS NOT NULL OR (data->>'$.summary') IS NOT NULL
 views:
+  poll_totals: SELECT build, data->>'$.fields.op' AS op, sum(coalesce((data->>'$.fields.samples')::BIGINT,1)) AS reads FROM facts WHERE kind='operator' AND (data->>'$.fields.op') IN ('login_pending','attention') GROUP BY ALL
   call_outcomes: SELECT build, who, data->>'$.fields.tool' AS tool, data->>'$.fields.status' AS status, count(*) AS calls FROM facts GROUP BY ALL
 budget:
   archive_mb_per_day: 100
@@ -41,20 +41,21 @@ eras:
     from: '2026-10-11T00:00:00Z'
     environment: private
     change: First content-free recorder; no historical backfill.
+
 ---
 
 # Ibara facts
 
-Run `facts`, `facts sync`, `facts check`, `facts session SESSION`, or `facts query 'SELECT * FROM call_outcomes'` on Halla. Set `FACTS_CACHE=/home/halla/build/ibara-record-everything/cache` so the mirror stays on the build host. The private read token is provisioned on Halla; neither token belongs in source or evidence.
+Recording captures operational categories and outcomes, not desktop contents. Screens, keystrokes, clipboard, file bytes, task goals, names, URLs, paths, credentials and raw arguments/results never enter the facts archive. The separate private operational journal keeps detailed receipts under its own retention rules.
 
-Recording captures operational categories and outcomes, not desktop contents. Screens, keystrokes, clipboard, file bytes, task goals, names, URLs, paths, credential material and raw arguments/results never enter the archive. Existing private journal/receipts still hold the detailed operational evidence under their own retention rules.
+This contract reads the local spool. Copy it to your analysis/build host and set `source.path` to an exported spool, or configure your own authenticated HTTP archive. Run `facts sync`, `facts check`, `facts session SESSION` and `facts query 'SELECT * FROM call_outcomes'`. Keep a large mirror on a build host with disk space. The reference archive service is in `facts-service/`; use separate read/write credentials. No upload is enabled by installation, and no credential is bundled.
 
-`bot` means a production MCP agent; `agent` means a test actor, enabled on the target with `IBARA_FACTS_TEST_AGENT=1`. Human operator activity is `human`; autonomous transitions and administrator operations are `system`. These are transport origins, not a claim that the caller is a verified human. Ibara has different human and MCP interfaces; compare outcomes within the interface rather than treating them as identical motor paths. Transitions have a system actor and do not identify their initiator.
+`bot` means an MCP agent; `agent` means a test actor enabled with `IBARA_FACTS_TEST_AGENT=1`. Operator calls are `human` and internal transitions/admin calls are `system`. These are transport origins, not verified human identities. Active-task calls share a session until finish; taskless calls use their connection. Session/actor bookkeeping is bounded, can restart old episode UUIDs, and resets on recorder restart. Session spans include idle time and are not activity exposure. Do not infer production adoption or human-versus-agent rates from test records or session duration. Declare appropriately scoped eras before comparing builds.
 
-Active task calls share a session while taskless calls use the transport connection. Successful finish retires its session; later history reads start a new episode. A 1,024-entry LRU preserves the active lease session; other old episodes may restart with a new UUID. A 256-actor cap similarly starts a new UUID before allocating another actor, so numbers are never reused inside a session. Human taskless operations share one operator session per recorder epoch; administrator taskless calls have a separate session. Opaque session UUIDs and actor numbers stay stable across reconnect within a recorder epoch; restarting starts new session UUIDs. Recovered pre-crash events retain their original UUIDs. Session spans include idle time: they are not exposure hours. No human-versus-agent rate comparison is valid until an actual activity exposure measure is added.
+A bounded1024item queue feeds the disk writer. Complete pending JSONL lines recover on startup; queued events can be lost on abrupt death. Flush/fsync happens on task finish, shutdown,2MiB or5minutes. A64MiB spool plus one in-flight chunk bounds disk use. Full/unavailable spool drops facts and reports loss best effort. Authentication/protocol refusals before dispatch are outside recording. No completeness claim is valid for crash or unavailable-disk intervals.
 
-A bounded 1,024-item queue feeds a disk writer. Up to the queued facts can be lost on abrupt process death; pending complete JSONL lines already written survive process death. Power-loss durability is established at flush by fsync, not on every event. Flush on task finish, shutdown, 2 MiB or five minutes; no idle facts or periodic snapshots. A 64 MiB spool budget plus one in-flight chunk bounds disk use; full/unavailable spool drops facts and reports counts. Loss reporting is best effort if the disk remains unavailable. No completeness claim is valid for a crash or unavailable disk interval. Rejected requests before controller dispatch (authentication, JSON-RPC validation and unknown tools) are outside this recorder. `.pending` files recover on startup; the uploader sends only finished gzip objects.
+Successful background `login_pending` and `attention` reads become counted minute summaries with `fields.samples` and `duration_ms_total`; failures remain individual. Use `poll_totals`, not raw summary event counts or per-read latency assumptions. Normal shutdown flushes the final partial summary; abrupt death can also lose that in-memory partial minute. No idle snapshots are emitted.
 
-Each immutable gzip object contains metadata `{schema, lines, from, to, sha256}` in R2. Upload retries compare the hash and never replace history. Failed uploads retain their local objects. The archive has no automatic deletion and no per-event database writes. Upload the spool with `python3 scripts/facts-upload.py --dir STATE/facts --url https://ibara-facts.mayberrydt.workers.dev --token-file ~/.config/ibara/facts/write.token`. Schedule it every five minutes on an opted-in target; read and write credentials are separate. `IBARA_FACTS_DISABLED=1` opts out; no upload happens merely by installing the recorder.
+Agent/operator/admin status exposes `recording`: enabled/test mode, cumulative and unreported losses, spool use, last append, upload-helper attempt age/state and pending poll samples. A zero-object helper run establishes a successful check, not new archived activity. `fresh_hours:24` independently warns when the newest ingested fact is old.
 
-The first era is private acceptance only. Do not infer production adoption, reliability, human activity or actual provider cost from it. The budget is a local archive-volume check; provider billing/analytics is the cost authority. Public deployment and each new recording era require a stamped clean candidate plus its own receipt.
+Upload explicitly with `python3 scripts/facts-upload.py --dir STATE/facts --url YOUR_ARCHIVE --token-file PRIVATE_WRITE_TOKEN`. Provision a mode600write token, configure the upload service URL and directory, then opt into its five-minute user timer. Failed objects remain; successful objects are removed only after a matching hash acknowledgment. Upload receipts report bounded HTTP/receipt/IO failures. Immutable archive keys are never overwritten, and no automatic archive deletion is configured. Preserve historical test labels and loss records.

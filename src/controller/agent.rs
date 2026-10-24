@@ -283,7 +283,7 @@ impl Controller {
     pub async fn call(&self, principal: &str, connection_id: &str, client_name: &str, tool: &str, args: Value, cancel: Cancel) -> CallOutcome {
         let recording_started = std::time::Instant::now();
         let agent = agent_label(client_name, principal);
-        let outcome = self.dispatch(principal, connection_id, client_name, &agent, tool, &args, &cancel).await;
+        let mut outcome = self.dispatch(principal, connection_id, client_name, &agent, tool, &args, &cancel).await;
         let hint = match &outcome {
             Ok(reply) => reply.task_ref.clone(),
             Err(_) => None,
@@ -294,6 +294,17 @@ impl Controller {
         let task = hint
             .and_then(|t| self.journal.readable_task(principal, &t).ok().flatten())
             .or_else(|| if holds { lease.as_ref().and_then(|l| self.journal.get_task(&l.task_ref).ok().flatten()) } else { None });
+        if tool=="browser_act" && holds && !cancel.is_cancelled() {
+            if let (Err(error),Some(task),Some(lease))=(&mut outcome,task.as_ref(),lease.as_ref()) {
+                if matches!(error.code,"STALE_TARGET"|"AMBIGUOUS_TARGET") && error.details.get("execution_not_started")==Some(&json!(true)) && self.assert_authority(lease).is_ok() {
+                    let spec=FrameSpec {view:View::Elements,surface:None,limit:Some(30),..FrameSpec::default()};
+                    if let Ok((frame,_))=self.build_frame(task,lease,&spec).await {
+                        error.details.insert("recovery_frame".into(),json!(frame.frame));
+                        error.details.insert("next".into(),json!("No input was sent. Choose a distinguishable target from recovery_frame; narrow the observation with a query if needed. Make a new explicit action; no effect was replayed."));
+                    }
+                }
+            }
+        }
         let situation = self.situation_line(principal, connection_id, &agent, task.as_ref());
         let since = self.take_since(connection_id, task.as_ref().map(|t| t.task_ref.as_str()), holds);
         let (mut envelope, images) = match outcome {
@@ -310,7 +321,10 @@ impl Controller {
         budget::fit(&mut envelope, &mut images, budget::MAX_RESULT_BYTES);
         self.record_fact("call", task.as_ref().map(|t| t.task_ref.as_str()).unwrap_or(connection_id), principal, "bot",
             json!({"tool": if crate::contract::tool_definitions().iter().any(|t| t.name == tool) { tool } else { "unknown" },
-                "status": envelope.to_value()["status"], "duration_ms": recording_started.elapsed().as_millis() as u64}), tool == "computer_finish" && envelope.to_value()["status"] == "ok");
+                "status": envelope.to_value()["status"], "duration_ms": recording_started.elapsed().as_millis() as u64,
+                "error_code":envelope.error.as_ref().and_then(|e|e["code"].as_str()),
+                "execution":envelope.result.get("execution").filter(|v|v.is_string()),
+                "recovery":envelope.error.as_ref().map(|e|match e["code"].as_str().unwrap_or("") {"STALE_TARGET"|"AMBIGUOUS_TARGET"=>"observe", "OUTCOME_UNKNOWN"=>"reconcile", "INVALID_ARGUMENT"=>"correct_arguments",_=>"follow_next"})}), tool == "computer_finish" && envelope.to_value()["status"] == "ok");
         CallOutcome { envelope: envelope.to_value(), images }
     }
 
@@ -554,6 +568,10 @@ impl Controller {
             json!({"event":kind,
                 "outcome": data.get("outcome").and_then(Value::as_str).filter(|v| matches!(*v,"done"|"unknown"|"failed"|"completed"|"partial"|"cancelled"|"verified"|"refused")),
                 "effect_class": data.get("effect_class").and_then(Value::as_str).filter(|v| matches!(*v,"observe"|"change"|"send"|"spend"|"destructive"|"access")),
+                "error_code":data.get("error_code").and_then(Value::as_str).filter(|v|crate::error::is_known_code(v)),
+                "execution":data.get("execution").and_then(Value::as_str).filter(|v|matches!(*v,"not_started"|"running"|"completed"|"unknown")),
+                "verification":data.get("verification").and_then(Value::as_str).filter(|v|matches!(*v,"not_requested"|"satisfied"|"unsatisfied"|"unknown")),
+                "duration_ms":data.get("duration_ms").and_then(Value::as_u64),
                 "replay":data.get("replay").and_then(Value::as_bool), "complete":data.get("complete").and_then(Value::as_bool)}), kind == "task_finished");
         let at = self.now_iso();
         if let Err(e) = self.journal.append_event(NewEvent { at: &at, kind, task_ref, actor, summary, data: &data }) {
@@ -749,13 +767,26 @@ impl Controller {
     }
 
     fn computer_summary(&self, principal: &str, connection_id: &str, agent: &str) -> Result<ComputerSummary> {
+        let capacity = self.journal.metadata_capacity()?;
+        let mut state = self.availability()?.to_string();
+        let mut capabilities = self.capability_line();
+        if capacity["state"] != "healthy" {
+            if state == "ready" && capacity["state"] == "blocked" { state = "degraded".into(); }
+            capabilities.push_str(&format!("; metadata capacity {} ({}/{} MiB; {})",
+                capacity["state"].as_str().unwrap_or("unknown"),
+                capacity["used_bytes"].as_u64().unwrap_or(0)/(1024*1024),
+                capacity["limit_bytes"].as_u64().unwrap_or(0)/(1024*1024),
+                capacity["reason"].as_str().unwrap_or("unknown")));
+        }
         Ok(ComputerSummary {
             id: self.computer_id.clone(),
             name: self.computer_name(),
-            state: self.availability()?.to_string(),
+            state,
             user: self.computer.user.clone(),
             holder: self.holder_text(principal, connection_id, agent),
-            capabilities: self.capability_line(),
+            capabilities,
+            metadata_capacity: Some(capacity),
+            recording: Some(self.facts.borrow().health()),
         })
     }
 
@@ -794,7 +825,7 @@ impl Controller {
                 let children = self.journal.get_active_lease()?.filter(|l| l.principal == principal).map(|l| vec![l.task_ref]).unwrap_or_default();
                 (
                     RefStatus {
-                        details: None,
+                        details: s.metadata_capacity.clone().map(|capacity| json!({"metadata_capacity":capacity,"recording":s.recording})),
                         reference: reference.clone(),
                         kind: "computer".into(),
                         state: s.state.clone(),
@@ -1806,7 +1837,7 @@ impl Controller {
                 } else {None}
             } else {step_surface(&resolved,focused_before.as_ref())};
             late_windows = late_owner.map(|owner| (owner, windows.clone()));
-            self.timeline("step", Some(ctx.task_ref), &ctx.lease.principal, &clip(&text, 200), json!({ "op": op_ref, "outcome": outcome_name(outcome), "effect_class": resolved.class, "replay": replay }));
+            self.timeline("step", Some(ctx.task_ref), &ctx.lease.principal, &clip(&text, 200), json!({ "op": op_ref, "outcome": outcome_name(outcome), "effect_class": resolved.class, "replay": replay,"error_code":receipt.get("error").and_then(|e|e.get("code")),"execution":receipt.get("execution"),"verification":receipt.get("verification"),"duration_ms":receipt.get("elapsed_ms") }));
             results.push(step_result(i, outcome, text, Some(&op_ref)));
         }
         // A bounded desktop quiet check lets focus/dialog transitions land.
@@ -1880,6 +1911,7 @@ impl Controller {
 
     /// Store an error for a call whose first step never ran, and return it.
     fn refuse_call(&self, ctx: &CallCtx<'_>, op0: &OperationRecord, receipt0: &mut Map<String, Value>, e: IbaraError) -> Result<Reply> {
+        let e=e.with("execution_not_started",true);
         let _ = ctx;
         receipt0.insert("operation_ref".into(), json!(op0.operation_ref));
         receipt0.insert("execution".into(), json!("not_started"));

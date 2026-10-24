@@ -293,7 +293,16 @@ async function handle(m,jobs) {
     if(m.op==='login_context') {
       const tab=await focusedTab(m.args.tabId);
       if(!tab)return {result:{refused:true}};
-      return {result:{url:tab.url,previous:navigation.get(tab.id)?.previous}};
+      const frames=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:()=>{
+        const authPath=/\/(?:log-?in|sign-?in|auth)(?:[/?#_-]|$)/i;
+        return [...document.querySelectorAll('input[type="password"],input[autocomplete="username"],input[autocomplete="current-password"],input[type="email"]')].some(e=>{
+          const visible=e.checkVisibility?.({visibilityProperty:true,opacityProperty:true})??e.getClientRects().length>0;
+          const action=e.closest('form')?.getAttribute('action');
+          const authRoute=authPath.test(location.pathname)||(action&&authPath.test(new URL(action,location.href).pathname));
+          return visible&&(e.type==='password'||e.autocomplete==='username'||e.autocomplete==='current-password'||authRoute);
+        });
+      }});
+      return {result:{url:tab.url,previous:navigation.get(tab.id)?.previous,sign_in_page:frames.some(f=>f.result===true)}};
     }
     if(m.op==='login_reload') {
       const tab=await focusedTab(m.args.tabId);

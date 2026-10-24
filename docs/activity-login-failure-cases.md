@@ -1,0 +1,7 @@
+# Activity/login repair failure cases (24 October 2026)
+
+Write process proof before implementation. A declared login at begin must not ask, copy cookies or change the browser. Allowed is availability, never authenticated proof. sign_in on a page without observable authentication controls must send no request; explicit unrelated sites must be refused. A real sign-in page may request once; repeat calls reuse its request; declined/unknown signup remains fenced. Existing signed-in sessions must stay untouched. Google independent-session restrictions remain.
+
+Recorder status must expose disabled/test mode/spool/loss/upload freshness without secrets. Poll compaction must preserve counts and errors and flush on shutdown; failures must never disappear into successful summaries. Upload failure retains bytes and reports failure; no credential appears in health. Old/new receipt JSON stays readable; no compression format breaks package rollback or SQL unknown guards. Browser recovery may observe after a definite refusal but never send input or replay unknown effects. Slower login polling must stay inside heartbeat freshness and not delay active login work indefinitely.
+
+Process artifacts must show no prompt at declaration, refusal away from a sign-in page, one real assistance request, retained older receipts, recording health/categories, polling summary counts, uploader receipt, and fresh installed acquisition/release. Existing process suites supply sharing/denial/privacy/replay regressions.

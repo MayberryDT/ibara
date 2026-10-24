@@ -52,6 +52,8 @@ impl Controller {
                 let caps = self.refresh_capabilities().await?;
                 Ok(json!({
                     "availability": self.availability()?,
+                    "metadata_capacity": self.journal.metadata_capacity()?,
+                    "recording": self.facts.borrow().health(),
                     "capabilities": caps,
                     "lease": self.journal.get_active_lease()?,
                     "control": self.journal.get_control()?,
@@ -63,6 +65,8 @@ impl Controller {
                 let caps = self.refresh_capabilities().await?;
                 Ok(json!({
                     "availability": self.availability()?,
+                    "metadata_capacity": self.journal.metadata_capacity()?,
+                    "recording": self.facts.borrow().health(),
                     "capabilities": caps,
                     "session_hint": self.desktop.session_available(),
                     "epoch": self.epoch,

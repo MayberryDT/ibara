@@ -491,6 +491,8 @@ impl Controller {
         out.insert("holds_control".into(), json!(holds));
         out.insert("video".into(), json!(self.desktop.video_capability()));
         out.insert("repair".into(), self.repair_status());
+        out.insert("metadata_capacity".into(), self.journal.metadata_capacity()?);
+        out.insert("recording".into(),self.facts.borrow().health());
         // A locked screen: a person unlocks it through Take Control; agents wait.
         out.insert("locked".into(), json!(self.desktop.locked().await));
         let control = self.journal.get_control()?;

@@ -1,0 +1,7 @@
+{
+  "name": "ibara-facts",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-11",
+  "r2_buckets": [{"binding":"ARCHIVE","bucket_name":"ibara-facts"}],
+  "workers_dev": true
+}

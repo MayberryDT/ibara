@@ -116,11 +116,15 @@ impl Daemon {
     /// Wayland display, runtime directory and no session bus, so no real
     /// program on the developer's desktop answers.
     fn start_with(name: &str, desktop: bool) -> Daemon {
+        Self::start_with_policy(name, desktop, json!({"principals":["test"],"min_free_bytes":1,"warn_free_bytes":1}))
+    }
+
+    fn start_with_policy(name: &str, desktop: bool, policy: Value) -> Daemon {
         let root = temp_root(name);
         for dir in ["home", "install", "operators", "bin"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        std::fs::write(root.join("policy.json"), r#"{"principals":["test"]}"#).unwrap();
+        std::fs::write(root.join("policy.json"), policy.to_string()).unwrap();
         std::fs::write(root.join("gateway.key"), "gateway-e2e-secret\n").unwrap();
         std::fs::write(root.join("admin.key"), "admin-e2e-secret\n").unwrap();
         std::fs::write(root.join("admin.sha256"), format!("{}\n", sha256_hex(b"admin-e2e-secret"))).unwrap();
@@ -147,6 +151,9 @@ impl Daemon {
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
             .env_remove("DISPLAY")
             .env("HOME", root.join("home"))
+            .env_remove("IBARA_FACTS_DIR")
+            .env_remove("IBARA_FACTS_TEST_AGENT")
+            .env_remove("IBARA_FACTS_DISABLED")
             .env("IBARA_STATE_DIR", root.join("state"))
             .env("IBARA_DATA_DIR", root.join("data"))
             .env("IBARA_RUNTIME_DIR", root.join("run"))
@@ -431,16 +438,41 @@ struct Agent {
 
 impl Agent {
     fn start(daemon: &Daemon, client: &str) -> Agent {
-        let mut child = Command::new(IBARA)
-            .args(["agent-entry", "test"])
+        let mut command = Command::new(IBARA);
+        command.args(["agent-entry", "test"])
             .arg(daemon.root.join("run/controller.sock"))
             .arg(daemon.root.join("gateway.key"))
             .env("SSH_ORIGINAL_COMMAND", "mcp")
             .env("IBARA_TEST_CLIENT_PING_MS", PING_MS)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        Self::from_child(command.spawn().unwrap(), client)
+    }
+
+    fn fleet(daemon: &Daemon, client: &str) -> Agent {
+        let endpoint=daemon.admin(&["endpoint"],"admin.key").1["result"]["endpoint_id"].as_str().unwrap().to_string();
+        let mut probe=Self::start(daemon,client);
+        let listing=probe.call("computer_status",json!({}));
+        let computer_id=format!("computer_{}",listing["result"]["computers"][0]["id"].as_str().unwrap().trim_start_matches("cmp_"));
+        drop(probe);
+        let db=daemon.root.join("operator.sqlite");
+        let mut directory=ibara::operator::directory::OperatorDirectory::open(&db).unwrap();
+        for name in ["identity","known_hosts"] { std::fs::write(daemon.root.join(name),"").unwrap(); }
+        directory.register_verified_computer(&json!({"computer_id":computer_id,"endpoint_id":endpoint,
+            "label":"Capacity fixture","transport":"ssh","host":"fixture","user":"test","port":2222,
+            "identity_file_ref":format!("file:{}",daemon.root.join("identity").display()),
+            "known_hosts_file_ref":format!("file:{}",daemon.root.join("known_hosts").display()),
+            "trust_state":"verified","binding_revision":1,"authorization_generation":1}),&endpoint,0).unwrap();
+        directory.close();
+        stub(&daemon.root.join("bin"),"ssh",&format!("exec '{}' agent-entry test '{}' '{}'",IBARA,daemon.root.join("run/controller.sock").display(),daemon.root.join("gateway.key").display()));
+        let child=Command::new(IBARA).arg("mcp").arg("--directory-db").arg(db)
+            .env("PATH",format!("{}:{}",daemon.root.join("bin").display(),std::env::var("PATH").unwrap()))
+            .env("HOME",daemon.root.join("home")).env("SSH_ORIGINAL_COMMAND","mcp")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        Self::from_child(child,client)
+    }
+
+    fn from_child(mut child: Child, client: &str) -> Agent {
         let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let answering = Arc::new(AtomicBool::new(true));
@@ -837,4 +869,293 @@ fn mcp_contract_recovery_retains_one_effect_and_actionable_errors() {
     assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
     assert!(unknown["error"]["data"]["available_tools"].as_array().unwrap().iter().any(|n| n == "computer_act"), "{unknown}");
     assert!(unknown["error"]["data"]["next"].as_str().unwrap().contains("tools/list"), "{unknown}");
+}
+
+// Failure cases written before the capacity repair:
+// - young retained evidence fills the base allowance; growth must admit one effect;
+// - duplicate request after growth must not launch twice; growth survives restart;
+// - storage WAL alone fills capacity; reclaim without deleting retained evidence;
+// - explicit ceiling refuses before launch; status and existing replay still work;
+// - low disk reserve refuses growth/new effects, with an actionable status;
+// - old unknown evidence and open attention survive maintenance.
+fn capacity_policy(base: u64, ceiling: u64) -> Value {
+    json!({"principals":["test"],"max_metadata_bytes":base,"metadata_growth_max_bytes":ceiling,
+        "metadata_headroom_bytes":65536,"min_free_bytes":1,"warn_free_bytes":1})
+}
+
+fn capacity_seed_observation(daemon: &Daemon, task: &str, bytes: usize) {
+    let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    db.execute("INSERT INTO observations(observation_ref,task_ref,principal,record) VALUES('capacity-proof',?,'test',?)",
+        rusqlite::params![task,json!({"retained_proof":"x".repeat(bytes)}).to_string()]).unwrap();
+}
+
+#[test]
+fn journal_capacity_growth_and_replay_through_real_daemon() {
+    let mut daemon=Daemon::start_with_policy("capacity-growth",true,capacity_policy(1024*1024,8*1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");
+    let (task,workspace)=begin_when_ready(&mut agent);
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let args=json!({"task_ref":task,"request_id":"capacity-once","command":["/bin/sh","-c","echo once >> capacity-launches"]});
+    let first=agent.call("computer_exec",args.clone());
+    assert_eq!(first["status"],"ok","{first}");
+    let replay=agent.call("computer_exec",args);
+    assert_eq!(replay["status"],"ok","{replay}");
+    assert_eq!(std::fs::read_to_string(workspace.join("capacity-launches")).unwrap(),"once\n");
+    let health=agent.call("computer_status",json!({}));
+    let limit=health["result"]["computers"][0]["metadata_capacity"]["limit_bytes"].as_u64().unwrap();
+    assert!(limit>1024*1024 && limit<=8*1024*1024,"{health}");
+    let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    assert_eq!(db.query_row("select length(record) from observations where observation_ref='capacity-proof'",[],|r|r.get::<_,usize>(0)).unwrap(),2*1024*1024+21);
+    drop(db);
+    let finished=agent.call("computer_finish",json!({"task_ref":task,"request_id":"capacity-finish","outcome":"complete","summary":"capacity E2E"}));
+    assert_eq!(finished["status"],"ok","{finished}");
+    drop(agent);daemon.crash_and_restart();
+    let mut back=Agent::start(&daemon,"codex");
+    let restart=back.call("computer_status",json!({}));
+    assert_eq!(restart["result"]["computers"][0]["metadata_capacity"]["limit_bytes"],limit);
+    work_artifact("journal-capacity-growth",json!({"kind":"daemon_process_e2e","native_input":false,"first":first,"replay":replay,"health":health,"restart":restart,"execution_count":1}));
+}
+
+#[test]
+fn journal_capacity_reclaims_storage_wal_without_pruning() {
+    let daemon=Daemon::start_with_policy("capacity-storage-wal",true,capacity_policy(1024*1024,1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    let storage=rusqlite::Connection::open(daemon.root.join("state/storage.sqlite")).unwrap();
+    storage.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE capacity_fixture(value BLOB); INSERT INTO capacity_fixture VALUES(zeroblob(2097152)); DELETE FROM capacity_fixture; VACUUM;").unwrap();
+    let wal=daemon.root.join("state/storage.sqlite-wal");let before=std::fs::metadata(&wal).unwrap().len();assert!(before>1024*1024);
+    let result=agent.call("computer_exec",json!({"task_ref":task,"request_id":"after-storage-wal","command":["/bin/true"]}));
+    assert_eq!(result["status"],"ok","{result}");
+    let after=std::fs::metadata(&wal).unwrap().len();assert!(after<before,"{before} -> {after}");
+    work_artifact("journal-capacity-wal",json!({"before":before,"after":after,"result":result}));
+}
+
+#[test]
+fn journal_capacity_ceiling_preserves_replay_and_unknown_evidence() {
+    let mut daemon=Daemon::start_with_policy("capacity-ceiling",true,capacity_policy(1024*1024,1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,workspace)=begin_when_ready(&mut agent);
+    let args=json!({"task_ref":task,"request_id":"before-full","command":["/bin/sh","-c","echo once >> capacity-launches"]});
+    assert_eq!(agent.call("computer_exec",args.clone())["status"],"ok");
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    db.execute("UPDATE operations SET receipt=json_set(receipt,'$.execution','unknown','$.verification','unknown') WHERE request_id='before-full'",[]).unwrap();
+    db.execute("UPDATE tasks SET state='completed',updated_at='2000-01-01T00:00:00.000Z' WHERE task_ref=?",[&task]).unwrap();
+    let refused=agent.call("computer_exec",json!({"task_ref":task,"request_id":"must-not-launch","command":["/bin/sh","-c","touch forbidden"]}));
+    assert_eq!(refused["error"]["code"],"BUDGET_EXCEEDED","{refused}");assert!(!workspace.join("forbidden").exists());
+    let replay_before=agent.call("computer_exec",args.clone());assert_eq!(replay_before["status"],"ok","{replay_before}");
+    db.execute("UPDATE leases SET state='expired' WHERE task_ref=?",[&task]).unwrap();
+    drop(agent);daemon.crash_and_restart();let mut agent=Agent::start(&daemon,"codex");
+    let deadline=std::time::Instant::now()+Duration::from_secs(30);
+    while situation(&agent.call("computer_status",json!({}))).contains("starting") {
+        assert!(std::time::Instant::now()<deadline,"startup did not settle");std::thread::sleep(Duration::from_millis(200));
+    }
+    let replay=agent.call("computer_exec",args);assert_eq!(replay["error"]["code"],"LEASE_EXPIRED","{replay}");
+    assert_eq!(db.query_row("select json_extract(receipt,'$.execution') from operations where request_id='before-full'",[],|r|r.get::<_,String>(0)).unwrap(),"unknown");
+    assert_eq!(std::fs::read_to_string(workspace.join("capacity-launches")).unwrap(),"once\n");
+    assert_eq!(db.query_row("select count(*) from observations where observation_ref='capacity-proof'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let status=agent.call("computer_status",json!({}));assert_eq!(status["result"]["computers"][0]["metadata_capacity"]["state"],"blocked","{status}");
+    work_artifact("journal-capacity-ceiling",json!({"refused":refused,"replay_before_restart":replay_before,"replay_after_restart":replay,"status":status,"unknown_evidence_preserved":true,"execution_count":1}));
+}
+
+#[test]
+fn journal_capacity_disk_reserve_refuses_before_dispatch() {
+    let mut policy=capacity_policy(1024*1024,8*1024*1024);policy["min_free_bytes"]=json!(9_000_000_000_000u64);
+    let daemon=Daemon::start_with_policy("capacity-disk",true,policy);
+    let mut agent=Agent::start(&daemon,"codex");
+    let status=agent.call("computer_status",json!({}));
+    assert_eq!(status["result"]["computers"][0]["metadata_capacity"]["state"],"blocked","{status}");
+    let result=agent.call("computer_begin",json!({"goal":"must refuse before effect","request_id":"disk-full-begin"}));
+    assert_eq!(result["error"]["code"],"BUDGET_EXCEEDED","{result}");
+    work_artifact("journal-capacity-disk",json!({"status":status,"refused":result}));
+}
+
+#[test]
+fn journal_capacity_retention_reclaims_only_settled_old_tasks() {
+    let daemon=Daemon::start_with_policy("capacity-retention",true,capacity_policy(1024*1024,8*1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let ended=agent.call("computer_finish",json!({"task_ref":task,"request_id":"retention-finish","outcome":"complete","summary":"settled evidence"}));
+    assert_eq!(ended["status"],"ok","{ended}");
+    let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    db.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00.000Z' WHERE task_ref=?",[&task]).unwrap();
+    let next=agent.call("computer_begin",json!({"goal":"trigger retention","request_id":"retention-next"}));assert_eq!(next["status"],"ok","{next}");
+    assert_eq!(db.query_row("select count(*) from observations where observation_ref='capacity-proof'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(db.query_row("select count(*) from leases where task_ref=?",[&task],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(db.query_row("select count(*) from tasks where task_ref=?",[&task],|r|r.get::<_,i64>(0)).unwrap(),1);
+    work_artifact("journal-capacity-retention",json!({"next":next,"old_evidence_reclaimed":true,"task_identity_preserved":true}));
+}
+
+#[test]
+fn journal_capacity_pressure_remains_routable_through_fleet() {
+    let daemon=Daemon::start_with_policy("capacity-fleet",true,capacity_policy(1024*1024,8*1024*1024));
+    let mut direct=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut direct);
+    direct.call("computer_finish",json!({"task_ref":task,"request_id":"fleet-prepare","outcome":"complete","summary":"fixture setup"}));
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let mut fleet=Agent::fleet(&daemon,"codex");
+    let status=fleet.call("computer_status",json!({}));
+    assert_eq!(status["result"]["computers"][0]["state"],"ready","{status}");
+    assert_eq!(status["result"]["computers"][0]["metadata_capacity"]["state"],"pressure","{status}");
+    let began=fleet.call("computer_begin",json!({"goal":"recover automatically","request_id":"auto-pressure"}));
+    assert_eq!(began["status"],"ok","{began}");
+    let admin=daemon.admin(&["status"],"admin.key").1;
+    let doctor=daemon.admin(&["doctor"],"admin.key").1;
+    assert!(admin["result"]["metadata_capacity"]["limit_bytes"].as_u64().unwrap()>1024*1024,"{admin}");
+    assert_eq!(doctor["result"]["metadata_capacity"]["limit_bytes"],admin["result"]["metadata_capacity"]["limit_bytes"]);
+    work_artifact("journal-capacity-fleet",json!({"status":status,"began":began,"admin":admin,"doctor":doctor}));
+}
+
+#[test]
+fn journal_capacity_busy_reader_is_bounded_and_recovers() {
+    let daemon=Daemon::start_with_policy("capacity-busy",true,capacity_policy(1024*1024,1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    let file=daemon.root.join("state/storage.sqlite");let writer=rusqlite::Connection::open(&file).unwrap();
+    writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE capacity_fixture(value BLOB); INSERT INTO capacity_fixture VALUES(zeroblob(2097152));").unwrap();
+    let reader=rusqlite::Connection::open(&file).unwrap();reader.execute_batch("BEGIN; SELECT count(*) FROM capacity_fixture;").unwrap();
+    writer.execute_batch("DELETE FROM capacity_fixture; VACUUM;").unwrap();
+    let started=std::time::Instant::now();
+    let refused=agent.call("computer_exec",json!({"task_ref":task,"request_id":"reader-blocked","command":["/bin/true"]}));
+    assert_eq!(refused["error"]["code"],"BUDGET_EXCEEDED","{refused}");assert!(started.elapsed()<Duration::from_secs(5));
+    reader.execute_batch("ROLLBACK").unwrap();
+    let recovered=agent.call("computer_exec",json!({"task_ref":task,"request_id":"reader-released","command":["/bin/true"]}));
+    assert_eq!(recovered["status"],"ok","{recovered}");
+    work_artifact("journal-capacity-busy",json!({"refused":refused,"recovered":recovered}));
+}
+
+#[test]
+fn journal_capacity_defaults_and_explicit_legacy_cap() {
+    let daemon=Daemon::start_with_policy("capacity-defaults",true,json!({"principals":["test"]}));
+    let mut agent=Agent::start(&daemon,"codex");let status=agent.call("computer_status",json!({}));
+    let h=&status["result"]["computers"][0]["metadata_capacity"];
+    assert_eq!(h["limit_bytes"],1024u64*1024*1024);assert_eq!(h["growth_max_bytes"],4u64*1024*1024*1024);
+    let mut policy=capacity_policy(1024*1024,1024*1024);policy.as_object_mut().unwrap().remove("metadata_growth_max_bytes");
+    let capped=Daemon::start_with_policy("capacity-legacy-cap",true,policy);let mut other=Agent::start(&capped,"codex");
+    let (task,_)=begin_when_ready(&mut other);capacity_seed_observation(&capped,&task,2*1024*1024);
+    let refused=other.call("computer_exec",json!({"task_ref":task,"request_id":"legacy-full","command":["/bin/true"]}));
+    assert_eq!(refused["error"]["code"],"BUDGET_EXCEEDED","{refused}");
+    work_artifact("journal-capacity-defaults",json!({"defaults":status,"explicit_cap":refused}));
+}
+
+#[test]
+fn journal_capacity_compacts_free_pages_in_both_databases() {
+    let daemon=Daemon::start_with_policy("capacity-compact",true,capacity_policy(1024*1024,1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let journal=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    journal.execute_batch("DELETE FROM observations WHERE observation_ref='capacity-proof'; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let storage=rusqlite::Connection::open(daemon.root.join("state/storage.sqlite")).unwrap();
+    storage.execute_batch("CREATE TABLE capacity_fixture(value BLOB); INSERT INTO capacity_fixture VALUES(zeroblob(2097152)); DELETE FROM capacity_fixture; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let paths=[daemon.root.join("state/journal.sqlite"),daemon.root.join("state/storage.sqlite")];
+    let before:Vec<u64>=paths.iter().map(|p|std::fs::metadata(p).unwrap().len()).collect();
+    let result=agent.call("computer_exec",json!({"task_ref":task,"request_id":"free-pages","command":["/bin/true"]}));
+    assert_eq!(result["status"],"ok","{result}");
+    let after:Vec<u64>=paths.iter().map(|p|std::fs::metadata(p).unwrap().len()).collect();
+    assert!(after[0]<before[0] && after[1]<before[1],"{before:?} -> {after:?}");
+    work_artifact("journal-capacity-compaction",json!({"before":before,"after":after,"result":result}));
+}
+
+#[test]
+fn journal_capacity_open_attention_pins_old_task_evidence() {
+    let daemon=Daemon::start_with_policy("capacity-attention",true,capacity_policy(1024*1024,1024*1024));
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    agent.call("computer_finish",json!({"task_ref":task,"request_id":"attention-finish","outcome":"complete","summary":"fixture settled"}));
+    capacity_seed_observation(&daemon,&task,2*1024*1024);
+    let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    db.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00.000Z' WHERE task_ref=?",[&task]).unwrap();
+    db.execute("INSERT INTO attention_items(att_ref,task_ref,principal,kind,question,state,created_at) VALUES('att_capacity',?,'test','question','retain evidence','open','2000-01-01T00:00:00.000Z')",[&task]).unwrap();
+    let refused=agent.call("computer_begin",json!({"goal":"pinned evidence","request_id":"open-attention"}));
+    assert_eq!(refused["error"]["code"],"BUDGET_EXCEEDED","{refused}");
+    assert_eq!(db.query_row("SELECT count(*) FROM observations WHERE observation_ref='capacity-proof'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    db.execute_batch("UPDATE attention_items SET state='answered',answered_at='2000-01-01T00:00:00.000Z' WHERE att_ref='att_capacity'").unwrap();
+    let recovered=agent.call("computer_begin",json!({"goal":"settled attention","request_id":"settled-attention"}));
+    assert_eq!(recovered["status"],"ok","{recovered}");
+    assert_eq!(db.query_row("SELECT count(*) FROM observations WHERE observation_ref='capacity-proof'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    work_artifact("journal-capacity-attention",json!({"refused":refused,"recovered":recovered}));
+}
+
+#[test]
+fn journal_capacity_low_disk_can_recover_duplicate_wal() {
+    let mut policy=capacity_policy(8*1024*1024,8*1024*1024);
+    let mut daemon=Daemon::start_with_policy("capacity-disk-wal",true,policy.clone());
+    let storage=rusqlite::Connection::open(daemon.root.join("state/storage.sqlite")).unwrap();
+    storage.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE capacity_fixture(value BLOB); INSERT INTO capacity_fixture VALUES(zeroblob(2097152)); DELETE FROM capacity_fixture; VACUUM;").unwrap();
+    let wal=daemon.root.join("state/storage.sqlite-wal");let before=std::fs::metadata(&wal).unwrap().len();assert!(before>1024*1024);
+    let free=ibara::storage::fsx::statfs_free(&daemon.root).unwrap();
+    policy["min_free_bytes"]=json!(free+512*1024);
+    std::fs::write(daemon.root.join("policy.json"),policy.to_string()).unwrap();
+    daemon.crash_and_restart();
+    let after=std::fs::metadata(&wal).unwrap().len();assert!(after<before,"{before} -> {after}");
+    let mut agent=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut agent);
+    let health=agent.call("computer_status",json!({}));assert_eq!(health["result"]["computers"][0]["metadata_capacity"]["state"],"healthy","{health}");
+    work_artifact("journal-capacity-low-disk-recovery",json!({"before":before,"after":after,"health":health,"task_ref":task}));
+}
+
+#[test]
+fn journal_capacity_fleet_recovers_compaction_and_eligible_retention() {
+    for mode in ["compact","retention","timeline"] {
+        let daemon=Daemon::start_with_policy(&format!("capacity-fleet-{mode}"),true,capacity_policy(1024*1024,1024*1024));
+        let mut direct=Agent::start(&daemon,"codex");let (task,_)=begin_when_ready(&mut direct);
+        let end=direct.call("computer_finish",json!({"task_ref":task,"request_id":"prepare-maintenance","outcome":"complete","summary":"fixture settled"}));assert_eq!(end["status"],"ok","{end}");
+        if mode!="timeline" { capacity_seed_observation(&daemon,&task,2*1024*1024); }
+        let db=rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+        if mode=="timeline" { db.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1100) INSERT INTO timeline_events(at,kind,actor,summary,data) SELECT '2000-01-01T00:00:00.000Z','capacity','fixture',replace(hex(zeroblob(1000)),'0','x'),'{}' FROM n").unwrap(); }
+        else if mode=="compact" { db.execute_batch("DELETE FROM observations WHERE observation_ref='capacity-proof'").unwrap(); }
+        else { db.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00.000Z' WHERE task_ref=?",[&task]).unwrap(); }
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let mut fleet=Agent::fleet(&daemon,"codex");
+        let before=fleet.call("computer_status",json!({}));assert_eq!(before["result"]["computers"][0]["state"],"ready","{mode}: {before}");
+        let began=fleet.call("computer_begin",json!({"goal":"recover maintenance capacity","request_id":"auto-maintenance"}));assert_eq!(began["status"],"ok","{mode}: {began}");
+        let after=fleet.call("computer_status",json!({}));assert_eq!(after["result"]["computers"][0]["metadata_capacity"]["limit_bytes"],1024*1024);
+        work_artifact(&format!("journal-capacity-fleet-{mode}"),json!({"before":before,"began":began,"after":after,"growth_disabled":true}));
+    }
+}
+
+#[test]
+fn journal_capacity_invalid_ceiling_refuses_daemon_startup() {
+    let root=temp_root("capacity-invalid-policy");
+    std::fs::write(root.join("policy.json"),json!({"metadata_growth_max_bytes":1024*1024}).to_string()).unwrap();
+    let mut child=Command::new(IBARAD).env("IBARA_POLICY",root.join("policy.json"))
+        .env("IBARA_STATE_DIR",root.join("state")).env("IBARA_DATA_DIR",root.join("data"))
+        .env("IBARA_RUNTIME_DIR",root.join("run")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline=std::time::Instant::now()+Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now()>=deadline {let _=child.kill();panic!("invalid growth ceiling was accepted");}
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out=child.wait_with_output().unwrap();assert!(!out.status.success());
+    let error=String::from_utf8_lossy(&out.stderr);assert!(error.contains("metadata_growth_max_bytes must be at least max_metadata_bytes"),"{error}");
+    work_artifact("journal-capacity-policy",json!({"invalid_ceiling_refused":true,"stderr":error}));
+}
+
+#[test]
+fn activity_recorder_health_and_content_free_error_categories_through_process() {
+    use std::io::Read;
+    let mut daemon=Daemon::start_with("activity-health",true);
+    let mut agent=Agent::start(&daemon,"codex");
+    let (task,_)=begin_when_ready(&mut agent);
+    let health=daemon.admin(&["status"],"admin.key").1;
+    assert_eq!(health["result"]["recording"]["enabled"],true,"{health}");
+    assert_eq!(health["result"]["recording"]["test_agent"],false,"{health}");
+    let bad=agent.call("computer_act",json!({"task_ref":task,"request_id":"bad-action","steps":[{"action":{"kind":"no_such_action"}}]}));
+    assert_eq!(bad["error"]["code"],"INVALID_ARGUMENT","{bad}");
+    let _=agent.call("computer_finish",json!({"task_ref":task,"request_id":"done","outcome":"partial","summary":"fixture complete"}));
+    Command::new("kill").args(["-TERM",&daemon.child.id().to_string()]).status().unwrap();
+    daemon.child.wait().unwrap();
+    fn files(p:&Path,out:&mut Vec<PathBuf>) {if let Ok(entries)=std::fs::read_dir(p){for e in entries.flatten(){let p=e.path();if p.is_dir(){files(&p,out)}else if p.to_string_lossy().ends_with(".jsonl.gz"){out.push(p)}}}}
+    let mut paths=Vec::new();files(&daemon.root.join("state/facts"),&mut paths);
+    let mut facts=Vec::new();
+    for p in paths {let mut text=String::new();flate2::read::GzDecoder::new(std::fs::File::open(p).unwrap()).read_to_string(&mut text).unwrap();for line in text.lines(){facts.push(serde_json::from_str::<Value>(line).unwrap())}}
+    assert!(facts.iter().any(|f|f["kind"]=="call"&&f["fields"]["error_code"]=="INVALID_ARGUMENT"),"{facts:?}");
+    let mut unavailable=Daemon::start("recording-failure");
+    unavailable.command.env("IBARA_FACTS_DIR","/proc/ibara-unwritable-spool");
+    unavailable.crash_and_restart();
+    let mut failure_health=Value::Null;
+    for _ in 0..20 {
+        failure_health=unavailable.admin(&["status"],"admin.key").1;
+        if failure_health["result"]["recording"]["lost_since_start"].as_u64().unwrap_or(0)>0 {break;}
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(failure_health["result"]["recording"]["lost_since_start"].as_u64().unwrap()>0,"{failure_health}");
+    unavailable.command.env("IBARA_FACTS_DISABLED","1");unavailable.crash_and_restart();
+    let disabled=unavailable.admin(&["status"],"admin.key").1;
+    assert_eq!(disabled["result"]["recording"]["enabled"],false,"{disabled}");
+    if let Some(out)=std::env::var_os("IBARA_ACTIVITY_E2E_OUT") {std::fs::create_dir_all(&out).unwrap();std::fs::write(Path::new(&out).join("recording-health.json"),serde_json::to_vec_pretty(&json!({"health":health,"invalid":bad,"facts":facts,"unavailable_spool":failure_health,"disabled":disabled})).unwrap()).unwrap();}
 }

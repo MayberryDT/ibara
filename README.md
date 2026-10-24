@@ -122,6 +122,8 @@ Pictures, files and commands pass between your computers over Tailscale’s encr
 
 Your agent may send screenshots, text and file contents to its model provider. What leaves your computers depends on the agent and model you use.
 
+ibara also records local, content-free operational diagnostics. Uploading those diagnostics is optional, requires a separately configured archive and credential, and is not enabled by installation. See [recording and its limits](facts.md).
+
 ibara checks for signed releases when you install or update it. Release 0.3.1 includes an optional uploader for diagnostic records. It stays off unless you enable it.
 
 By default, recognized sending, spending, deleting and access changes need approval. You can change approval settings for your own agents.

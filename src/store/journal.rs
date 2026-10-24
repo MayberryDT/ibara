@@ -10,11 +10,13 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde_json::{Map, Value, json};
 use std::io::Read;
+use std::cell::Cell;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const DEFAULT_MAX_METADATA_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_MAX_METADATA_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_METADATA_GROWTH_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_METADATA_HEADROOM_BYTES: u64 = 1024 * 1024;
 const DEFAULT_METADATA_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const TERMINAL_SETTLED_STATES: &[&str] = &["completed", "cancelled", "partial"];
@@ -35,6 +37,8 @@ pub enum FingerprintSecret {
 pub struct JournalOptions {
     pub fingerprint_secret: Option<FingerprintSecret>,
     pub max_metadata_bytes: Option<u64>,
+    pub metadata_growth_max_bytes: Option<u64>,
+    pub metadata_min_free_bytes: Option<u64>,
     pub metadata_headroom_bytes: Option<u64>,
     pub metadata_retention_ms: Option<i64>,
     pub now: Option<Clock>,
@@ -76,7 +80,9 @@ pub struct Journal {
     state_dir: PathBuf,
     db_path: PathBuf,
     secret: Vec<u8>,
-    max_metadata_bytes: u64,
+    max_metadata_bytes: Cell<u64>,
+    metadata_growth_max_bytes: u64,
+    metadata_min_free_bytes: u64,
     metadata_headroom_bytes: u64,
     metadata_retention_ms: i64,
     clock: Clock,
@@ -106,12 +112,20 @@ impl Journal {
         db.pragma_update(None, "foreign_keys", "ON")?;
         db.pragma_update(None, "busy_timeout", 5000)?;
         let secret = load_secret(&db, options.fingerprint_secret.as_ref())?;
+        let base = options.max_metadata_bytes.unwrap_or(DEFAULT_MAX_METADATA_BYTES).max(1024);
+        // An explicit existing limit remains a hard cap unless growth is opted in.
+        let ceiling = options.metadata_growth_max_bytes.unwrap_or_else(||
+            options.max_metadata_bytes.unwrap_or(DEFAULT_METADATA_GROWTH_MAX_BYTES)).max(base);
+        let saved: Option<String> = db.query_row("SELECT value FROM meta WHERE key='metadata_capacity_bytes'", [], |r| r.get(0)).optional()?;
+        let current = saved.and_then(|s| s.parse::<u64>().ok()).unwrap_or(base).clamp(base, ceiling);
         let journal = Journal {
             db,
             state_dir,
             db_path,
             secret,
-            max_metadata_bytes: options.max_metadata_bytes.unwrap_or(DEFAULT_MAX_METADATA_BYTES).max(1024),
+            max_metadata_bytes: Cell::new(current),
+            metadata_growth_max_bytes: ceiling,
+            metadata_min_free_bytes: options.metadata_min_free_bytes.unwrap_or(0),
             metadata_headroom_bytes: options.metadata_headroom_bytes.unwrap_or(DEFAULT_METADATA_HEADROOM_BYTES),
             metadata_retention_ms: options.metadata_retention_ms.unwrap_or(DEFAULT_METADATA_RETENTION_MS).max(0),
             clock,
@@ -581,7 +595,7 @@ impl Journal {
         // Finishing releases work; reserve headroom for its durable receipt.
         // All new goal effects still use the lower admission limit.
         self.enforce_retention(input.tool != "computer_finish")?;
-        if input.tool == "computer_finish" && self.metadata_bytes()? > self.max_metadata_bytes {
+        if input.tool == "computer_finish" && self.metadata_bytes()? > self.max_metadata_bytes.get() {
             return Err(capacity_exhausted());
         }
         let operation = OperationRecord {
@@ -1175,38 +1189,147 @@ impl Journal {
         Ok(total)
     }
 
-    /// `enforceRetention` (journal.ts:727-741): prune settled terminal tasks and old
-    /// timeline rows, then enforce the metadata cap. For a new intent the cap
-    /// keeps headroom and an overflow is `BUDGET_EXCEEDED`.
+    /// Retention never sacrifices young or uncertain evidence to admit work.
+    /// Under pressure, reclaim duplicate WAL/free pages before bounded growth.
     pub fn enforce_retention(&self, for_new_intent: bool) -> Result<()> {
-        let deleted = self.prune_terminal_settled()?;
-        if deleted > 0 {
-            self.checkpoint_wal()?;
-        }
-        let limit = if for_new_intent { self.intent_limit() } else { self.max_metadata_bytes };
-        if self.metadata_bytes()? <= limit {
+        let free = crate::storage::fsx::statfs_free(&self.state_dir)?;
+        let disk_low = free < self.metadata_min_free_bytes.saturating_add(self.metadata_headroom_bytes);
+        // Checkpointing can reclaim duplicate WAL allocation even below the
+        // reserve. Do it before writes/pruning, then reassess disk admission.
+        if disk_low { self.checkpoint_wal()?; }
+        let free = crate::storage::fsx::statfs_free(&self.state_dir)?;
+        let disk_low = free < self.metadata_min_free_bytes.saturating_add(self.metadata_headroom_bytes);
+        // Don't amplify a full disk with a pruning transaction. Emergency finish
+        // remains available; ordinary effects stop only after safe recovery.
+        if disk_low {
+            if for_new_intent { return Err(self.capacity_error("disk_reserve")); }
             return Ok(());
         }
-        // WAL contains copies of database pages, not additional retained
-        // records. Reclaim it before declaring metadata exhausted, even when
-        // the retention cutoff did not delete anything.
-        self.checkpoint_wal()?;
-        if self.metadata_bytes()? > limit {
-            let free_pages: u64 = self.db.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-            if free_pages > 0 {
-                self.db.execute_batch("VACUUM")?;
-                self.checkpoint_wal()?;
-            }
+        let deleted = self.prune_terminal_settled()?;
+        let pressure = self.metadata_bytes()? >= self.max_metadata_bytes.get().saturating_mul(4) / 5;
+        if deleted > 0 || pressure {
+            self.checkpoint_wal()?;
         }
-        if for_new_intent && self.metadata_bytes()? > limit {
-            return Err(capacity_exhausted());
+        if pressure {
+            self.compact_metadata()?;
+            self.grow_metadata()?;
+        }
+        if for_new_intent && self.metadata_bytes()? > self.intent_limit() {
+            return Err(self.capacity_error("metadata_limit"));
         }
         Ok(())
     }
 
     fn intent_limit(&self) -> u64 {
-        let headroom = self.metadata_headroom_bytes.min(self.max_metadata_bytes.saturating_sub(1));
-        self.max_metadata_bytes - headroom
+        self.max_metadata_bytes.get().saturating_sub(self.metadata_headroom_bytes.min(self.max_metadata_bytes.get().saturating_sub(1)))
+    }
+
+    /// Read-only health: status remains available when new effects are refused.
+    pub fn metadata_capacity(&self) -> Result<Value> {
+        let used = self.metadata_bytes()?;
+        let free = crate::storage::fsx::statfs_free(&self.state_dir)?;
+        let limit = self.max_metadata_bytes.get();
+        let disk_low = free < self.metadata_min_free_bytes.saturating_add(self.metadata_headroom_bytes);
+        let can_grow = self.growth_target(used, free).is_some();
+        let wal_bytes = file_size(&self.state_dir.join("journal.sqlite-wal"))?
+            .saturating_add(file_size(&self.state_dir.join("storage.sqlite-wal"))?);
+        // WAL bytes duplicate database pages; let admission attempt the normal
+        // checkpoint rather than make fleet routing fence out its own recovery.
+        let can_checkpoint = wal_bytes > 0 && used.saturating_sub(wal_bytes) <= self.intent_limit();
+        let can_maintain = used > self.intent_limit() && !disk_low && !can_grow && !can_checkpoint
+            && (self.can_compact_metadata(free)? || self.can_prune_metadata()?);
+        let can_checkpoint_disk = wal_bytes > 0 && free.saturating_add(wal_bytes) >= self.metadata_min_free_bytes.saturating_add(self.metadata_headroom_bytes);
+        let state = if (disk_low && !can_checkpoint_disk) || (used > self.intent_limit() && !can_grow && !can_checkpoint && !can_maintain) { "blocked" }
+            else if disk_low || used >= limit.saturating_mul(4) / 5 { "pressure" } else { "healthy" };
+        Ok(json!({"state":state,"used_bytes":used,"limit_bytes":limit,
+            "growth_max_bytes":self.metadata_growth_max_bytes,"headroom_bytes":self.metadata_headroom_bytes,
+            "free_disk_bytes":free,"min_free_bytes":self.metadata_min_free_bytes,"can_grow":can_grow,"can_maintain":can_maintain,"wal_bytes":wal_bytes,
+            "reason":if disk_low { "disk_reserve" } else if state=="blocked" { "metadata_limit" } else { "none" }}))
+    }
+
+    // Read-only recovery eligibility, consulted only when pressure would
+    // otherwise exclude an idle computer from automatic acquisition. It is a
+    // reason to attempt normal maintenance, not permission to bypass admission.
+    fn can_compact_metadata(&self, free: u64) -> Result<bool> {
+        for db in self.metadata_connections()? {
+            let pages: u64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            let count: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            if pages > 0 && free >= self.metadata_min_free_bytes.saturating_add(count.saturating_mul(size).saturating_mul(2)) { return Ok(true); }
+        }
+        Ok(false)
+    }
+
+    fn can_prune_metadata(&self) -> Result<bool> {
+        let cutoff = iso_from_millis(self.now_ms() - self.metadata_retention_ms);
+        let timeline_ready: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_events WHERE at<=?1 AND (task_ref IS NULL OR task_ref NOT IN (SELECT task_ref FROM tasks))) OR EXISTS(SELECT 1 FROM attention_items WHERE state!='open' AND COALESCE(answered_at,created_at)<=?1) OR EXISTS(SELECT 1 FROM timeline_events WHERE id<=(SELECT MAX(id) FROM timeline_events)-?2)",
+            params![cutoff,super::timeline::MAX_TIMELINE_EVENTS], |r| r.get(0))?;
+        if timeline_ready { return Ok(true); }
+        let tasks = self.db.prepare_cached("SELECT task_ref FROM tasks WHERE state IN ('completed','cancelled','partial') AND updated_at<=? AND NOT EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref AND state='active') AND NOT EXISTS(SELECT 1 FROM attention_items WHERE attention_items.task_ref=tasks.task_ref AND state='open') AND (EXISTS(SELECT 1 FROM observations WHERE observations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM operations WHERE operations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checks WHERE checks.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checkpoints WHERE checkpoints.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM jobs WHERE jobs.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM timeline_events WHERE timeline_events.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref))")?
+            .query_map([cutoff], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for task in tasks {
+            let jobs = self.db.prepare_cached("SELECT record FROM jobs WHERE task_ref=?")?.query_map([&task], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let ops = self.db.prepare_cached("SELECT receipt,dispatched FROM operations WHERE task_ref=?")?.query_map([&task], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let jobs_keep = jobs.iter().map(|record| parse_json(Some(record),json!({})).map(|v| job_needs_retention(&v))).collect::<Result<Vec<_>>>()?;
+            let ops_keep = ops.iter().map(|(record,dispatched)| parse_json(Some(record),json!({})).map(|v| receipt_needs_retention(&v,*dispatched))).collect::<Result<Vec<_>>>()?;
+            if !jobs_keep.contains(&true) && !ops_keep.contains(&true) { return Ok(true); }
+        }
+        Ok(false)
+    }
+
+    fn capacity_error(&self, reason: &str) -> IbaraError {
+        capacity_exhausted().with("reason", reason).with("metadata_capacity", self.metadata_capacity().unwrap_or(Value::Null))
+    }
+
+    fn growth_target(&self, used: u64, free: u64) -> Option<u64> {
+        let current = self.max_metadata_bytes.get();
+        let target = current.saturating_mul(2).max(used.saturating_add(self.metadata_headroom_bytes).saturating_mul(5)/4)
+            .min(self.metadata_growth_max_bytes);
+        (target > current && target > used.saturating_add(self.metadata_headroom_bytes)
+            && free >= self.metadata_min_free_bytes.saturating_add(target-current).saturating_add(self.metadata_headroom_bytes))
+            .then_some(target)
+    }
+
+    fn grow_metadata(&self) -> Result<()> {
+        let used = self.metadata_bytes()?;
+        if used < self.max_metadata_bytes.get().saturating_mul(4)/5 { return Ok(()); }
+        let free = crate::storage::fsx::statfs_free(&self.state_dir)?;
+        if let Some(target) = self.growth_target(used, free) {
+            self.db.execute("INSERT INTO meta(key,value) VALUES('metadata_capacity_bytes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [target.to_string()])?;
+            self.max_metadata_bytes.set(target);
+        }
+        Ok(())
+    }
+
+    fn compact_metadata(&self) -> Result<()> {
+        for db in self.metadata_connections()? {
+            let pages: u64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            if pages == 0 { continue; }
+            let count: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let free = crate::storage::fsx::statfs_free(&self.state_dir)?;
+            // SQLite VACUUM can need twice the original file size in spare disk.
+            if free >= self.metadata_min_free_bytes.saturating_add(count.saturating_mul(size).saturating_mul(2)) {
+                match db.execute_batch("VACUUM") {
+                    Ok(()) => {},
+                    Err(e) if sqlite_busy(&e) => continue,
+                    Err(e) => return Err(map_capacity_error(e)),
+                }
+                checkpoint(&db)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn metadata_connections(&self) -> Result<Vec<Connection>> {
+        let mut databases = vec![Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?];
+        let storage = self.state_dir.join("storage.sqlite");
+        if storage.exists() {
+            databases.push(Connection::open_with_flags(storage, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?);
+        }
+        for db in &databases { db.busy_timeout(std::time::Duration::from_millis(50))?; }
+        Ok(databases)
     }
 
     /// `pruneTerminalSettled` (journal.ts:748-784), plus the timeline tables:
@@ -1227,6 +1350,8 @@ impl Journal {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut deleted = 0usize;
         for task_ref in &prunable {
+            let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM leases WHERE task_ref=? AND state='active') OR EXISTS(SELECT 1 FROM attention_items WHERE task_ref=? AND state='open')", params![task_ref,task_ref], |r| r.get(0))?;
+            if held { continue; }
             let jobs: Vec<(String, String)> = tx
                 .prepare_cached("SELECT job_ref, record FROM jobs WHERE task_ref = ?")?
                 .query_map([task_ref], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1246,6 +1371,7 @@ impl Journal {
             deleted += tx.execute("DELETE FROM observations WHERE task_ref = ?", [task_ref])?;
             deleted += tx.execute("DELETE FROM checks WHERE task_ref = ?", [task_ref])?;
             deleted += tx.execute("DELETE FROM checkpoints WHERE task_ref = ?", [task_ref])?;
+            deleted += tx.execute("DELETE FROM leases WHERE task_ref = ? AND state != 'active'", [task_ref])?;
             for (job_ref, _) in &jobs {
                 deleted += tx.execute("DELETE FROM jobs WHERE job_ref = ?", [job_ref])?;
             }
@@ -1260,9 +1386,23 @@ impl Journal {
     }
 
     fn checkpoint_wal(&self) -> Result<()> {
-        self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        for db in self.metadata_connections()? { checkpoint(&db)?; }
         Ok(())
     }
+}
+
+// A busy reader is not evidence of corruption. Checkpoint may report busy in
+// its first result column; the remaining WAL stays counted by metadata_bytes.
+fn checkpoint(db: &Connection) -> Result<()> {
+    match db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)) {
+        Ok(_) => Ok(()),
+        Err(e) if sqlite_busy(&e) => Ok(()),
+        Err(e) => Err(map_capacity_error(e)),
+    }
+}
+
+fn sqlite_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 // ---- helpers ------------------------------------------------------------------

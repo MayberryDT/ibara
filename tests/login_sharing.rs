@@ -257,7 +257,7 @@ fn browser(path: &Path, jar: Shared) -> Browser {
                 "tabs" => {
                     json!({"tabs": [{"id": 7, "title": "Sign in", "url": jar.url, "focused": true}]})
                 }
-                "login_context" => json!({"url": jar.url, "previous": jar.previous}),
+                "login_context" => json!({"url": jar.url, "previous": jar.previous, "sign_in_page": jar.page != "left_sign_in"}),
                 "login_reload" => {
                     jar.ops.push("reload".into());
                     jar.commit_at = Some(Instant::now() + jar.reload_delay);
@@ -639,9 +639,8 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
             .then_some(())
     });
     let off_begin = off_agent.begin("off-begin", &["tax.test"]);
-    let off_att = off_begin["result"]["logins"][0]["attention"]
-        .as_str()
-        .unwrap();
+    let off_request=off_agent.sign_in(off_begin["result"]["task_ref"].as_str().unwrap(),"off-request", &["tax.test"]);
+    let off_att = off_request["result"]["attention"].as_str().unwrap_or_else(||panic!("{off_request}"));
     let declined = vesper.ok(
         "login-answer",
         &[
@@ -789,28 +788,13 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     // J2: one begin, several sites, one approval.
     let began = codex.begin("b1", &["tax.test", "idp.test", "bank.test", "mail.test"]);
     let task = began["result"]["task_ref"].as_str().unwrap().to_string();
-    let logins = &began["result"]["logins"];
-    let standing = states(&began);
-    assert_eq!(
-        standing,
-        BTreeMap::from([
-            ("tax.test".into(), "allowed".into()),
-            ("idp.test".into(), "asking".into()),
-            ("bank.test".into(), "denied".into()),
-            ("mail.test".into(), "asking".into())
-        ]),
-        "{began}"
-    );
-    let att = logins[1]["attention"].as_str().unwrap().to_string();
-    assert_eq!(
-        logins[3]["attention"],
-        json!(att),
-        "one request for every site asked: {began}"
-    );
-    assert!(
-        logins[0]["attention"].is_null() && logins[2]["attention"].is_null(),
-        "{began}"
-    );
+    assert!(began["result"]["logins"].as_array().unwrap().iter().all(|l|l["attention"].is_null()),"{began}");
+    let initial_tax=codex.sign_in(&task,"initial-tax", &["tax.test"]);
+    assert_eq!(states(&initial_tax)["tax.test"],"shared","{initial_tax}");
+    agents_computer.lock().url="https://idp.test/login".into();
+    agents_computer.lock().previous=Some("https://mail.test/".into());
+    let requested=codex.sign_in(&task,"initial-ask", &["idp.test","mail.test"]);
+    let att=requested["result"]["attention"].as_str().unwrap().to_string();
     let open_logins = |target: &Target| {
         target.admin(&["attention"]).1["result"]["items"]
             .as_array()
@@ -923,7 +907,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
             "--att",
             &att,
             "--decisions",
-            r#"{"tax.test":"share","idp.test":"share","mail.test":"decline"}"#,
+            r#"{"idp.test":"share","mail.test":"decline"}"#,
         ],
     );
     replies.push(answered.to_string());
@@ -941,7 +925,6 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     assert_eq!(
         outcomes,
         BTreeMap::from([
-            ("tax.test".into(), "shared".into()),
             ("idp.test".into(), "shared".into()),
             ("mail.test".into(), "declined".into())
         ]),
@@ -951,6 +934,8 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     assert!(ops(&agents_computer).contains(&"write idp.test 2".to_string()));
 
     // J3 on an Allowed site: nothing asked, a fresh copy, the page opens signed in.
+    agents_computer.lock().url="https://tax.test/login".into();
+    agents_computer.lock().previous=None;
     let allowed = codex.sign_in(&task, "s1", &[]);
     assert_eq!(
         (
@@ -973,8 +958,8 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
             .iter()
             .filter(|o| *o == "write tax.test 3")
             .count(),
-        3,
-        "refreshed fresh"
+        2,
+        "declaration does not copy; explicit sign-in refreshes"
     );
     assert_eq!(
         codex.sign_in(&task, "s1", &[])["result"],
@@ -1002,6 +987,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     agents_computer.lock().old_extension = false;
 
     // Ask First: held, answered, then the same request goes ahead.
+    agents_computer.lock().url="https://news.test/login".into();
     let held = codex.sign_in(&task, "s2", &["news.test"]);
     assert_eq!(
         (
@@ -1045,6 +1031,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     assert_eq!(states(&shared)["news.test"], "shared", "{shared}");
 
     // Declined earlier in this task, and Denied: final at once.
+    agents_computer.lock().url="https://mail.test/login".into();
     let declined = codex.sign_in(&task, "s3", &["mail.test"]);
     assert_eq!(
         (
@@ -1061,6 +1048,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
             .starts_with("declined:"),
         "{declined}"
     );
+    agents_computer.lock().url="https://bank.test/login".into();
     let denied = codex.sign_in(&task, "s4", &["bank.test"]);
     assert_eq!(states(&denied)["bank.test"], "denied", "{denied}");
     assert!(
@@ -1069,6 +1057,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     );
 
     // Signed out in the person's browser: the agent waits, then it arrives.
+    agents_computer.lock().url="https://out.test/login".into();
     let out = codex.sign_in(&task, "s5", &["out.test"]);
     assert_eq!(
         (out["status"].as_str(), states(&out)["out.test"].as_str()),
@@ -1132,6 +1121,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
         "{:?}",
         ops(&agents_computer)
     );
+    agents_computer.lock().url="https://big.test/login".into();
     let big = codex.sign_in(&task, "s9", &["big.test"]);
     assert_eq!(states(&big)["big.test"], "shared", "{big}");
     let batches: Vec<usize> = ops(&agents_computer)
@@ -1145,6 +1135,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     );
 
     // A partial write is unknown, says what to do, and page reading goes on.
+    agents_computer.lock().url="https://partial.test/login".into();
     let partial = codex.sign_in(&task, "s10", &["partial.test"]);
     assert_eq!(states(&partial)["partial.test"], "unknown", "{partial}");
     assert!(
@@ -1201,7 +1192,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
         let began = codex.begin(&format!("b2-{}", uuid::Uuid::new_v4()), &["strict.test"]);
         let task = began["result"]["task_ref"].as_str().unwrap().to_string();
         let seen = began["result"]["logins"][0].clone();
-        if seen["state"] == "rejected_before" {
+        if seen["last_result"] == "site_rejected" {
             assert_eq!(seen["last_result"], "site_rejected", "{began}");
             agents_computer.lock().url = "https://strict.test/login".into();
             let worked = codex.sign_in(&task, "w1", &[]);
@@ -1230,9 +1221,9 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     assert_eq!(tulip1.admin(&["access_set", &edit]).0, Some(0));
     let mut friend = Agent::start(&tulip1, "hazel", "claude");
     let theirs = friend.begin("h1", &["tax.test"]);
-    assert_eq!(theirs["result"]["logins"][0]["state"], "asking", "{theirs}");
+    assert_eq!(theirs["result"]["logins"][0]["state"], "check_session", "{theirs}");
     assert!(
-        theirs["result"]["logins"][0]["attention"].is_string(),
+        theirs["result"]["logins"][0]["attention"].is_null(),
         "{theirs}"
     );
     friend.finish(theirs["result"]["task_ref"].as_str().unwrap(), "hf");
@@ -1252,7 +1243,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     wait_for("shop.test Allowed through All Computers", 15, || {
         let began = codex.begin(&format!("b3-{}", uuid::Uuid::new_v4()), &["shop.test"]);
         codex.finish(began["result"]["task_ref"].as_str().unwrap(), "f3");
-        (began["result"]["logins"][0]["state"] == "allowed").then_some(())
+        (began["result"]["logins"][0]["state"] == "available").then_some(())
     });
     let removed = vesper.ok(
         "login-remove",
@@ -1289,10 +1280,12 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     );
     let asked_again = codex.begin("b4", &["shop.test"]);
     assert_eq!(
-        asked_again["result"]["logins"][0]["state"], "asking",
+        asked_again["result"]["logins"][0]["state"], "check_session",
         "{asked_again}"
     );
-    let again_att = asked_again["result"]["logins"][0]["attention"]
+    agents_computer.lock().url="https://shop.test/login".into();
+    let ask=codex.sign_in(asked_again["result"]["task_ref"].as_str().unwrap(),"shop-ask", &["shop.test"]);
+    let again_att = ask["result"]["attention"]
         .as_str()
         .unwrap();
     let share_all = vesper.ok(
@@ -1318,7 +1311,8 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
         &["--computer", &tulip1_id, "--site", "shop.test"],
     );
     let again = codex.begin("b4-share", &["shop.test"]);
-    let att = again["result"]["logins"][0]["attention"].as_str().unwrap();
+    let ask=codex.sign_in(again["result"]["task_ref"].as_str().unwrap(),"shop-ask-again", &["shop.test"]);
+    let att = ask["result"]["attention"].as_str().unwrap();
     let share = vesper.ok(
         "login-answer",
         &[
@@ -1426,6 +1420,7 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
         .to_string();
     drop(person_browser.take());
     drop(vesper);
+    agents_computer.lock().url="https://tax.test/login".into();
     let away = codex.sign_in(&away_task, "a1", &["tax.test"]);
     assert_eq!(
         (away["status"].as_str(), states(&away)["tax.test"].as_str()),
@@ -1676,6 +1671,7 @@ fn login_assistance_preserves_intent_and_safe_continuation() {
     let computer = add_own(&mut console, "tulip1");
     let jar = Shared::default();
     jar.lock().url = "https://accounts.test/login".into();
+    jar.lock().previous=Some("https://public.test/".into());
     let browser_connection = browser(&target.root.join("run/chrome.sock"), jar.clone());
     let mut agent = Agent::start(&target, "vesper", "assistance-e2e");
     wait_for("assistance target ready", 40, || agent.call("computer_status", json!({}))["situation"]
@@ -1683,7 +1679,8 @@ fn login_assistance_preserves_intent_and_safe_continuation() {
     let mut receipts = Vec::new();
     let began = agent.begin("assist-begin", &["accounts.test", "public.test"]);
     let task = began["result"]["task_ref"].as_str().unwrap().to_string();
-    let att = began["result"]["logins"][0]["attention"].as_str().unwrap().to_string();
+    let ask=agent.sign_in(&task,"assist-request", &["accounts.test","public.test"]);
+    let att = ask["result"]["attention"].as_str().unwrap_or_else(||panic!("{ask}")).to_string();
     let answer = |c: &mut Console, revision: u64, choices: Value| -> Value {
         c.ask("login-assist", &["--computer", &computer, "--att", &att,
             "--revision", &revision.to_string(), "--decisions", &choices.to_string()])
@@ -1781,9 +1778,11 @@ fn login_assistance_preserves_intent_and_safe_continuation() {
     assert_eq!(cancelled["status"], "ok", "{cancelled}");
     let after = answer(&mut console, 99, json!({"accounts.test":"no_account"}));
     assert!(!after["error"].is_null(), "cancelled request cannot be revived");
-    let began=agent.begin("recovery-new-task", &["accounts.test","guest.test","retry.test"]);
+    let began=agent.begin("recovery-new-task", &["accounts.test","guest.test"]);
     let next_task=began["result"]["task_ref"].as_str().unwrap().to_string();
-    let next_att=began["result"]["logins"][0]["attention"].as_str().unwrap().to_string();
+    jar.lock().previous=Some("https://guest.test/".into());
+    let ask=agent.sign_in(&next_task,"recovery-request", &["accounts.test","guest.test"]);
+    let next_att=ask["result"]["attention"].as_str().unwrap().to_string();
     let checkpoint=|agent:&mut Agent,action:&str,extra:Value|->Value {
         let mut login=extra;login["attention"]=json!(next_att);login["action"]=json!(action);
         agent.call("computer_checkpoint",json!({"task_ref":next_task,"login":login}))
@@ -1797,20 +1796,20 @@ fn login_assistance_preserves_intent_and_safe_continuation() {
     assert!(guest["error"].is_null(),"{guest}");
     let resolved=checkpoint(&mut agent,"resolve",json!({"site":"guest.test","evidence_ref":"fixture:public-report"}));
     assert_eq!(resolved["status"],"ok","unclaimed proposal must not prevent guest resolution: {resolved}");
-    let proposal=json!({"site":"retry.test","identity":"Animas fixture","credential_store":"Synthetic vault","cost":"free","summary":"Read report"});
+    let proposal=json!({"site":"accounts.test","identity":"Animas fixture","credential_store":"Synthetic vault","cost":"free","summary":"Read report"});
     let proposed=checkpoint(&mut agent,"propose_signup",json!({"proposal":proposal}));
-    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"retry.test":"approve_signup"}));
+    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"accounts.test":"approve_signup"}));
     assert!(approved["error"].is_null(),"{approved}");
-    let claim=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    let claim=checkpoint(&mut agent,"claim_signup",json!({"site":"accounts.test"}));
     assert_eq!(claim["status"],"ok","{claim}");
-    let no_effect=checkpoint(&mut agent,"record_not_created",json!({"site":"retry.test","evidence_ref":"fixture:registration-rejected-zero-effects"}));
+    let no_effect=checkpoint(&mut agent,"record_not_created",json!({"site":"accounts.test","evidence_ref":"fixture:registration-rejected-zero-effects"}));
     assert_eq!(no_effect["status"],"ok","{no_effect}");
-    let repeat=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    let repeat=checkpoint(&mut agent,"claim_signup",json!({"site":"accounts.test"}));
     assert_eq!(repeat["status"],"error","reconciled no-effect still needs a new concrete grant: {repeat}");
     let proposed=checkpoint(&mut agent,"propose_signup",json!({"proposal":proposal}));
-    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"retry.test":"approve_signup"}));
+    let approved=decide(&mut console,proposed["result"]["login"]["revision"].as_u64().unwrap(),json!({"accounts.test":"approve_signup"}));
     assert!(approved["error"].is_null(),"{approved}");
-    let retry=checkpoint(&mut agent,"claim_signup",json!({"site":"retry.test"}));
+    let retry=checkpoint(&mut agent,"claim_signup",json!({"site":"accounts.test"}));
     assert_eq!(retry["status"],"ok","confirmed no effect permits newly authorized retry: {retry}");
     assert_ne!(retry["result"]["login"]["signup"]["claim_ref"],claim["result"]["login"]["signup"]["claim_ref"]);
     receipts.extend([guest,resolved,no_effect,retry]);
@@ -1821,4 +1820,62 @@ fn login_assistance_preserves_intent_and_safe_continuation() {
             "browser":"synthetic transport", "native_ui_proven":false,"receipts":receipts,
             "cookie_effects":ops(&jar),"real_accounts_created":0})).unwrap()).unwrap();
     }
+}
+
+/// Process regression: declaring likely sites is not permission to disturb a
+/// session or ask a person. The browser adapter witnesses whether a request
+/// reaches sharing, and the actual attention API witnesses notification count.
+#[test]
+fn login_declaration_preserves_sessions_and_assistance_requires_a_sign_in_page() {
+    use support::*;
+    let world = World::new("login-declaration");
+    let desk = world.root.join("desktop"); fs::create_dir_all(&desk).unwrap();
+    write_executable(&desk.join("hyprctl"), DESKTOP_HYPRCTL);
+    write_executable(&desk.join("omarchy-toggle-idle"), DESKTOP_IDLE);
+    let (hypr,idle)=(desk.join("hyprctl"),desk.join("omarchy-toggle-idle"));
+    let env=[("IBARA_TEST_HYPRCTL",hypr.as_os_str()),("IBARA_TEST_IDLE",idle.as_os_str()),("WAYLAND_DISPLAY",std::ffi::OsStr::new("wayland-e2e"))];
+    let mut target=Target::start_with(&world,node("tulip1"),Some("Tulip1"),300_000,&env);
+    let operator_target=Target::start(&world,node("vesper"),None,300_000);
+    let mut console=Console::start(&world,"vesper",node("vesper"),Some(&operator_target));
+    let computer=add_own(&mut console,"tulip1");
+    let jar=Shared::default(); jar.lock().url="https://accounts.test/home".into();
+    jar.lock().page="left_sign_in".into();
+    let _browser=browser(&target.root.join("run/chrome.sock"),jar.clone());
+    let mut agent=Agent::start(&target,"vesper","login-declaration-e2e");
+    wait_for("declaration target ready",40,||agent.call("computer_status",json!({}))["situation"].as_str().is_some_and(|s|s.contains("nobody controls")).then_some(()));
+    let began=agent.begin("declare", &["accounts.test","other.test"]);
+    let task=began["result"]["task_ref"].as_str().unwrap().to_string();
+    let open=||target.admin(&["attention"]).1["result"]["items"].as_array().cloned().unwrap_or_default().into_iter().filter(|i|i["kind"]=="login"&&i["state"]=="open").count();
+    assert_eq!(open(),0,"declaration must not notify: {began}");
+    assert!(ops(&jar).is_empty(),"declaration must not alter a session");
+    let stale=agent.call("browser_act",json!({"task_ref":task,"request_id":"stale-target","action":{"kind":"click","target":"b999"}}));
+    assert_eq!(stale["error"]["code"],"STALE_TARGET","{stale}");
+    assert!(stale["error"]["recovery_frame"].is_object(),"fresh read-only context: {stale}");
+    let existing=agent.sign_in(&task,"existing", &["accounts.test"]);
+    assert_eq!(existing["error"]["code"],"INVALID_ARGUMENT","{existing}");
+    assert_eq!(open(),0); assert!(ops(&jar).is_empty());
+    jar.lock().url="https://accounts.test/login".into(); jar.lock().page="still_sign_in".into();
+    let unrelated=agent.sign_in(&task,"unrelated", &["other.test"]);
+    assert_eq!(unrelated["error"]["code"],"INVALID_ARGUMENT","{unrelated}"); assert_eq!(open(),0);
+    let requested=agent.sign_in(&task,"request", &["accounts.test"]);
+    assert_eq!(open(),1,"{requested}");
+    let repeated=agent.sign_in(&task,"repeat", &["accounts.test"]);
+    assert_eq!(open(),1,"{repeated}");
+    assert!(ops(&jar).is_empty());
+    if let Some(out)=std::env::var_os("IBARA_ACTIVITY_E2E_OUT") {
+        fs::create_dir_all(&out).unwrap();
+        fs::write(Path::new(&out).join("login-declaration.json"),serde_json::to_vec_pretty(&json!({"begin":began,"existing":existing,"unrelated":unrelated,"request":requested,"repeat":repeated,"open":1,"cookie_operations":ops(&jar)})).unwrap()).unwrap();
+    }
+    agent.finish(&task,"finish");
+    for _ in 0..7 {console.ok("fleet-attention", &["--fresh",&computer]);}
+    Command::new("kill").args(["-TERM",&target.child.id().to_string()]).status().unwrap();
+    target.child.wait().unwrap();
+    fn collect(p:&Path,out:&mut Vec<std::path::PathBuf>) {if let Ok(entries)=fs::read_dir(p){for e in entries.flatten(){let p=e.path();if p.is_dir(){collect(&p,out)}else if p.to_string_lossy().ends_with(".jsonl.gz"){out.push(p)}}}}
+    let mut files=Vec::new();collect(&target.root.join("state/facts"),&mut files);
+    let mut summaries=Vec::new();
+    for p in files {use std::io::Read;let mut text=String::new();flate2::read::GzDecoder::new(fs::File::open(p).unwrap()).read_to_string(&mut text).unwrap();for line in text.lines(){let f:Value=serde_json::from_str(line).unwrap();if f["fields"]["aggregation"]=="poll_summary" {summaries.push(f)}}}
+    assert!(summaries.iter().filter(|f|f["fields"]["op"]=="attention").map(|f|f["fields"]["samples"].as_u64().unwrap()).sum::<u64>()>=7,"{summaries:?}");
+    assert!(summaries.len()<7,"poll counts compacted: {summaries:?}");
+    if let Some(out)=std::env::var_os("IBARA_ACTIVITY_E2E_OUT") {fs::write(Path::new(&out).join("poll-summaries.json"),serde_json::to_vec_pretty(&summaries).unwrap()).unwrap();}
+
 }

@@ -402,7 +402,7 @@ impl Target {
         ] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
-        fs::write(root.join("policy.json"), r#"{"principals":[]}"#).unwrap();
+        fs::write(root.join("policy.json"), r#"{"principals":[],"min_free_bytes":1,"warn_free_bytes":1}"#).unwrap();
         fs::write(root.join("gateway.key"), "gateway-e2e-secret\n").unwrap();
         let admin_digest = ibara::server::policy::sha256_hex(b"admin-e2e-secret");
         fs::write(root.join("admin.sha256"), format!("{admin_digest}\n")).unwrap();
@@ -463,6 +463,9 @@ impl Target {
         world.machine_env(&mut command, n);
         command
             .env("HOME", root.join("home"))
+            .env_remove("IBARA_FACTS_DIR")
+            .env_remove("IBARA_FACTS_TEST_AGENT")
+            .env_remove("IBARA_FACTS_DISABLED")
             .env("IBARA_STATE_DIR", root.join("state"))
             .env("IBARA_DATA_DIR", root.join("data"))
             .env("IBARA_RUNTIME_DIR", root.join("run"))

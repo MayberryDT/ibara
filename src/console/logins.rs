@@ -200,6 +200,7 @@ struct Remote {
     older: bool,
     last_error: Option<String>,
     retry_after: Option<Instant>,
+    idle_poll_after: Option<Instant>,
 }
 
 impl Logins {
@@ -869,6 +870,8 @@ async fn tend(console: &Console, computer: &str) -> Result<()> {
     {
         return Ok(());
     }
+    // Keep active delivery responsive; idle polling still renews the 15s source heartbeat.
+    if !off && !removals && remote.pushed==Some(settings.version) && remote.idle_poll_after.is_some_and(|at|Instant::now()<at) { return Ok(()); }
     let failed_before = remote.last_error.is_some();
     if !administers(console, computer, failed_before).await? || console.logins.get(computer).older {
         if off || removals {
@@ -904,6 +907,8 @@ async fn tend(console: &Console, computer: &str) -> Result<()> {
                 return Err(error);
             }
         };
+        let idle=pending["requests"].as_array().is_some_and(|v|v.is_empty()) && pending["results"].as_array().is_some_and(|v|v.is_empty());
+        console.logins.with(computer,|remote|remote.idle_poll_after=idle.then(||Instant::now()+Duration::from_secs(6)));
         absorb(computer, &pending["results"])?;
         deliver_pending(console, computer, &pending["requests"]).await?;
     } else if settings.pending_off.iter().any(|c| c == computer) {

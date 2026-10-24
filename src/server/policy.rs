@@ -11,10 +11,11 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Limit keys that must be positive safe integers when present (`server.ts:132`).
-pub const LIMIT_KEYS: [&str; 9] = [
+pub const LIMIT_KEYS: [&str; 10] = [
     "max_process_output_chars",
     "max_artifact_bytes",
     "max_metadata_bytes",
+    "metadata_growth_max_bytes",
     "metadata_headroom_bytes",
     "metadata_retention_ms",
     "min_free_bytes",
@@ -49,6 +50,10 @@ impl Policy {
                 Some(value) if safe_integer(value).is_some_and(|n| n >= 1.0) => {}
                 Some(_) => bail!("Invalid configured limit: {key}"),
             }
+        }
+        if let Some(ceiling) = raw.get("metadata_growth_max_bytes").and_then(Value::as_u64) {
+            let base = raw.get("max_metadata_bytes").and_then(Value::as_u64).unwrap_or(1024 * 1024 * 1024);
+            if ceiling < base { bail!("metadata_growth_max_bytes must be at least max_metadata_bytes"); }
         }
         let principals = raw
             .get("principals")

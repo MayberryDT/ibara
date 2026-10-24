@@ -155,7 +155,7 @@ pub struct BeginResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoginStanding {
     pub site: String,
-    /// `allowed`, `asking`, `denied`, `sharing_off`, `rejected_before` or `not_available`.
+    /// Availability only: `available`, `denied` or `check_session`; never authentication proof.
     pub state: String,
     /// The one request a person answers for every site asked at begin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,6 +371,11 @@ pub struct ComputerSummary {
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
+    /// Read-only capacity health; absent for older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_capacity: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<Value>,
     /// One line.
     pub capabilities: String,
 }

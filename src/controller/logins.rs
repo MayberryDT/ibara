@@ -2,7 +2,7 @@
 //!
 //! One sharing computer is pinned here (`login_receiver` in the journal's
 //! meta). It pushes a projection of its login rules (`login_configure`) and
-//! asks every 2 s for what agents here need (`login_pending`) over the
+//! asks every 2 s while delivering, every 6 s while idle for what agents here need (`login_pending`) over the
 //! existing operator route; this computer never connects to it. An agent asks
 //! with `logins` at `computer_begin` or with `browser_act` `sign_in`. Each ask
 //! is a login request (`login_requests` in meta); the sites that need the
@@ -266,7 +266,7 @@ fn next_for(code: &str, site: &str, task_ref: &str, att: Option<&str>) -> String
         "waiting_for_browser" => format!("waiting_for_browser: your person's browser on their sharing computer isn't running. Keep waiting: {again} in a minute; it completes when the browser opens."),
         "waiting_for_sharing_computer" => format!("waiting_for_sharing_computer: the sharing computer is off or asleep. Do other work or wait, {again}; it completes when that computer is back."),
         "signed_out_there" => format!("signed_out_there: your person isn't signed in to {site} in their browser and was asked to sign in there and choose Retry. Wait, {again}."),
-        "sharing_off" => format!("sharing_off: no computer shares logins with this one yet; your person was offered Turn On Login Sharing. Wait, {again}."),
+        "sharing_off" => format!("sharing_off: automatic sharing is unavailable. This requests assistance, not authentication. Read the existing assistance answer; use the current session or person sign-in. Do not raise another request. When waiting for a response, {again}."),
         "independent_session" => "independent_session: this site uses a separate browser session on this computer. Cookie sharing is disabled. Verify an existing session, or use the login assistance request for person sign-in or account setup.".into(),
         "cancelled" => "cancelled: this sign-in was stopped. Do not ask again or create an account for it in this task.".into(),
         "resolved" => "resolved: this request already has verified route evidence. Continue the task without opening another login request.".into(),
@@ -457,70 +457,28 @@ impl Controller {
         }
     }
 
-    /// `computer_begin`'s `logins`: each site's standing, one request for
-    /// them all and one attention item for the ones the person answers. It
-    /// never waits.
+    /// Declaration only: describe sharing availability without modifying the
+    /// browser or asking a person. Actual assistance requires an observed form.
     pub(super) fn begin_logins(
         &self,
         task: &TaskRecord,
-        lease: &LeaseRecord,
+        _lease: &LeaseRecord,
         names: &[String],
     ) -> Result<Vec<LoginStanding>> {
         let receiver = Receiver::load(&self.journal)?;
         let own = self.own_principal(&task.principal)?;
         let available = receiver.source.is_some() || own;
         let mut standings = Vec::new();
-        let mut entries = Vec::new();
         for raw in names {
             let name = site(raw)?;
-            if standings.iter().any(|s: &LoginStanding| s.site == name) {
-                continue;
-            }
-            let (entry, mut state) = self.first_standing(&receiver, &name, own, available);
-            let last_result = receiver.last_result(&name);
-            if last_result.as_deref() == Some("site_rejected")
-                && matches!(state, "allowed" | "asking")
-            {
-                state = "rejected_before";
-            }
-            if state == "denied" {
-                entries.push(Entry {
-                    site: name.clone(),
-                    via: None,
-                    state: "denied".into(),
-                    reason: None,
-                    person_response: None,
-                    responded_at: None,
-                });
-            } else if let Some(entry) = entry {
-                entries.push(Entry {
-                    site: name.clone(),
-                    via: None,
-                    state: entry.into(),
-                    reason: None,
-                    person_response: None,
-                    responded_at: None,
-                });
-            }
+            if standings.iter().any(|s: &LoginStanding| s.site == name) { continue; }
+            let (_, state) = self.first_standing(&receiver, &name, own, available);
             standings.push(LoginStanding {
-                site: name,
-                state: state.into(),
+                site: name.clone(),
+                state: if state == "allowed" { "available" } else if state == "denied" { "denied" } else { "check_session" }.into(),
                 attention: None,
-                last_result,
+                last_result: receiver.last_result(&name),
             });
-        }
-        if entries.is_empty() {
-            return Ok(standings);
-        }
-        let request = self.open_request(self.new_request(task, own, None, entries), lease, None)?;
-        for standing in &mut standings {
-            if request
-                .sites
-                .iter()
-                .any(|e| e.site == standing.site && e.state == "asking")
-            {
-                standing.attention = request.att_ref.clone();
-            }
         }
         Ok(standings)
     }
@@ -545,36 +503,28 @@ impl Controller {
         } else {
             None
         };
-        let page = tab.as_ref().map(|t| page_of(&t.url));
+        let tab = tab.ok_or_else(|| invalid("sign_in requests assistance; it does not sign in. Open the needed site and inspect its existing session first."))?;
+        let context = self.desktop.browser_call("login_context", json!({"tabId":tab.id}), false).await?;
+        if context["sign_in_page"] != true {
+            return Err(invalid("No visible sign-in form was established. Use the existing browser session and verify the expected account. sign_in only requests assistance or shares an eligible session; it does not enter credentials or prove authentication.")
+                .with("execution_not_started", true)
+                .with("next", "Observe the current page. Request sign_in only when a visible sign-in form blocks this task."));
+        }
+        let current = context["url"].as_str().and_then(url_host).and_then(|h|site(h).ok())
+            .ok_or_else(|| invalid("The focused tab is not a web sign-in page."))?;
+        let previous = context["previous"].as_str().and_then(url_host).and_then(|h|site(h).ok()).filter(|p|*p!=current);
+        let page = Some(page_of(&tab.url));
         let mut names: Vec<(String, Option<String>)> = Vec::new();
         if sites.is_empty() {
-            let tab = tab.ok_or_else(|| {
-                IbaraError::new("STALE_TARGET", "No browser tab is focused. Focus the tab that shows the sign-in page, then call sign_in again.", true)
-                    .with("execution_not_started", true)
-            })?;
-            let context = self
-                .desktop
-                .browser_call("login_context", json!({ "tabId": tab.id }), false)
-                .await?;
-            let current = context["url"].as_str().and_then(url_host).and_then(|h| site(h).ok()).ok_or_else(|| {
-                IbaraError::new("STALE_TARGET", "The focused tab is not a web page. Open the sign-in page, then call sign_in again.", true)
-                    .with("execution_not_started", true)
-            })?;
-            let previous = context["previous"]
-                .as_str()
-                .and_then(url_host)
-                .and_then(|h| site(h).ok())
-                .filter(|p| *p != current);
-            names.push((current.clone(), None));
-            if let Some(previous) = previous {
-                names.push((previous, Some(current)));
-            }
+            names.push((current.clone(),None));
+            if let Some(previous)=previous { names.push((previous,Some(current))); }
         } else {
             for raw in sites {
-                let name = site(raw)?;
-                if !names.iter().any(|(n, _)| *n == name) {
-                    names.push((name, None));
+                let name=site(raw)?;
+                if name!=current && previous.as_deref()!=Some(name.as_str()) {
+                    return Err(invalid("sign_in.sites must match the focused sign-in page or the site it redirected from. Visit each needed site and inspect its existing session first.").with("execution_not_started",true));
                 }
+                if !names.iter().any(|(n,_)|*n==name) { names.push((name,None)); }
             }
         }
         let receiver = Receiver::load(&self.journal)?;
@@ -744,11 +694,7 @@ impl Controller {
             .iter()
             .find_map(|w| codes.iter().find(|(_, c, _)| c == w));
         if let Some((name, code, att)) = waiting {
-            let attention = if code == "waiting_for_person" {
-                att.clone()
-            } else {
-                None
-            };
+            let attention=att.clone();
             let result = SignInResult {
                 sign_in: SignIn {
                     sites: codes

@@ -765,3 +765,15 @@ GNOME idle inhibition uses SessionManager flag8 on a private connection, bound t
 the same UID and installed root-owned gnome-session-service. Lease inhibition is
 released explicitly; runtime keep-awake lasts until daemon disconnect. Neither
 path alters persistent idle preferences or inhibits explicit logout/suspend.
+
+## Journal capacity and pressure recovery
+
+Fresh policies allow 1 GiB of combined metadata and automatic growth up to 4 GiB. `max_metadata_bytes` is the initial allowance; an explicitly configured value remains a hard cap unless `metadata_growth_max_bytes` is also configured. The ceiling must be at least the initial allowance. `min_free_bytes` (default 5 GiB) is checked on the metadata filesystem; growth leaves that reserve plus admission headroom. Capacity grows in bounded steps, is persisted in journal `meta`, and is clamped to the current policy on restart. It never edits the policy file.
+
+At 80% usage, admission checkpoints both `journal.sqlite` and `storage.sqlite`, including their WALs, compacts free pages when enough temporary disk is available, then grows if retained records still need space. A busy reader leaves its WAL counted; maintenance does not wait indefinitely or erase it. Below the disk reserve, checkpointing is attempted before refusing ordinary new effects. Full VACUUM needs up to twice the database size in spare disk in addition to the reserve. Finish retains its separate emergency headroom and old requests are reconciled/replayed before new-effect admission.
+
+Age-based retention remains 30 days. Young evidence, uncertain receipts/jobs, active leases and open attention items keep their task evidence. Eligible old settled tasks lose large observations/checks/checkpoints, settled operation/job records, timeline events and ended leases. Task identities, artifact/delivery references and unresolved work remain available. Pressure does not shorten retention or reinterpret unknown effects.
+
+`computer_status` summaries and computer-reference details, operator status, and administrator `status`/`doctor` expose `metadata_capacity`: usage, allowance, growth ceiling, WAL allocation, admission headroom, disk reserve/free bytes and healthy/pressure/blocked state. Recoverable pressure remains routable for automatic fleet acquisition; persistent blockage is degraded with a plain warning. Status reads do not run maintenance.
+
+Repeat the daemon/MCP E2E with `IBARA_E2E_ARTIFACTS=/absolute/evidence cargo test --test server_entries journal_capacity -- --test-threads=1`. Its JSON artifacts record actual process results, growth/restart, replay launch count, storage WAL/busy-reader recovery, compaction, limits and retention. Desktop adapters are fixtures; real native input is a separate installed-candidate check.

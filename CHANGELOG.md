@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2-1 — prepared for release
+
+- Check existing browser sessions before requesting login assistance. Declaring sites at task start no longer asks a person or copies cookies; assistance requires an observed authentication control.
+- Recover journal capacity through safe maintenance and bounded disk-aware growth, with capacity health in status and doctor.
+- Expose recorder health, freshness and bounded error categories. Reduce idle login polling and summarize successful background reads without losing their counts. Upload stays opt-in.
+- Preserve the current console-background fix, complete MCP schemas and unsupported NVIDIA preview diagnostics. The Omarchy-native driver experiment is excluded; production input remains Cua.
+
+
 ## Documentation updated on 23 October 2026
 
 - Rewrite the README in plain English, with requirements, installation, agent connection and a first task in order.

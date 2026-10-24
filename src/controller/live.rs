@@ -58,6 +58,8 @@ impl ControllerOptions {
         let limit = |key: &str| cfg.policy.get(key).and_then(Value::as_u64);
         options.journal = JournalOptions {
             max_metadata_bytes: limit("max_metadata_bytes"),
+            metadata_growth_max_bytes: limit("metadata_growth_max_bytes"),
+            metadata_min_free_bytes: Some(limit("min_free_bytes").unwrap_or(5 * 1024 * 1024 * 1024)),
             metadata_headroom_bytes: limit("metadata_headroom_bytes"),
             metadata_retention_ms: limit("metadata_retention_ms").map(|v| v as i64),
             ..Default::default()

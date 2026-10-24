@@ -789,7 +789,14 @@ fn logins_are_shared_as_the_person_decides_and_never_seen() {
     let began = codex.begin("b1", &["tax.test", "idp.test", "bank.test", "mail.test"]);
     let task = began["result"]["task_ref"].as_str().unwrap().to_string();
     assert!(began["result"]["logins"].as_array().unwrap().iter().all(|l|l["attention"].is_null()),"{began}");
-    let initial_tax=codex.sign_in(&task,"initial-tax", &["tax.test"]);
+    // Idle source polling is demand-driven: a heartbeat may need its next
+    // poll before delivery. Reconcile the same request, without another ask.
+    let initial_tax=wait_for("the sharing computer delivers the allowed login",30,|| {
+        let reply=codex.sign_in(&task,"initial-tax", &["tax.test"]);
+        let state=states(&reply)["tax.test"].clone();
+        assert!(matches!(state.as_str(),"shared"|"waiting_for_sharing_computer"),"{reply}");
+        (state=="shared").then_some(reply)
+    });
     assert_eq!(states(&initial_tax)["tax.test"],"shared","{initial_tax}");
     agents_computer.lock().url="https://idp.test/login".into();
     agents_computer.lock().previous=Some("https://mail.test/".into());

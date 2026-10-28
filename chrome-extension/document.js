@@ -333,10 +333,6 @@ export async function documentOperation(message) {
       if(w&&e.isTrusted)post({submit:{watch:w.id,hit:!!e.submitter&&reaches(w.el,e.submitter)}});
     },true);
     addEventListener('beforeunload',()=>{const w=state.watch;if(w)post({leaving:{watch:w.id}});},true);
-    // The last trusted key the page received, so a key press Cua could not
-    // confirm can be confirmed here. Kept in this isolated world only and
-    // answered as yes or no.
-    addEventListener('keydown',e=>{const w=state.keyWatch;if(e.isTrusted&&w&&w.seen===null)w.seen=e.key===w.key&&e.ctrlKey===w.ctrl&&e.altKey===w.alt&&e.metaKey===w.meta&&e.shiftKey===w.shift;},true);
     state.listening=true;
   }
   const meaningOf=packed=>JSON.stringify({...packed,states:[]});
@@ -415,11 +411,6 @@ export async function documentOperation(message) {
     // frame is not seen: the focus is then the frame itself.
     const el=document.hasFocus()?active():null;
     return {page:!!el,submits:!!el&&(submitter(el)||(args.key==='enter'&&enterSubmits(el)))};
-  }
-  if(message.op==='keyseen') {
-    if(args.arm){state.keyWatch={...args,seen:null};return {armed:document.hasFocus()};}
-    const w=state.keyWatch;state.keyWatch=null;
-    return {seen:document.hasFocus()&&w?.watch===args.watch&&w.seen===true};
   }
   if(message.op==='check') {
     // innerText excludes hidden rendered text and does not expose password values.

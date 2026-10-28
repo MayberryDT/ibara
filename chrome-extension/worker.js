@@ -5,7 +5,7 @@
 // request adds `receive` (agent computers) or `share` (the sharing computer).
 import { documentOperation } from './document.js';
 const HOST='io.ibara.chrome';
-const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys','keyseen'];
+const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys'];
 // Operations that change the page (a refusal after they start is not "not started").
 const EFFECTS=['navigate','reveal','cookies_write','cookies_remove','login_reload'];
 // What each job lets ibara ask for. Anything else is refused unstarted.
@@ -368,9 +368,8 @@ async function handle(m,jobs) {
     const inventory=await chrome.webNavigation.getAllFrames({tabId:tab.id});
     const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
     if(!rootId)return refused();
-    if(m.op==='keyseen'&&!m.args.arm&&m.args.documentId!==rootId)return refused();
     if(m.op==='observe')return await observeFrames(m,tab,rootId);
-    if(['check','keys','keyseen'].includes(m.op)){
+    if(['check','keys'].includes(m.op)){
       const epoch=frameEpoch.get(tab.id)||0;
       if(pendingFrames.has(tab.id))return {result:{refused:true}};
       const replies=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[m]});
@@ -380,7 +379,6 @@ async function handle(m,jobs) {
         if(path&&(await mapPoint(tab.id,path,null)).ready)results.push(reply);
       }
       if(pendingFrames.has(tab.id)||(frameEpoch.get(tab.id)||0)!==epoch)return {result:{refused:true}};
-      if(m.op==='keyseen')return {result:{documentId:rootId,armed:results.some(r=>r.result?.armed===true),seen:results.some(r=>r.result?.seen===true)}};
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }
     const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);

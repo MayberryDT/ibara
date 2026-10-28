@@ -2509,42 +2509,7 @@ impl Controller {
     async fn send_input(&self, effect: &Effect, cancel: &Cancel) -> Result<Done> {
         crate::desktop::cua::unless_cancelled(Some(cancel)).map_err(|e| e.with("no_input_held", true))?;
         self.turns.borrow_mut().before_action()?;
-        let witness = self.arm_key(effect).await;
-        let sent = self.desktop.act(effect, cancel).await;
-        self.confirm_key(effect, witness, sent).await
-    }
-
-    /// Arm the original focused document before dispatch. A navigation, focus
-    /// change or a different first trusted key leaves the result unknown.
-    async fn arm_key(&self, effect: &Effect) -> Option<Value> {
-        let Effect::Key { surface, combo } = effect else { return None };
-        if !is_browser(&surface.class) || !self.desktop.browser_connected() { return None; }
-        let keys = crate::desktop::input::cua_keys(combo).ok()?;
-        let (key, mods) = keys.split_last()?;
-        let tab = self.desktop.tabs().await.ok()?.into_iter().find(|t| t.focused)?;
-        let dom = match key.as_str() {
-            "Return" => "Enter", "space" => " ", "BackSpace" => "Backspace", "Page_Up" => "PageUp", "Page_Down" => "PageDown",
-            "Up" => "ArrowUp", "Down" => "ArrowDown", "Left" => "ArrowLeft", "Right" => "ArrowRight", other => other,
-        };
-        let held = |m: &str| mods.iter().any(|k| k == m);
-        let mut target = json!({"tabId":tab.id,"watch":uuid::Uuid::new_v4().to_string(),"arm":true,
-            "key":dom,"ctrl":held("ctrl"),"alt":held("alt"),"meta":held("super"),"shift":held("shift")});
-        let answer = self.desktop.browser_call("keyseen", target.clone(), false).await.ok()?;
-        if answer.get("armed").and_then(Value::as_bool) != Some(true) { return None; }
-        target["documentId"] = answer.get("documentId")?.clone();
-        target["arm"] = json!(false);
-        Some(target)
-    }
-
-    async fn confirm_key(&self, effect: &Effect, witness: Option<Value>, sent: Result<Done>) -> Result<Done> {
-        if let (Err(e), Effect::Key { .. }, Some(target)) = (&sent, effect, witness)
-            && e.code == "OUTCOME_UNKNOWN" && e.message == "Cua press_key failed after dispatch."
-            && self.desktop.browser_call("keyseen", target, false).await
-                .is_ok_and(|a| a.get("seen").and_then(Value::as_bool) == Some(true))
-        {
-            return Ok(Done { note: Some("Cua could not confirm the key; the original page received it".into()), ..Done::default() });
-        }
-        sent
+        self.desktop.act(effect, cancel).await
     }
 
     /// Select the focused field's text and type `text` over it, piece by
@@ -2638,9 +2603,7 @@ impl Controller {
                 let (cancel, _) = self.abort_handles();
                 self.mark_effect(Some(ctx.task_ref));
                 self.turns.borrow_mut().before_action()?;
-                let witness = self.arm_key(effect).await;
                 let done = self.desktop.act(effect, &cancel).await;
-                let done = self.confirm_key(effect, witness, done).await;
                 self.mark_effect(None);
                 let done = match effect.as_ref() {
                     Effect::Type { text, .. } => done.map_err(|e| typing_stopped(e, 0, text.chars().count(), TypedInto::Window)),

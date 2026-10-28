@@ -5,7 +5,7 @@
 - Keep browser targets usable across equivalent redraws and recent observations of the same page. Refusals explain what changed; uncertain clicks name the element they reached.
 - Recognize editable comboboxes, named options and clickable images. Preserve native select behavior and give clearer hints for unsupported actions.
 - Accept unmodified punctuation keys and pixel-sized scroll amounts. Explain frame and scaled-picture coordinate mistakes before input.
-- Confirm an uncertain browser key only from a pre-dispatch witness in its original document, matching all modifiers. Leave other uncertain effects unresolved.
+- Preserve uncertain key-dispatch receipts when the input backend cannot confirm delivery; a matching page event is not dispatch proof.
 - Recognize email-first sign-in dialogs outside login paths, while excluding newsletter and search dialogs.
 - Observe fullscreen exit during browser cleanup, with an Escape fallback. The browser still retires through the existing blank-page procedure.
 - Remind agents to provide checks that ibara can evaluate when beginning a task.

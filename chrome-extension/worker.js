@@ -234,7 +234,7 @@ async function observeFrames(m,tab,rootId) {
     captures.set(capture,snapshot);while(captures.size>8)captures.delete(captures.keys().next().value);
   }
   const offset=m.args.offset||0,nodes=snapshot.nodes.slice(offset,offset+m.args.limit),next=offset+nodes.length<snapshot.nodes.length?offset+nodes.length:null;
-  return {result:{...snapshot,routes:undefined,nodes,count:snapshot.nodes.length,documentId:rootId,next_offset:next,truncated:snapshot.truncated||next!==null}};
+  return {result:{...snapshot,routes:undefined,nodes,count:snapshot.nodes.length,documentId:rootId,revalidates_refs:true,next_offset:next,truncated:snapshot.truncated||next!==null}};
 }
 async function focusedTab(tabId) {
   const tab=await chrome.tabs.get(tabId);

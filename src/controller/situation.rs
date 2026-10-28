@@ -178,6 +178,8 @@ pub(crate) struct BrowserNode {
     pub page: String,
     pub tab_id: i64,
     pub document_id: String,
+    /// Only readers that revalidate retained captures may reuse older refs.
+    pub revalidates_refs: bool,
     pub capture: String,
     pub token: Value,
 }
@@ -282,9 +284,10 @@ impl Frames {
     /// A page element of one of the task's latest page observations, of
     /// the page the latest frame shows when it shows one.
     pub fn recent_browser(&self, frame: &FrameState, id: &str) -> Option<BrowserNode> {
-        let page = frame.browser.first().map(|n| (n.tab_id, n.document_id.as_str()));
+        let page = frame.browser.first()?;
+        if !page.revalidates_refs { return None; }
         self.recent_browser.get(&frame.task_ref)?.iter().rev()
-            .find(|n| n.id == id && page.is_none_or(|(tab, doc)| n.tab_id == tab && n.document_id == doc)).cloned()
+            .find(|n| n.id == id && n.revalidates_refs && n.tab_id == page.tab_id && n.document_id == page.document_id).cloned()
     }
     pub fn forget(&mut self, task_ref: &str) {
         self.map.remove(task_ref);
@@ -993,6 +996,7 @@ impl Controller {
                 page: clip(data.get("url").and_then(Value::as_str).unwrap_or(""), 4096),
                 tab_id: tab.id,
                 document_id: document_id.to_string(),
+                revalidates_refs: data.get("revalidates_refs").and_then(Value::as_bool) == Some(true),
                 capture: capture.to_string(),
                 token: node.get("token").cloned().unwrap_or(Value::Null),
             })

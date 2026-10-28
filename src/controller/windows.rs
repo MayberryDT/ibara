@@ -180,26 +180,39 @@ impl Controller {
         // native chord is delivered. Retire in an ordinary visible window and
         // independently observe that transition before using the address bar.
         if self.desktop.windows().await?.iter().any(|w| w.key()==*key && w.fullscreen) {
-            send(Effect::Key{surface:key.clone(),combo:"F11".into()}).await?;
-            let deadline=Instant::now()+CLOSE_WAIT;
-            let mut geometry = None;
-            let mut stable_since = Instant::now();
-            loop {
-                if !allowed()? || cancel.is_cancelled() {return Err(IbaraError::new("CONTROL_UNSETTLED","Reset authority changed.",false));}
-                let current = self.desktop.windows().await?.iter()
-                    .find(|w| w.key()==*key && w.focused && !w.fullscreen)
-                    .map(|w| w.rect);
-                // The flag changes before Chromium's surface resize finishes.
-                // Do not bind native typing to that transient geometry.
-                if current.is_none() || current != geometry {
-                    geometry = current;
-                    stable_since = Instant::now();
-                } else if stable_since.elapsed() >= Duration::from_millis(500) {
-                    break;
+            // Leaving full screen resizes the window under the key, so Cua
+            // may report the key unconfirmed; the transition is observed
+            // below either way. A page's own full screen (a game) that F11
+            // does not leave, Escape does.
+            let mut settled = false;
+            for combo in ["F11", "Escape"] {
+                if let Err(e) = send(Effect::Key{surface:key.clone(),combo:combo.into()}).await {
+                    if e.code != "OUTCOME_UNKNOWN" { return Err(e); }
+                    super::log_event("browser_retirement_key_unconfirmed", combo);
                 }
-                if Instant::now()>=deadline {return Err(IbaraError::new("CONTROL_UNSETTLED","Browser did not settle after leaving full-screen mode for cleanup.",false));}
-                sleep(POLL).await;
+                let deadline=Instant::now()+CLOSE_WAIT;
+                let mut geometry = None;
+                let mut stable_since = Instant::now();
+                loop {
+                    if !allowed()? || cancel.is_cancelled() {return Err(IbaraError::new("CONTROL_UNSETTLED","Reset authority changed.",false));}
+                    let current = self.desktop.windows().await?.iter()
+                        .find(|w| w.key()==*key && w.focused && !w.fullscreen)
+                        .map(|w| w.rect);
+                    // The flag changes before Chromium's surface resize finishes.
+                    // Do not bind native typing to that transient geometry.
+                    if current.is_none() || current != geometry {
+                        geometry = current;
+                        stable_since = Instant::now();
+                    } else if stable_since.elapsed() >= Duration::from_millis(500) {
+                        settled = true;
+                        break;
+                    }
+                    if Instant::now()>=deadline { break; }
+                    sleep(POLL).await;
+                }
+                if settled { break; }
             }
+            if !settled {return Err(IbaraError::new("CONTROL_UNSETTLED","Browser did not settle after leaving full-screen mode for cleanup.",false));}
         }
         let focus_deadline = Instant::now() + CLOSE_WAIT;
         let focused = loop {

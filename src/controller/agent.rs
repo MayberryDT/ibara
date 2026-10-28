@@ -1408,7 +1408,11 @@ impl Controller {
             Ok((frame, _)) => frame.frame.clone(),
             Err(e) => unreadable_frame(&e),
         };
-        let notes = frame.lines.iter().filter(|l| l.starts_with("note: ")).map(|l| l.trim_start_matches("note: ").to_string()).collect();
+        let mut notes: Vec<String> = frame.lines.iter().filter(|l| l.starts_with("note: ")).map(|l| l.trim_start_matches("note: ").to_string()).collect();
+        // Most tasks finish with nothing ibara can prove; say so while checks can still be chosen.
+        if !input.checks.iter().any(|c| c.check.is_some()) {
+            notes.push("No typed check: computer_finish can record only your own assessment. When the result shows on screen or in a file, begin with a typed check (url, text_present, element, file_exists or file_content) so ibara proves it.".into());
+        }
         let checks = input
             .checks
             .iter()
@@ -2008,7 +2012,12 @@ impl Controller {
                     let pictures = frame.map_or(&[][..], |f| f.pictures.as_slice());
                     let picture = match &p.frame {
                         Some(given) => pictures.iter().find(|pic| pic.frame_ref == given.as_str()).ok_or_else(|| {
+                            let next = match pictures.last() {
+                                Some(latest) => format!("Leave out target.frame to use this task's latest picture ({}, of {}), or take a new one with computer_observe view \"image\".", latest.frame_ref, latest.named),
+                                None => again.to_string(),
+                            };
                             refuse(format!("Nothing was sent: target.frame {given} is not a picture ibara still holds for this task (only the latest picture of each window is kept)."))
+                                .with("next", next)
                         })?,
                         None => pictures.last().ok_or_else(|| refuse("Nothing was sent: x and y are pixels of a picture, and this task has not taken one.".into()))?,
                     };
@@ -2025,8 +2034,18 @@ impl Controller {
                         }
                     }
                     if p.x < 0 || p.y < 0 || p.x as u32 >= picture.width || p.y as u32 >= picture.height {
-                        return Err(invalid(format!("target: {},{} is outside the picture from {} ({}x{} pixels)", p.x, p.y, picture.frame_ref, picture.width, picture.height))
-                            .with("execution_not_started", true));
+                        let mut e = invalid(format!("target: {},{} is outside the picture from {} ({}x{} pixels)", p.x, p.y, picture.frame_ref, picture.width, picture.height))
+                            .with("execution_not_started", true);
+                        // Inside what the picture shows at full size: a screen
+                        // point read without the picture's scaling.
+                        let (rw, rh) = (picture.region.width, picture.region.height);
+                        if p.x >= 0 && p.y >= 0 && (p.x as i64) < rw as i64 && (p.y as i64) < rh as i64 && rw > 0 && rh > 0 {
+                            let (sx, sy) = ((p.x as f64 * picture.width as f64 / rw as f64) as i64, (p.y as f64 * picture.height as f64 / rh as f64) as i64);
+                            e = e.with("next", format!(
+                                "x and y are pixels of the {}x{} picture, which shows {} scaled down from {rw}x{rh}. If {},{} was read at full size, the same spot in the picture is {{x: {sx}, y: {sy}, frame: \"{}\"}}.",
+                                picture.width, picture.height, picture.named, p.x, p.y, picture.frame_ref));
+                        }
+                        return Err(e);
                     }
                     let img = Image { region: picture.region, width: picture.width, height: picture.height, ..Default::default() };
                     let (x, y) = img.to_logical(p.x as f64, p.y as f64);
@@ -2125,7 +2144,8 @@ impl Controller {
                         Effect::ClickPoint { x, y, .. } => Some((x, y)),
                         _ => None,
                     };
-                    (Effect::Scroll { at, dx: s.dx, dy: s.dy }, format!("scroll {},{} at {d}", s.dx, s.dy), "scroll".to_string(), "scroll")
+                    let (dx, dy) = (notches(s.dx), notches(s.dy));
+                    (Effect::Scroll { at, dx, dy }, format!("scroll {dx},{dy} at {d}{}", read_as_pixels((s.dx, s.dy), (dx, dy))), "scroll".to_string(), "scroll")
                 }
                 Target::Element(_) => {
                     return Err(invalid("action.target: scroll needs a point {x, y}; elements have no position here"));
@@ -2147,11 +2167,12 @@ impl Controller {
         // arguments, the words for the agent and the words for a person.
         let node = |target: &str, wanted: &str| -> Result<(Value, String, String)> {
             let frame = frame.ok_or_else(|| fail("STALE_TARGET", "There is no current page observation; observe with surface \"tab\" and view \"elements\".", true))?;
-            let node = frame
-                .browser
-                .iter()
-                .find(|n| n.id == target)
-                .ok_or_else(|| fail("STALE_TARGET", format!("action.target: {} is not in the latest page observation", clip(target, 40)), true))?;
+            // An element of an earlier observation of the page (one with a
+            // query, a later page of results) still acts: the page reader
+            // checks it is still there and the same.
+            let node = frame.browser.iter().find(|n| n.id == target).cloned()
+                .or_else(|| self.frames.borrow().recent_browser(frame, target))
+                .ok_or_else(|| fail("STALE_TARGET", format!("action.target: {} is not in the page's latest observations; observe again", clip(target, 40)), true))?;
             if node.states.iter().any(|s| matches!(s.as_str(), "ambiguous" | "context_truncated")) {
                 return Err(fail("AMBIGUOUS_TARGET", format!("{target} is not distinguishable from another element; observe with a query."), true));
             }
@@ -2161,8 +2182,12 @@ impl Controller {
                         .with("next", "Wait for it to be enabled (wait_for), or choose another element."));
                 }
                 let takes = if node.actions.is_empty() { "nothing".to_string() } else { node.actions.join(", ") };
-                let hint = if node.actions.iter().any(|a| a == "type") {
+                let hint = if node.actions.iter().any(|a| a == "fill") {
                     format!(" To fill it in, send {{kind: \"type\", target: \"{target}\", text: …}}: that replaces its text, no click needed.")
+                } else if node.role == "slider" {
+                    " A slider moves with arrow keys once it has focus (Tab to it, then browser_act key); a click would set it to the value under the pointer.".to_string()
+                } else if node.actions.is_empty() {
+                    " The page shows no sign that it reacts to that (no control role, no hand pointer). If it does, click its point on a picture with computer_act.".to_string()
                 } else {
                     String::new()
                 };
@@ -2208,20 +2233,19 @@ impl Controller {
                 (Some(args), BrowserOp::Select(s.value.clone()), format!("choose \"{}\" in {what}", squash(&s.value, 40)), said, "browser_select")
             }
             BrowserAction::Scroll(s) => {
-                if !(-50..=50).contains(&s.dx) || !(-50..=50).contains(&s.dy) {
-                    return Err(invalid("Scroll dx/dy are wheel notches from -50 to 50, not pixels; for example dy: 3 scrolls down three notches.").with("field", "action.dx/dy").with("execution_not_started", true));
-                }
+                let (dx, dy) = (notches(s.dx), notches(s.dy));
                 let target = match &s.target {
                     Some(target) => {
                         let frame = frame.ok_or_else(|| fail("STALE_TARGET", "There is no current page observation.", true))?;
-                        let node = frame.browser.iter().find(|n| &n.id == target).ok_or_else(|| {
-                            fail("STALE_TARGET", format!("action.target: {} is not in the latest page observation", clip(target, 40)), true)
-                        })?;
+                        let node = frame.browser.iter().find(|n| &n.id == target).cloned()
+                            .or_else(|| self.frames.borrow().recent_browser(frame, target))
+                            .ok_or_else(|| fail("STALE_TARGET", format!("action.target: {} is not in the page's latest observations; observe again", clip(target, 40)), true))?;
                         Some(json!({ "tabId": node.tab_id, "documentId": node.document_id, "capture": node.capture, "token": node.token }))
                     }
                     None => None,
                 };
-                (target, BrowserOp::Scroll { dx: s.dx, dy: s.dy }, "scroll the page".into(), "scroll the page".into(), "browser_scroll")
+                let describe = format!("scroll the page{}", read_as_pixels((s.dx, s.dy), (dx, dy)));
+                (target, BrowserOp::Scroll { dx, dy }, describe, "scroll the page".into(), "browser_scroll")
             }
             BrowserAction::Key(k) => {
                 crate::desktop::input::cua_keys(&k.keys)?;
@@ -2399,10 +2423,16 @@ impl Controller {
                 let note = seen.get("navigated").and_then(Value::as_str).map(|url| {
                     let went = if seen.get("arrived").and_then(Value::as_bool) == Some(false) { "began loading" } else { "went to" };
                     format!("the click reached it; the page then {went} {}", page_address(url))
-                });
+                }).or_else(|| (seen.get("redrawn").and_then(Value::as_bool) == Some(true))
+                    .then(|| "the page drew the element again as the pointer arrived; the click reached the new copy".to_string()));
                 Ok((Done { note, ..done }, data, true))
             }
-            (Some(true), _) => Err(fail("OUTCOME_UNKNOWN", "The click reached a different element than the one chosen; observe the page.", false)),
+            (Some(true), _) => {
+                let instead = seen.get("reached").and_then(Value::as_str).filter(|r| !r.is_empty())
+                    .map(|r| format!("The click reached {} instead of the element chosen; observe the page.", clip(r, 80)))
+                    .unwrap_or_else(|| "The click reached a different element than the one chosen; observe the page.".to_string());
+                Err(fail("OUTCOME_UNKNOWN", instead, false))
+            }
             _ if seen.get("gone").and_then(Value::as_bool) == Some(true) => {
                 Err(fail("OUTCOME_UNKNOWN", "The page went away before it reported where the click landed; observe the page.", false))
             }
@@ -2479,7 +2509,42 @@ impl Controller {
     async fn send_input(&self, effect: &Effect, cancel: &Cancel) -> Result<Done> {
         crate::desktop::cua::unless_cancelled(Some(cancel)).map_err(|e| e.with("no_input_held", true))?;
         self.turns.borrow_mut().before_action()?;
-        self.desktop.act(effect, cancel).await
+        let witness = self.arm_key(effect).await;
+        let sent = self.desktop.act(effect, cancel).await;
+        self.confirm_key(effect, witness, sent).await
+    }
+
+    /// Arm the original focused document before dispatch. A navigation, focus
+    /// change or a different first trusted key leaves the result unknown.
+    async fn arm_key(&self, effect: &Effect) -> Option<Value> {
+        let Effect::Key { surface, combo } = effect else { return None };
+        if !is_browser(&surface.class) || !self.desktop.browser_connected() { return None; }
+        let keys = crate::desktop::input::cua_keys(combo).ok()?;
+        let (key, mods) = keys.split_last()?;
+        let tab = self.desktop.tabs().await.ok()?.into_iter().find(|t| t.focused)?;
+        let dom = match key.as_str() {
+            "Return" => "Enter", "space" => " ", "BackSpace" => "Backspace", "Page_Up" => "PageUp", "Page_Down" => "PageDown",
+            "Up" => "ArrowUp", "Down" => "ArrowDown", "Left" => "ArrowLeft", "Right" => "ArrowRight", other => other,
+        };
+        let held = |m: &str| mods.iter().any(|k| k == m);
+        let mut target = json!({"tabId":tab.id,"watch":uuid::Uuid::new_v4().to_string(),"arm":true,
+            "key":dom,"ctrl":held("ctrl"),"alt":held("alt"),"meta":held("super"),"shift":held("shift")});
+        let answer = self.desktop.browser_call("keyseen", target.clone(), false).await.ok()?;
+        if answer.get("armed").and_then(Value::as_bool) != Some(true) { return None; }
+        target["documentId"] = answer.get("documentId")?.clone();
+        target["arm"] = json!(false);
+        Some(target)
+    }
+
+    async fn confirm_key(&self, effect: &Effect, witness: Option<Value>, sent: Result<Done>) -> Result<Done> {
+        if let (Err(e), Effect::Key { .. }, Some(target)) = (&sent, effect, witness)
+            && e.code == "OUTCOME_UNKNOWN" && e.message == "Cua press_key failed after dispatch."
+            && self.desktop.browser_call("keyseen", target, false).await
+                .is_ok_and(|a| a.get("seen").and_then(Value::as_bool) == Some(true))
+        {
+            return Ok(Done { note: Some("Cua could not confirm the key; the original page received it".into()), ..Done::default() });
+        }
+        sent
     }
 
     /// Select the focused field's text and type `text` over it, piece by
@@ -2573,7 +2638,9 @@ impl Controller {
                 let (cancel, _) = self.abort_handles();
                 self.mark_effect(Some(ctx.task_ref));
                 self.turns.borrow_mut().before_action()?;
+                let witness = self.arm_key(effect).await;
                 let done = self.desktop.act(effect, &cancel).await;
+                let done = self.confirm_key(effect, witness, done).await;
                 self.mark_effect(None);
                 let done = match effect.as_ref() {
                     Effect::Type { text, .. } => done.map_err(|e| typing_stopped(e, 0, text.chars().count(), TypedInto::Window)),
@@ -3843,10 +3910,30 @@ fn page_refusal(data: &Value) -> Result<()> {
             .with("execution_not_started", true));
     }
     if data.get("refused").and_then(Value::as_bool) == Some(true) {
-        return Err(fail("STALE_TARGET", "The page changed since it was observed, or the tab is not focused; observe again.", true)
-            .with("execution_not_started", true));
+        let (code, message) = match data.get("why").and_then(Value::as_str).unwrap_or("") {
+            "hidden" => ("STALE_TARGET", "The tab is hidden behind another tab or window; focus the browser window with computer_act, then observe surface \"tab\"."),
+            "late" => ("STALE_TARGET", "The page did not answer in time; observe again."),
+            "expired" => ("STALE_TARGET", "That page observation is no longer held (the page keeps its four latest); observe surface \"tab\" again."),
+            "navigated" => ("STALE_TARGET", "The page went to another address since it was observed; observe again."),
+            "changed" => ("STALE_TARGET", "That element changed since it was observed (its name, state, place or visibility); observe again."),
+            "gone" => ("STALE_TARGET", "That element is no longer on the page; observe again."),
+            "ambiguous" => ("AMBIGUOUS_TARGET", "The page drew that element again and now more than one element matches it; observe again."),
+            _ => ("STALE_TARGET", "The page changed since it was observed, or the tab is not focused; observe again."),
+        };
+        return Err(fail(code, message, true).with("execution_not_started", true));
     }
     Ok(())
+}
+
+/// Wheel notches from a scroll amount. Up to 50 is notches; more is read as
+/// pixels, which agents often send, at 100 to a notch and at most 50.
+fn notches(v: i32) -> i32 {
+    if (-50..=50).contains(&v) { v } else { (v as f64 / 100.0).round().clamp(-50.0, 50.0) as i32 }
+}
+
+/// Words for a scroll whose amounts were read as pixels, or nothing.
+fn read_as_pixels(given: (i32, i32), sent: (i32, i32)) -> String {
+    if given == sent { String::new() } else { format!(" ({},{} read as pixels: {},{} notches)", given.0, given.1, sent.0, sent.1) }
 }
 
 /// The tallest band the browser's own bars above the page can make, in

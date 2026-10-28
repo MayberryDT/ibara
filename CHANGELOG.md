@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 — 28 October 2026
+
+- Keep browser targets usable across equivalent redraws and recent observations of the same page. Refusals explain what changed; uncertain clicks name the element they reached.
+- Recognize editable comboboxes, named options and clickable images. Preserve native select behavior and give clearer hints for unsupported actions.
+- Accept unmodified punctuation keys and pixel-sized scroll amounts. Explain frame and scaled-picture coordinate mistakes before input.
+- Confirm an uncertain browser key only from a pre-dispatch witness in its original document, matching all modifiers. Leave other uncertain effects unresolved.
+- Recognize email-first sign-in dialogs outside login paths, while excluding newsletter and search dialogs.
+- Observe fullscreen exit during browser cleanup, with an Escape fallback. The browser still retires through the existing blank-page procedure.
+- Remind agents to provide checks that ibara can evaluate when beginning a task.
+
+
 ## 0.3.2 — 24 October 2026
 
 - Check existing browser sessions before requesting login assistance. Declaring sites at task start no longer asks a person or copies cookies; assistance requires an observed authentication control.

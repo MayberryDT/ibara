@@ -720,7 +720,9 @@ impl Cua {
         if tool != "click" || editable_role(role) || matches!(role, "table cell" | "spin button" | "slider" | "combo box" | "search box" | "textbox" | "menu") {
             return pointer(None);
         }
-        let token = element["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
+        // Cua gave this element no accessibility handle: the guarded pointer
+        // at its freshly resolved centre clicks it instead.
+        let Some(token) = element["element_token"].as_str() else { return pointer(None) };
         if let Some((x, y)) = center {
             self.lead(x, y, screens).await;
         }
@@ -831,6 +833,19 @@ impl Cua {
     /// A chord such as `ctrl+s`, already validated by [`super::input::cua_keys`].
     pub async fn key(&self, pid: i64, window: u64, keys: &[String]) -> Result<()> {
         let mut args = Self::target(pid, window);
+        // Cua's Hyprland input maps punctuation only for typed text, so a
+        // punctuation key without modifiers goes as that one character:
+        // the same key press. With ctrl, alt or super it cannot go at all.
+        if let [mods @ .., last] = keys
+            && last.len() == 1 && last.bytes().all(|c| c.is_ascii_punctuation())
+        {
+            if !mods.is_empty() {
+                return Err(invalid(format!("Cua cannot send {} with a punctuation key on this desktop; use the app's menu or button for it, or a letter shortcut.", mods.join("+")))
+                    .with("field", "keys").with("execution_not_started", true));
+            }
+            args["text"] = json!(last);
+            return self.call("type_text", args, true, ACT_TIMEOUT).await.map(|_| ());
+        }
         let tool = if let [only] = keys {
             args["key"] = json!(only);
             "press_key"
@@ -1381,7 +1396,7 @@ fn menu_move(snapshot: &Value, identity: &Value, role: &str, name: &str) -> Resu
             return Ok(MenuMove::Keys("Escape", 1));
         }
         let top = chain.first().ok_or_else(|| stale("The element is not in a menu."))?;
-        let token = top["element_token"].as_str().ok_or_else(|| stale("Element has no token."))?;
+        let token = top["element_token"].as_str().ok_or_else(|| stale("That menu has no accessibility handle in this app; click it at a point from computer_observe with view \"image\"."))?;
         return Ok(MenuMove::Open(token.to_string()));
     };
     // Highlight the next step: the submenu on the way, or the item itself.

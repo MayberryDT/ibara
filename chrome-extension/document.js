@@ -122,10 +122,14 @@ export async function documentOperation(message) {
                 return normalize(input.alt);
             return normalize(el.getAttribute('title'));
         }
-        if (['FORM', 'SECTION', 'TEXTAREA', 'SELECT', 'UL', 'OL', 'LI', 'TABLE', 'TBODY', 'THEAD', 'TFOOT'].includes(el.tagName))
-            return normalize(el.getAttribute('title'));
         const ariaRole = normalize(el.getAttribute('role')).split(' ')[0];
         const contentNames = ['button', 'cell', 'checkbox', 'columnheader', 'gridcell', 'heading', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'row', 'rowheader', 'switch', 'tab', 'tooltip', 'treeitem'];
+        // A list item made an option, a menu item or a tab (a custom
+        // dropdown's <li role="option">) is named by its text like any of them.
+        if (el.tagName === 'LI' && contentNames.includes(ariaRole))
+            return content(el) || normalize(el.getAttribute('title'));
+        if (['FORM', 'SECTION', 'TEXTAREA', 'SELECT', 'UL', 'OL', 'LI', 'TABLE', 'TBODY', 'THEAD', 'TFOOT'].includes(el.tagName))
+            return normalize(el.getAttribute('title'));
         if ((ariaRole && !contentNames.includes(ariaRole)) || ['DIALOG', 'NAV', 'MAIN', 'ASIDE'].includes(el.tagName))
             return normalize(el.getAttribute('title'));
         return content(el) || normalize(el.getAttribute('title'));
@@ -254,11 +258,19 @@ export async function documentOperation(message) {
             states.push('enter_submits');
         const actions = [];
         if (!disabled) {
-            if (['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'textbox', 'searchbox', 'spinbutton'].includes(r))
+            // An ARIA combobox is usually a text field with a list it opens;
+            // only a native <select> takes select (the reader refuses it for
+            // anything else).
+            const editable = (el instanceof HTMLInputElement && TYPING.includes(el.type)) || el instanceof HTMLTextAreaElement || el.isContentEditable;
+            if (['button', 'link', 'checkbox', 'radio', 'switch', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem', 'tab', 'textbox', 'searchbox', 'spinbutton'].includes(r) ||
+                (r === 'combobox' && !(el instanceof HTMLSelectElement)))
                 actions.push('click');
-            if (['textbox', 'searchbox', 'spinbutton'].includes(r) && !el.readOnly)
+            // A picture the page made clickable shows the hand pointer.
+            if (r === 'img' && getComputedStyle(el).cursor === 'pointer')
+                actions.push('click');
+            if ((['textbox', 'searchbox', 'spinbutton'].includes(r) || (r === 'combobox' && editable)) && !el.readOnly)
                 actions.push('fill', 'press');
-            if (['combobox', 'listbox'].includes(r))
+            if (el instanceof HTMLSelectElement)
                 actions.push('select');
             if (el instanceof HTMLSelectElement || (['date_input', 'datetime-local_input', 'month_input', 'time_input', 'week_input'].includes(r) && !el.readOnly))
                 actions.push('click');
@@ -279,14 +291,19 @@ export async function documentOperation(message) {
   // The worker already requires the tab to be active in the focused window.
   // Keyboard focus may sit in the address bar; a click gives the page focus.
   const safe=()=>Date.now()<message.deadline&&document.visibilityState==='visible';
-  const refuse=()=>({refused:true});
-  if(!safe())return refuse();
+  // Why a request found nothing, for the agent: the tab is hidden, the page
+  // answered too late, went to another address or no longer holds the
+  // observation, or the element is gone, changed or no longer unique.
+  let missing='';
+  const unsafe=()=>document.visibilityState==='visible'?'late':'hidden';
+  const refuse=(why=missing)=>({refused:true,...(why?{why}:{})});
+  if(!safe())return refuse(unsafe());
   const args=message.args;
   const normalize=s=>(s||'').replace(/\s+/g,' ').trim();
   // This global belongs only to the extension's isolated world, not page
   // scripts. An updated extension can meet the state and press listener its
   // previous copy left in an open page, so the key changes whenever they do.
-  const key='__ibaraPageReaderV6';
+  const key='__ibaraPageReaderV7';
   const state=globalThis[key] ||= {captures:new Map(),identities:new WeakMap(),watch:null,listening:false,selecting:null,located:null,port:null};
   if(!state.listening){
     // Which element the next trusted press reached, whether it submitted a
@@ -299,16 +316,39 @@ export async function documentOperation(message) {
     addEventListener('pointerdown',e=>{
       const w=state.watch;
       if(!w||w.result||!e.isTrusted)return;
-      w.result={hit:reaches(w.el,e.composedPath()[0])};
-      post({press:{watch:w.id,hit:w.result.hit}});
+      const target=e.composedPath()[0];
+      let hit=reaches(w.el,target),redrawn=false;
+      // A framework that draws the element again in the time the pointer
+      // takes to arrive replaces its node; the one element with exactly its
+      // meaning is the same control.
+      if(!hit&&!w.el.isConnected&&w.meaning){
+        const found=sameMeaning(w.meaning);
+        if(found.length===1&&reaches(found[0],target)){hit=true;redrawn=true;w.el=found[0];}
+      }
+      w.result={hit,redrawn,...(hit?{}:{reached:reached(target)})};
+      post({press:{watch:w.id,...w.result}});
     },true);
     addEventListener('submit',e=>{
       const w=state.watch;
       if(w&&e.isTrusted)post({submit:{watch:w.id,hit:!!e.submitter&&reaches(w.el,e.submitter)}});
     },true);
     addEventListener('beforeunload',()=>{const w=state.watch;if(w)post({leaving:{watch:w.id}});},true);
+    // The last trusted key the page received, so a key press Cua could not
+    // confirm can be confirmed here. Kept in this isolated world only and
+    // answered as yes or no.
+    addEventListener('keydown',e=>{const w=state.keyWatch;if(e.isTrusted&&w&&w.seen===null)w.seen=e.key===w.key&&e.ctrlKey===w.ctrl&&e.altKey===w.alt&&e.metaKey===w.meta&&e.shiftKey===w.shift;},true);
     state.listening=true;
   }
+  const meaningOf=packed=>JSON.stringify({...packed,states:[]});
+  const sameMeaning=meaning=>{const found=[];collect('',(el,node)=>{if(meaningOf(pack(el,node))===meaning)found.push(el);});return found;};
+  // What a press reached instead, in a few words: its role or tag and name.
+  const reached=hit=>{
+    const el=hit?.closest?.('a[href],button,input,select,textarea,summary,[role]')||hit;
+    if(!el?.tagName)return '';
+    const r=normalize(el.getAttribute('role'))||el.tagName.toLowerCase();
+    const n=normalize(el.getAttribute('aria-label')||el.innerText||el.getAttribute('alt')||el.getAttribute('title')).slice(0,60);
+    return n?`${r} "${n}"`:r;
+  };
   const pack=(el,node)=>{
     const ancestor=[...node.ancestors.map(a=>`${a.role}:${a.text||a.name}`),...(node.context?[`card:${node.context}`]:[])].join(' > ');
     return {role:node.role,name:node.name.slice(0,1000),ancestor:ancestor.slice(0,500),contextGuard:node.contextGuard,
@@ -316,16 +356,26 @@ export async function documentOperation(message) {
       actions:node.actions,href:el instanceof HTMLAnchorElement?el.href:''};
   };
   // The element a capture/token names, only while the page still shows it
-  // the same way (same URL, same element, same role, name and context). No age
-  // limit: a step held for a person's approval may run minutes later.
+  // the same way (same URL, same role, name, context and actions). A page
+  // that draws the element again replaces its node: the one element on the
+  // page with exactly the same meaning is then the same element; two are
+  // ambiguous. No age limit: a step held for a person's approval may run
+  // minutes later.
   const find=()=>{
     const capture=state.captures.get(args.capture);
     const old=capture?.targets.get(args.token);
-    if(!old||capture.url!==location.href||!old.el.isConnected)return null;
-    let current;
-    collect('',(el,node)=>{if(el===old.el)current=pack(el,node);});
-    const same=current&&JSON.stringify({...current,states:[]})===JSON.stringify({...old.packed,states:[]});
-    return same?old.el:null;
+    if(!old){missing='expired';return null;}
+    if(capture.url!==location.href){missing='navigated';return null;}
+    const meaning=meaningOf(old.packed);
+    if(old.el.isConnected){
+      let current;
+      collect('',(el,node)=>{if(el===old.el)current=pack(el,node);});
+      if(current&&meaningOf(current)===meaning)return old.el;
+      missing='changed';return null;
+    }
+    const found=sameMeaning(meaning);
+    if(found.length===1){old.el=found[0];return found[0];}
+    missing=found.length?'ambiguous':'gone';return null;
   };
   const inView=el=>{const r=el.getBoundingClientRect();return r.top>=0&&r.left>=0&&r.bottom<=innerHeight&&r.right<=innerWidth;};
   // Whether a press on `hit` acts on el: el itself or something inside it,
@@ -366,6 +416,11 @@ export async function documentOperation(message) {
     const el=document.hasFocus()?active():null;
     return {page:!!el,submits:!!el&&(submitter(el)||(args.key==='enter'&&enterSubmits(el)))};
   }
+  if(message.op==='keyseen') {
+    if(args.arm){state.keyWatch={...args,seen:null};return {armed:document.hasFocus()};}
+    const w=state.keyWatch;state.keyWatch=null;
+    return {seen:document.hasFocus()&&w?.watch===args.watch&&w.seen===true};
+  }
   if(message.op==='check') {
     // innerText excludes hidden rendered text and does not expose password values.
     const text=(document.body?.innerText||'').slice(0,200000);
@@ -373,7 +428,7 @@ export async function documentOperation(message) {
   }
   if(message.op==='verify') {
     const w=state.watch;state.watch=null;
-    return {observed:!!w?.result,hit:w?.result?w.result.hit:null};
+    return {observed:!!w?.result,hit:w?.result?w.result.hit:null,...(w?.result?.redrawn?{redrawn:true}:{}),...(w?.result?.reached?{reached:w.result.reached}:{})};
   }
   if(message.op==='selected') {
     const selection=state.selecting;
@@ -402,7 +457,7 @@ export async function documentOperation(message) {
     return {focused,matches:value===args.expected||lines(value)===lines(args.expected)};
   }
   if(message.op==='locate'||message.op==='reveal') {
-    const el=find();
+    let el=find();
     if(!el)return refuse();
     const scrolled=!inView(el);
     if(scrolled)el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
@@ -437,13 +492,15 @@ export async function documentOperation(message) {
       const before=centre(el);
       point=reachable(el);
       await frame();
-      if(!safe()||!el.isConnected)return refuse();
+      if(!safe())return refuse(unsafe());
+      if(!el.isConnected){el=find();if(!el)return refuse();point=null;continue;}
       const after=centre(el);
       rest=Math.abs(after[0]-before[0])<=1&&Math.abs(after[1]-before[1])<=1&&(!point||reaches(el,hitAt(point.x,point.y)));
     }
     if(!rest)return {moving:true};
     if(!point)return {covered:true};
-    state.watch={el,id:message.watch,result:null};
+    const bound=state.captures.get(args.capture)?.targets.get(args.token);
+    state.watch={el,id:message.watch,result:null,meaning:bound?meaningOf(bound.packed):null};
     state.located={el,capture:args.capture,token:args.token};
     try{state.port?.disconnect();}catch{}
     state.port=chrome.runtime.connect({name:'press:'+message.watch});

@@ -248,6 +248,9 @@ pub(crate) struct Frames {
     map: HashMap<String, Rc<FrameState>>,
     browser_ids: HashMap<String, HashMap<(String, String), String>>,
     next_browser_id: u64,
+    /// Page elements of each task's latest page observations, as many as the
+    /// page reader still holds (its four latest captures).
+    recent_browser: HashMap<String, Vec<BrowserNode>>,
 }
 
 impl Frames {
@@ -260,17 +263,38 @@ impl Frames {
             if let Some(k) = oldest {
                 self.map.remove(&k);
                 self.browser_ids.remove(&k);
+                self.recent_browser.remove(&k);
             }
         }
+        if !frame.browser.is_empty() {
+            let recent = self.recent_browser.entry(frame.task_ref.clone()).or_default();
+            recent.retain(|n| !frame.browser.iter().any(|b| b.id == n.id));
+            recent.extend(frame.browser.iter().cloned());
+            let mut held: Vec<String> = Vec::new();
+            for n in recent.iter().rev() {
+                if !held.contains(&n.capture) { held.push(n.capture.clone()); }
+            }
+            held.truncate(4);
+            recent.retain(|n| held.contains(&n.capture));
+        }
         self.map.insert(frame.task_ref.clone(), frame);
+    }
+    /// A page element of one of the task's latest page observations, of
+    /// the page the latest frame shows when it shows one.
+    pub fn recent_browser(&self, frame: &FrameState, id: &str) -> Option<BrowserNode> {
+        let page = frame.browser.first().map(|n| (n.tab_id, n.document_id.as_str()));
+        self.recent_browser.get(&frame.task_ref)?.iter().rev()
+            .find(|n| n.id == id && page.is_none_or(|(tab, doc)| n.tab_id == tab && n.document_id == doc)).cloned()
     }
     pub fn forget(&mut self, task_ref: &str) {
         self.map.remove(task_ref);
         self.browser_ids.remove(task_ref);
+        self.recent_browser.remove(task_ref);
     }
     pub fn clear(&mut self) {
         self.map.clear();
         self.browser_ids.clear();
+        self.recent_browser.clear();
     }
     /// Stable for the same reader-bound element, never recycled for another
     /// element when a query, screenshot or page replaces the current frame.

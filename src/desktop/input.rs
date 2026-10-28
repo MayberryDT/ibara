@@ -78,6 +78,19 @@ pub fn cua_key(name: &str) -> Result<String> {
         "shift" => "shift",
         "alt" => "alt",
         "meta" | "super" | "win" | "logo" => "super",
+        // Cua takes any single printable ASCII character as a key.
+        "plus" => "+",
+        "minus" | "hyphen" | "dash" => "-",
+        "equal" | "equals" => "=",
+        "comma" => ",",
+        "period" | "dot" => ".",
+        "slash" => "/",
+        "backslash" => "\\",
+        "semicolon" => ";",
+        "apostrophe" | "quote" => "'",
+        "grave" | "backtick" => "`",
+        "bracketleft" => "[",
+        "bracketright" => "]",
         _ => "",
     };
     if !named.is_empty() {
@@ -88,11 +101,11 @@ pub fn cua_key(name: &str) -> Result<String> {
     {
         return Ok(format!("F{n}"));
     }
-    if key.len() == 1 && key.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+    if key.len() == 1 && key.bytes().all(|c| c.is_ascii_graphic()) {
         return Ok(key);
     }
     Err(invalid(format!(
-        "Unsupported key name: {name}. key sends one key or chord, such as Tab or ctrl+a. For text, use computer_act with action kind type and text. Keys include letters, digits, Return, Tab, Escape, BackSpace, Delete, arrows, Home, End, PageUp, PageDown, F1-F12 and modifiers."
+        "Unsupported key name: {name}. key sends one key or chord, such as Tab or ctrl+a. For text, use computer_act with action kind type and text. Keys include letters, digits, punctuation (= - + , . / or names such as plus and minus), Return, Tab, Escape, BackSpace, Delete, arrows, Home, End, PageUp, PageDown, F1-F12 and modifiers."
     ))
     .with("field", "keys"))
 }
@@ -100,7 +113,11 @@ pub fn cua_key(name: &str) -> Result<String> {
 /// A chord such as `"ctrl+s"` as Cua key names, modifiers first. At most five
 /// keys of at most 32 characters, and at least one that is not a modifier.
 pub fn cua_keys(combo: &str) -> Result<Vec<String>> {
-    let keys: Vec<&str> = combo.split('+').map(str::trim).collect();
+    // `ctrl++` and `+` name the plus key itself.
+    let mut keys: Vec<&str> = combo.trim().strip_suffix("++").or_else(|| (combo.trim() == "+").then_some(""))
+        .map(|head| head.split('+').map(str::trim).filter(|k| !k.is_empty()).collect())
+        .unwrap_or_else(|| combo.split('+').map(str::trim).collect());
+    if combo.trim().ends_with("++") || combo.trim() == "+" { keys.push("+"); }
     if combo.trim().is_empty() || keys.iter().any(|k| k.is_empty()) {
         return Err(invalid("Key action requires keys, for example \"ctrl+s\".").with("field", "keys"));
     }

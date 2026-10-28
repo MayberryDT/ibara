@@ -5,7 +5,7 @@
 // request adds `receive` (agent computers) or `share` (the sharing computer).
 import { documentOperation } from './document.js';
 const HOST='io.ibara.chrome';
-const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys'];
+const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys','keyseen'];
 // Operations that change the page (a refusal after they start is not "not started").
 const EFFECTS=['navigate','reveal','cookies_write','cookies_remove','login_reload'];
 // What each job lets ibara ask for. Anything else is refused unstarted.
@@ -131,7 +131,7 @@ chrome.runtime.onConnect.addListener(p=>{
   if(!a||a.port||p.name!=='press:'+a.watch||s?.id!==chrome.runtime.id||s.tab?.id!==a.tabId||s.documentId!==a.documentId){p.disconnect();return;}
   a.port=p;
   p.onMessage.addListener(m=>{
-    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true};a.pressedAt=Date.now();}
+    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true,redrawn:m.press.redrawn===true,...(typeof m.press.reached==='string'?{reached:m.press.reached.slice(0,80)}:{})};a.pressedAt=Date.now();}
     else if(m?.submit?.watch===a.watch&&!a.submit)a.submit={hit:m.submit.hit===true};
     else if(m?.leaving?.watch===a.watch)a.leaving=true;
   });
@@ -250,7 +250,9 @@ async function pressed(a,navigation) {
   await until(()=>a.press||a.submit||a.gone,500);
   const hit=a.press?a.press.hit:a.submit?a.submit.hit:null;
   if(hit===null)return {observed:false,hit:null,...(a.gone?{gone:true}:{})};
-  if(!navigation||!hit)return {observed:true,hit};
+  if(!hit)return {observed:true,hit,...(a.press?.reached?{reached:a.press.reached}:{})};
+  const redrawn=a.press?.redrawn?{redrawn:true}:{};
+  if(!navigation)return {observed:true,hit,...redrawn};
   // A form submits and the page leaves just after the press; a pending
   // address means the browser has begun loading the next page.
   await until(()=>a.leaving||a.gone,150);
@@ -295,12 +297,18 @@ async function handle(m,jobs) {
       if(!tab)return {result:{refused:true}};
       const frames=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:()=>{
         const authPath=/\/(?:log-?in|sign-?in|auth)(?:[/?#_-]|$)/i;
-        return [...document.querySelectorAll('input[type="password"],input[autocomplete="username"],input[autocomplete="current-password"],input[type="email"]')].some(e=>{
-          const visible=e.checkVisibility?.({visibilityProperty:true,opacityProperty:true})??e.getClientRects().length>0;
+        const shown=e=>e.checkVisibility?.({visibilityProperty:true,opacityProperty:true})??e.getClientRects().length>0;
+        const form=[...document.querySelectorAll('input[type="password"],input[autocomplete="username"],input[autocomplete="current-password"],input[type="email"]')].some(e=>{
           const action=e.closest('form')?.getAttribute('action');
           const authRoute=authPath.test(location.pathname)||(action&&authPath.test(new URL(action,location.href).pathname));
-          return visible&&(e.type==='password'||e.autocomplete==='username'||e.autocomplete==='current-password'||authRoute);
+          return shown(e)&&(e.type==='password'||e.autocomplete==='username'||e.autocomplete==='current-password'||authRoute);
         });
+        if(form)return true;
+        // An email-first sign-in in a dialog over an app page (an email
+        // field and Continue, then a code or a password), at any address.
+        const identifier=e=>e.type==='email'||(e.type==='text'&&/e-?mail|user\s?name/i.test([e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.autocomplete].join(' ')));
+        return [...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"]')]
+          .some(d=>shown(d)&&/\b(?:log|sign)[\s-]?in\b/i.test(d.innerText||'')&&[...d.querySelectorAll('input')].some(e=>shown(e)&&identifier(e)));
       }});
       return {result:{url:tab.url,previous:navigation.get(tab.id)?.previous,sign_in_page:frames.some(f=>f.result===true)}};
     }
@@ -360,8 +368,9 @@ async function handle(m,jobs) {
     const inventory=await chrome.webNavigation.getAllFrames({tabId:tab.id});
     const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
     if(!rootId)return refused();
+    if(m.op==='keyseen'&&!m.args.arm&&m.args.documentId!==rootId)return refused();
     if(m.op==='observe')return await observeFrames(m,tab,rootId);
-    if(['check','keys'].includes(m.op)){
+    if(['check','keys','keyseen'].includes(m.op)){
       const epoch=frameEpoch.get(tab.id)||0;
       if(pendingFrames.has(tab.id))return {result:{refused:true}};
       const replies=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[m]});
@@ -371,6 +380,7 @@ async function handle(m,jobs) {
         if(path&&(await mapPoint(tab.id,path,null)).ready)results.push(reply);
       }
       if(pendingFrames.has(tab.id)||(frameEpoch.get(tab.id)||0)!==epoch)return {result:{refused:true}};
+      if(m.op==='keyseen')return {result:{documentId:rootId,armed:results.some(r=>r.result?.armed===true),seen:results.some(r=>r.result?.seen===true)}};
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }
     const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);

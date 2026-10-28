@@ -455,9 +455,15 @@ impl Agent {
         let listing=probe.call("computer_status",json!({}));
         let computer_id=format!("computer_{}",listing["result"]["computers"][0]["id"].as_str().unwrap().trim_start_matches("cmp_"));
         drop(probe);
+        // The operator database requires a private parent, including under CI umask 022.
+        std::fs::set_permissions(&daemon.root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let db=daemon.root.join("operator.sqlite");
         let mut directory=ibara::operator::directory::OperatorDirectory::open(&db).unwrap();
-        for name in ["identity","known_hosts"] { std::fs::write(daemon.root.join(name),"").unwrap(); }
+        for name in ["identity","known_hosts"] {
+            let path = daemon.root.join(name);
+            std::fs::write(&path, "").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         directory.register_verified_computer(&json!({"computer_id":computer_id,"endpoint_id":endpoint,
             "label":"Capacity fixture","transport":"ssh","host":"fixture","user":"test","port":2222,
             "identity_file_ref":format!("file:{}",daemon.root.join("identity").display()),

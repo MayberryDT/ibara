@@ -63,7 +63,7 @@ ibara prompt
 
 The prompt tells your agent to add the ibara MCP server, link its skill and add instructions for future sessions.
 
-We have tested Codex, Claude Code, opencode and omp. Other agents need MCP support. The [agent connection reference](docs/agent-tools.md#connecting) explains manual setup.
+We have tested [Codex](https://ibara.app/docs/agents/codex), [Claude Code](https://ibara.app/docs/agents/claude-code), opencode and omp. Other agents need MCP support. The [agent connection reference](docs/agent-tools.md#connecting) explains manual setup.
 
 ## Run your first task
 
@@ -172,6 +172,7 @@ Use these guides for more detail:
 
 - [architecture](docs/architecture.md) explains the services, network connections and stored data
 - [agent tools](docs/agent-tools.md) describes the MCP tools and their results
+- [computer use on Linux](https://ibara.app/docs/linux-computer-use) compares the built-in computer use of common coding agents
 - [compositor settings](docs/compositors.md) explains optional Hypoland input and its reduced safeguards
 - [development](docs/development.md) explains building and checking the source
 - [internals](docs/internals.md) describes the implementation

@@ -610,6 +610,10 @@ fn confirm(question: &str) -> Result<bool, String> {
 
 fn unlink_plugin(me: &Account) {
     let link = plugins_dir(me).join(PLUGIN_ID);
+    if std::fs::read_link(&link).ok().as_deref() != Some(Path::new(PLUGIN)) {
+        println!("  Keeping independently installed plugin {}; manage it through its installer.", link.display());
+        return;
+    }
     if shell_running() {
         let _ = omarchy("omarchy-shell", &["shell", "setPluginEnabled", PLUGIN_ID, "false"]);
     }

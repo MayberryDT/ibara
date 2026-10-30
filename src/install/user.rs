@@ -210,10 +210,8 @@ pub(super) fn plugin_digest() -> String {
     sha256_hex(&all)
 }
 
-/// Omarchy's plugin folder gets a link to the packaged plugin, so it always
-/// matches the installed ibara and updates with it. A copy installed from the
-/// plugin marketplace is set aside (dot folders are not loaded). True when
-/// something changed.
+/// Link the packaged plugin on fresh installs. Preserve independently installed
+/// plugins: their updates belong to their installer. True when changed.
 pub fn link_plugin(me: &Account) -> Result<bool, String> {
     let dir = plugins_dir(me);
     std::fs::DirBuilder::new().recursive(true).mode(0o755).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -224,12 +222,12 @@ pub fn link_plugin(me: &Account) -> Result<bool, String> {
                 println!("  Already linked to the installed ibara.");
                 return Ok(false);
             }
-            std::fs::remove_file(&link).map_err(|e| format!("{}: {e}", link.display()))?;
+            println!("  Keeping the independently installed plugin at {}.", link.display());
+            return Ok(false);
         }
         Ok(meta) if meta.is_dir() && meta.uid() == me.uid => {
-            let aside = dir.join(format!(".{PLUGIN_ID}.marketplace-{}", crate::ids::now_millis()));
-            std::fs::rename(&link, &aside).map_err(|e| format!("{}: {e}", link.display()))?;
-            println!("  The plugin copy from the marketplace is replaced by the installed one (kept in {}).", aside.display());
+            println!("  Keeping the Marketplace plugin at {}; update it through Marketplace.", link.display());
+            return Ok(false);
         }
         Ok(_) => return Err(format!("{} is in the way; move it away and run ibara setup again.", link.display())),
         Err(_) => {}

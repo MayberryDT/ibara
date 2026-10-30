@@ -1373,7 +1373,7 @@ Item {
         " task_ref=" + root.notificationTraceToken(notice.trace.taskRef) +
         " state=" + root.notificationTraceState(notice.trace.state) + " verified=" + (notice.trace.verified === true ? "true" : "false") +
         " notice=" + root.notificationTraceNotice(notice.trace.notice))
-    notifyProcess.command = ["notify-send", "-a", "ibara", notice.title, notice.body]
+    notifyProcess.command = ["notify-send", "-a", "ibara", "ibara", "Open ibara for updates."]
     notifyProcess.running = true
   }
 
@@ -3039,10 +3039,8 @@ Item {
     }
     loadAttention()
   }
-  // One desktop notification per new approval, with Approve and Deny on it, Always Allow on a
-  // send, spend or delete, and Allow and Not Now on an agent's request to stop asking (notify-send --action;
-  // a notification server that renders actions shows the buttons). Each waits in its own process,
-  // which prints the notification's id, then the action chosen.
+  // Desktop notifications contain generic text and an Open action. Review and
+  // answer private requests inside the console. Each process reports its id/action.
   property var approvalNotices: ({})
   property var noticedApprovals: ({})
   function loginNeedsNotification(item) {
@@ -3068,9 +3066,8 @@ Item {
       fresh = true
       var name = item.label || computerLabelFor(item.computer_id)
       var notice = approvalNoticeComponent.createObject(root, { ref: item.ref, computerId: item.computer_id, label: name })
-      var actions = item.stopAsking ? ["-A", "approve=Allow", "-A", "deny=Not Now"]
-        : ["-A", "approve=Approve", "-A", "deny=Deny"].concat(item.effect ? ["-A", "always=Always Allow"] : [])
-      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open"].concat(actions, ["--", name + (item.stopAsking ? " needs your answer" : " needs your approval"), StatusModel.approvalNoticeBody(item, name, sessions[item.computer_id])])
+      // Private request text stays in the console, never in process arguments.
+      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open", "--", "ibara needs your approval", "Open ibara to review the request."]
       notice.running = true
       notices[item.ref] = notice
     }
@@ -3086,12 +3083,7 @@ Item {
       fresh = true
       var name = item.label || computerLabelFor(item.computer_id)
       var notice = approvalNoticeComponent.createObject(root, { ref: item.ref, computerId: item.computer_id, label: name, question: true, options: item.options.slice() })
-      var actions = []
-      for (var j = 0; item.options.length <= 2 && j < item.options.length; j++) actions.push("-A", "option-" + j + "=" + StatusModel.titleCase(item.options[j]))
-      if (!actions.length) actions = ["-A", "open=Open"]
-      if (sessions[item.computer_id] && sessions[item.computer_id].interactive_control === "available_if_exclusive") actions.push("-A", "take=Join")
-      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open"].concat(actions,
-        ["--", name + " needs your answer", StatusModel.requestNoticeBody(item, name, sessions[item.computer_id], item.summary)])
+      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open", "--", "ibara needs your answer", "Open ibara to review the question and options."]
       notice.running = true
       notices[item.ref] = notice
     }
@@ -3451,9 +3443,7 @@ Item {
       var notice = approvalNoticeComponent.createObject(root, { ref: item.ref, computerId: item.computer_id, label: name, login: true,
         loginRevision: item.login.assistance ? item.login.assistance.revision : -1, loginSites: item.login.sites })
       // Sharing/signup scope is reviewed on the card, never a truncated notification.
-      var actions = item.login.assistance ? ["-A", "defer=Not now", "-A", "open=Options and details"] : ["-A", "open=Open request"]
-      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open"].concat(actions,
-        ["--", "Sign-in needed", item.login.sites.map(function(s){return s.site}).join(", ") + " · " + name])
+      notice.command = ["notify-send", "-a", "ibara", "-p", "-u", "normal", "-t", "15000", "-A", "default=Open", "--", "Sign-in needed", "Open ibara to review the sign-in request."]
       notice.running = true; notices[item.ref] = notice
     }
     if (fresh) { noticedApprovals = seen; approvalNotices = notices }

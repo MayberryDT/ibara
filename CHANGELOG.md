@@ -1,3 +1,8 @@
+# 0.3.4
+
+- Keep private approval, question and sign-in details out of desktop notification process arguments.
+- Preserve independently installed Omarchy plugins during setup; fresh installs use the corrected bundled plugin.
+
 # Changelog
 
 ## 0.3.3 — 28 October 2026

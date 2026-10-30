@@ -200,3 +200,7 @@ Bug reports and suggestions are welcome. Tyler maintains ibara and does not merg
 You can submit a pull request to demonstrate a proposed fix. Tyler uses Claude or Codex to review submissions and decides which changes to make independently.
 
 Read the [contribution policy](CONTRIBUTING.md) before spending time on a patch.
+
+### Omarchy plugin updates
+
+Fresh core setups link the bundled console plugin. If you installed the plugin through Marketplace, core setup preserves that copy; update it through Marketplace. Core 0.3.4 includes the notification privacy fix. Older core releases can replace a corrected Marketplace copy with an older bundle: update core before running setup again.

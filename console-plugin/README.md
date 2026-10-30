@@ -3,7 +3,7 @@
 [![Test](https://github.com/MayberryDT/omarchy-ibara/actions/workflows/test.yml/badge.svg)](https://github.com/MayberryDT/omarchy-ibara/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-This is the console for [ibara](https://ibara.app), the best computer use for Omarchy: it gives your agents computer use across the Omarchy computers you own, built into Omarchy itself. You can use every one of those computers from any other one too. ibara's core is in [MayberryDT/ibara](https://github.com/MayberryDT/ibara).
+This is the console for [ibara](https://ibara.app), which gives your agents computer use across the Omarchy machines you own. You can use every one of those computers from any other one too. ibara's core is in [MayberryDT/ibara](https://github.com/MayberryDT/ibara).
 
 The console lives in Omarchy's bar: one glance tells you whether anything needs you, and one click opens a wall with a live picture of every computer.
 
@@ -53,7 +53,7 @@ Approval, login and question requests appear in ibara's own top-right pop-ups wh
 
 Settings keeps short help lines, with an info button for approval, disk startup and input details. Logins has its own page, reached through **Manage Logins** beside the site count in Settings. Search by site and filter **Allowed**, **Ask First** or **Denied**; choose a computer for **Share With…**, **Remove**, and expandable task and sharing history. All Sites shows each rule's computer scope; Sharing Options holds browser/profile selection and Never Share. Long lists create only visible rows.
 
-Console Settings has Request Pop-ups, switches for each kind, Show During Do Not Disturb (off by default), and Also Send Desktop Notifications (off by default). Settings survive shell restarts through Omarchy's plugin settings. When pop-ups are off, desktop notifications offer Open and the same answers where the notification server renders buttons. Desktop notifications close through the standard notification protocol; stock Omarchy may keep its own closed card visible until its 15-second timeout.
+Console Settings has Request Pop-ups, switches for each kind, Show During Do Not Disturb (off by default), and Also Send Desktop Notifications (off by default). Settings survive shell restarts through Omarchy's plugin settings. Desktop notifications contain generic text and an Open action. Review private sign-in sites, request details and answer options inside the console. Desktop notifications close through the standard notification protocol; stock Omarchy may keep its own closed card visible until its 15-second timeout.
 
 ## Install
 
@@ -65,7 +65,7 @@ curl -fsSL https://github.com/MayberryDT/ibara/releases/latest/download/install 
 
 The installer checks the release's signature, installs the signed `ibara` package with this plugin inside it, and runs `ibara setup`. Setup asks for your password once, adds the plugin to Omarchy's bar and restarts the shell once.
 
-If you installed the plugin from Omarchy's plugin marketplace first, its console shows one button, Install ibara, which runs the same installer in a terminal you can read. Setup then replaces the marketplace copy with the one in the package, so the plugin always matches the installed ibara.
+If you installed the plugin from Omarchy's plugin marketplace first, its console shows one button, Install ibara, which runs the same installer in a terminal you can read. Core 0.3.4 and later preserve the Marketplace copy; update it through Marketplace. Fresh installs link the corrected bundled plugin. Older core releases can replace a corrected plugin with an older bundle: update core before running setup again. If you already use Marketplace, update both core and your Marketplace copy to receive the privacy fix.
 
 ## Requirements
 

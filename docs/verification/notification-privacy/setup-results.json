@@ -1,0 +1,20 @@
+[
+  {
+    "case": "fresh",
+    "setup_runs": 2,
+    "uninstall_preserves_ownership": true,
+    "passed": true
+  },
+  {
+    "case": "marketplace",
+    "setup_runs": 2,
+    "uninstall_preserves_ownership": true,
+    "passed": true
+  },
+  {
+    "case": "independent-link",
+    "setup_runs": 2,
+    "uninstall_preserves_ownership": true,
+    "passed": true
+  }
+]

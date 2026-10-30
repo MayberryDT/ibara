@@ -1,0 +1,7 @@
+{
+  "version": "ibara 0.3.4-1",
+  "bundled_service_sha256": "84fcc273a8432c22ae94382790af58288f0ad1ec8649dded31901cca93b274cd",
+  "plugin_matches_release_source": true,
+  "sibling_payloads_unchanged": true,
+  "private_marker_scan": "passed"
+}

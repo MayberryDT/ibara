@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+import os,sys,json,time
+with open(os.environ['PRIVACY_ARGV_LOG'],'a') as f:
+ f.write(json.dumps({'argv':sys.argv[1:],'cmdline':open('/proc/self/cmdline','rb').read().decode().split(chr(0))})+'\n')
+print('42',flush=True)
+time.sleep(1)

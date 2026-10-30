@@ -1,0 +1,16 @@
+[
+  {
+    "request_popups": false,
+    "desktop_notifications": false,
+    "spawned_notifications": 4,
+    "private_canaries_in_arguments": false,
+    "open_routes_verified": 3
+  },
+  {
+    "request_popups": true,
+    "desktop_notifications": true,
+    "spawned_notifications": 4,
+    "private_canaries_in_arguments": false,
+    "open_routes_verified": 3
+  }
+]

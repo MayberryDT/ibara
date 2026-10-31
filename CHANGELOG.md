@@ -1,3 +1,7 @@
+# Unreleased
+
+- Pin and verify the bootstrap installer before execution in maintained README and console sources. Published 0.3.4 assets are unchanged.
+
 # 0.3.4
 
 - Keep private approval, question and sign-in details out of desktop notification process arguments.

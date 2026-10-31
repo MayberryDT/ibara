@@ -60,10 +60,17 @@ Console Settings has Request Pop-ups, switches for each kind, Show During Do Not
 The plugin comes with ibara. On an Omarchy computer, run this as yourself, not as root:
 
 ```bash
-curl -fsSL https://github.com/MayberryDT/ibara/releases/latest/download/install | sh
+(set -eu;
+umask 077;
+installer=$(mktemp);
+trap 'rm -f "$installer"' EXIT;
+trap 'exit 1' HUP INT TERM;
+curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 https://github.com/MayberryDT/ibara/releases/download/v0.3.4/install -o "$installer";
+printf '%s  %s\n' 92591da2459f18da47b6567d47cb66c0b16b988d4752fa88ec67283021a03fbe "$installer" | sha256sum -c -;
+sh "$installer")
 ```
 
-The installer checks the release's signature, installs the signed `ibara` package with this plugin inside it, and runs `ibara setup`. Setup asks for your password once, adds the plugin to Omarchy's bar and restarts the shell once.
+This command downloads the reviewed 0.3.4 installer to a private temporary file and verifies its pinned SHA-256 before running it. A failed download or checksum stops installation. The authenticated installer then checks the release's signature, installs the signed `ibara` package with this plugin inside it, and runs `ibara setup`. Setup asks for your password once, adds the plugin to Omarchy's bar and restarts the shell once.
 
 If you installed the plugin from Omarchy's plugin marketplace first, its console shows one button, Install ibara, which runs the same installer in a terminal you can read. Core 0.3.4 and later preserve the Marketplace copy; update it through Marketplace. Fresh installs link the corrected bundled plugin. Older core releases can replace a corrected plugin with an older bundle: update core before running setup again. If you already use Marketplace, update both core and your Marketplace copy to receive the privacy fix.
 

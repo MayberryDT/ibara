@@ -36,14 +36,21 @@ The 3 Omarchy packages for release 0.3.1-1 total about 52.3 MB to download, excl
 1. Run this command on each computer, as your own user rather than root.
 
    ```bash
-   curl -fsSL https://github.com/MayberryDT/ibara/releases/latest/download/install | sh
+   (set -eu;
+   umask 077;
+   installer=$(mktemp);
+   trap 'rm -f "$installer"' EXIT;
+   trap 'exit 1' HUP INT TERM;
+   curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 https://github.com/MayberryDT/ibara/releases/download/v0.3.4/install -o "$installer";
+   printf '%s  %s\n' 92591da2459f18da47b6567d47cb66c0b16b988d4752fa88ec67283021a03fbe "$installer" | sha256sum -c -;
+   sh "$installer")
    ```
 
 2. Follow the setup prompts. Setup asks for your password and adds the ibara icon to your bar.
 3. On your everyday computer, right-click the ibara icon to open the console.
 4. Choose Add Computer, then select the spare.
 
-The installer downloads the latest release. It checks the release signature and package checksums before installing `ibara`, `ibara-stream` and `ibara-view`.
+The command verifies the pinned 0.3.4 bootstrap installer before executing it; download or checksum failures stop installation. The authenticated installer downloads the latest signed release. It checks the release signature and package checksums before installing `ibara`, `ibara-stream` and `ibara-view`.
 
 Your own computers can pair in one step when they use the same Tailscale login and neither computer is tagged. Other pairings need confirmation.
 

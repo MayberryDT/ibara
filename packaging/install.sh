@@ -1,7 +1,6 @@
 #!/bin/sh
-# ibara's one-line installer:
-#
-#   curl -fsSL @IBARA_BASE_URL@/install | sh
+# ibara's installer. Authenticate this file before running it: use the
+# version-and-SHA256-pinned command in the reviewed README or console plugin.
 #
 # Downloads the newest release, checks its signature and the digest of each of
 # its three packages (ibara, and ibara-stream and ibara-view for Take Control),

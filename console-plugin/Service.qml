@@ -1179,8 +1179,9 @@ Item {
   // packaging/release.env (packaging/release.sh refuses a release when they differ): the
   // downloads of the newest GitHub release of MayberryDT/ibara.
   readonly property string ibaraBaseUrl: "https://github.com/MayberryDT/ibara/releases/latest/download"
-  // The one place the console names ibara's install command.
-  readonly property string ibaraInstallCommand: ibaraBaseUrl ? "curl -fsSL " + ibaraBaseUrl + "/install | sh" : ""
+  // Reviewed bootstrap bytes: pin the first-stage installer before executing it.
+  // Update the version and SHA256 together with the README install command.
+  readonly property string ibaraInstallCommand: "(set -eu; umask 077; installer=$(mktemp); trap 'rm -f \"$installer\"' EXIT; trap 'exit 1' HUP INT TERM; curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 https://github.com/MayberryDT/ibara/releases/download/v0.3.4/install -o \"$installer\"; printf '%s  %s\\n' 92591da2459f18da47b6567d47cb66c0b16b988d4752fa88ec67283021a03fbe \"$installer\" | sha256sum -c -; sh \"$installer\")"
   // This plugin can arrive before the rest of ibara (from Omarchy's plugin marketplace).
   // "package": the ibara package is not installed; "setup": it is, but `ibara setup` has not
   // finished; "": ibara is here (or its background service simply isn't answering).

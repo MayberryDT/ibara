@@ -140,7 +140,7 @@ echo "Release $version in $out is complete and signed." >&2
 
 {
   jq -r '.notes[] | "- " + .' "$out/stable.json"
-  printf '\n## Install\n\nOn an Omarchy computer:\n\n```bash\ncurl -fsSL %s/install | sh\n```\n\n' "$IBARA_BASE_URL"
+  printf '\n## Install\n\nOn an Omarchy computer, use the version-and-SHA256-pinned command in the [reviewed installation instructions](https://github.com/%s/blob/%s/README.md). It authenticates the bootstrap installer before execution.\n\n' "$repo" "$commit"
   echo 'Already installed? Run `ibara update`.'
   printf '\n`ibara-%s-source.tar.gz` is the full source of the three packages. Core and the Omarchy plugin are MIT; the separate ibara-stream (Sunshine) and ibara-view (Moonlight) programs remain GPL-3.0.\n' "$version"
 } >"$check/body.md"

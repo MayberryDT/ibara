@@ -7,7 +7,7 @@
 #     --private-markers MARKERS_FILE OUT
 #
 # OUT receives:
-#   install                                 the one-line installer (curl -fsSL URL/install | sh)
+#   install                                 the installer (authenticate its pinned bytes before execution)
 #   stable.json, stable.json.sig            the release manifest and its signature
 #   ibara-VERSION-x86_64.pkg.tar.zst        ibara, ibarad and workspace ibara-screen
 #   ibara-stream-VERSION-x86_64.pkg.tar.zst Take Control of this computer (the ibara-stream fork, branch ibara)

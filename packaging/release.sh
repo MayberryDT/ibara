@@ -117,7 +117,7 @@ build_package() {
   cp "$dir"/PKGBUILD "$build/$name/"
   [[ ! -f $dir/$name.install ]] || cp "$dir/$name.install" "$build/$name/"
   echo "Building $name $version…" >&2
-  (cd "$build/$name" && env "$@" IBARA_PKGREL="$pkgrel" PKGDEST="$build" BUILDDIR="$build" makepkg --force --nodeps --noconfirm >&2)
+  (cd "$build/$name" && umask 022 && env "$@" IBARA_PKGREL="$pkgrel" PKGDEST="$build" BUILDDIR="$build" makepkg --force --nodeps --noconfirm >&2)
   file=$build/$name-$version-x86_64.pkg.tar.zst
   [[ -f $file ]] || fail "makepkg made no $name-$version-x86_64.pkg.tar.zst."
   [[ -s $patterns ]] || return 0
@@ -138,6 +138,9 @@ bsdtar -xf "$build/ibara-$version-x86_64.pkg.tar.zst" -C "$build/verify-core" us
 rm -rf "$build/verify-core"
 build_package ibara-stream "$stream/packaging/ibara" IBARA_STREAM_DIR="$stream" IBARA_VERSION="$pkgver"
 build_package ibara-view "$view/packaging/ibara" IBARA_VIEW_DIR="$view" IBARA_VERSION="$pkgver"
+
+# Validate the final archive bytes, metadata and installed permissions before signing.
+"$core/packaging/check-packages.py" "$version" "$build"
 
 # The sources the packages were built from: core (MIT), the plugin (MIT)
 # and both forks (GPL-3.0) with their submodules. Two submodules hold only

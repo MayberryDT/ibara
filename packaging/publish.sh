@@ -129,6 +129,7 @@ for file in "${packages[@]}"; do
   grep -qxF "pkgname = $name" "$check/PKGINFO" && grep -qxF "pkgver = $version" "$check/PKGINFO" ||
     fail "$file is not $name $version."
 done
+"$core/packaging/check-packages.py" "$version" "$out"
 # The channel `ibara update` uses is the one built into the package's own ibara.
 bsdtar -xOf "$out/${packages[0]}" usr/lib/ibara/bin/ibara >"$check/ibara"
 grep -aqF "IBARA_BASE_URL=\"$IBARA_BASE_URL\"" "$check/ibara" && grep -aqF "$IBARA_RELEASE_KEY" "$check/ibara" ||

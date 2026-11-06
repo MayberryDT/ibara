@@ -154,16 +154,22 @@ append() { # REPO PREFIX
 # submodules NAME REPO [PATH]: the checked-out submodules of REPO, recursively,
 # as paths from the fork's top, not entering the prebuilt ones.
 submodules() {
-  local name=$1 repo=$2 top=${3:-} path sub
-  git -C "$repo" config -f .gitmodules --get-regexp '\.path$' 2>/dev/null | while read -r _ path; do
+  local name=$1 repo=$2 top=${3:-} path sub paths code
+  [[ -f $repo/.gitmodules ]] || return 0
+  paths=$(git -C "$repo" config -f .gitmodules --get-regexp '\.path$') || {
+    code=$?
+    [[ $code -eq 1 ]] && return 0
+    return "$code"
+  }
+  while read -r _ path; do
     sub=${top:+$top/}$path
     case $name/$sub in
       ibara-stream/third-party/build-deps | ibara-view/libs) continue ;;
     esac
-    [[ -e $repo/$path/.git ]] || continue
+    [[ -e $repo/$path/.git ]] || { echo "Missing required submodule: $name/$sub" >&2; return 1; }
     echo "$sub"
-    submodules "$name" "$repo/$path" "$sub"
-  done
+    submodules "$name" "$repo/$path" "$sub" || return
+  done <<<"$paths"
 }
 tar --create --file="$build/source.tar" --files-from=/dev/null
 append "$core" "ibara-$version/core"
@@ -172,9 +178,11 @@ declare -A forks=([ibara-stream]=$stream [ibara-view]=$view)
 for name in ibara-stream ibara-view; do
   fork=${forks[$name]}
   append "$fork" "ibara-$version/$name"
+  subs=$(submodules "$name" "$fork") || fail "Could not enumerate $name submodules."
   while read -r sub; do
+    [[ -n $sub ]] || continue
     append "$fork/$sub" "ibara-$version/$name/$sub"
-  done < <(submodules "$name" "$fork")
+  done <<<"$subs"
   mkdir -p "$build/notes/ibara-$version/$name"
   git -C "$fork" submodule status --recursive >"$build/notes/ibara-$version/$name/SUBMODULES"
 done

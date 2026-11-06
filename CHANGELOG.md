@@ -1,6 +1,7 @@
 # 0.3.6
 
 - Show request popups on the focused monitor and keep unanswered sign-in requests in the badge and quick panel after the popup closes.
+- Include all required nested dependencies in the release source archive.
 
 # Unreleased
 

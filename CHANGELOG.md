@@ -1,3 +1,7 @@
+# 0.3.6
+
+- Show request popups on the focused monitor and keep unanswered sign-in requests in the badge and quick panel after the popup closes.
+
 # Unreleased
 
 - Pin and verify the bootstrap installer before execution in maintained README and console sources. Published 0.3.4 assets are unchanged.

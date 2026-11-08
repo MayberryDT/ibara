@@ -1,3 +1,7 @@
+# 0.3.7
+
+- Keep sign-up proposal details out of the saved popup dismissal file. Dismissals store only a fingerprint, and files from earlier versions are converted when the console loads. A damaged entry in that file no longer stops dismissals from working.
+
 # 0.3.6
 
 - Show request popups on the focused monitor and keep unanswered sign-in requests in the badge and quick panel after the popup closes.

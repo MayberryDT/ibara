@@ -22,6 +22,14 @@
 //!    holds the pointer and how to release it.
 //! 7. A press the lock took is reported as a click that "reached canvas"
 //!    without saying why, or as a success.
+//!
+//! Navigate addresses:
+//! 8. A bare host or host and path (`example.com/a`, `localhost:8000/x`) is
+//!    refused, or opened as something other than that address over https.
+//! 9. A scheme the page reader cannot read (file:, chrome:, about:,
+//!    javascript:, mailto:) is opened, or refused without naming the accepted
+//!    forms with an example, or a file:// address without the routes that
+//!    show a file of the computer.
 use super::*;
 
 fn text(env: &Value) -> String {
@@ -153,5 +161,44 @@ fn a_page_holding_the_pointer_locked_refuses_a_click_before_any_input() {
         let env = call(&rig.controller, "browser_act", click_next(&task, "locked-2")).await;
         assert_eq!(env["result"]["steps"][0]["outcome"], "unknown", "a press at the page's own pointer is no success: {env}");
         assert!(env["result"]["steps"][0]["effect"].as_str().unwrap().contains("locked the pointer"), "{env}");
+    });
+}
+
+#[test]
+fn navigate_opens_a_bare_host_as_https_and_names_the_forms_it_takes() {
+    run(async {
+        let rig = browser_rig();
+        shop(&rig);
+        rig.desktop.extension.borrow_mut().insert("navigate".into(), json!({"navigated": true}));
+        let task = observe_page(&rig.controller).await;
+        let go = |url: &str| json!({"task_ref": task, "request_id": id("go"), "action": {"kind": "navigate", "url": url}});
+        let opened = || rig.desktop.extension_args.borrow().iter().filter(|(op, _)| op == "navigate").map(|(_, a)| a["url"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        for (given, sent) in [
+            ("example.com/a?b=1#c", "https://example.com/a?b=1#c"),
+            ("localhost:8000/report.html", "https://localhost:8000/report.html"),
+            ("  https://shop.example/cart ", "https://shop.example/cart"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/"),
+        ] {
+            let env = call(&rig.controller, "browser_act", go(given)).await;
+            assert_eq!(env["result"]["steps"][0]["outcome"], "done", "{given}: {env}");
+            assert_eq!(opened().last().map(String::as_str), Some(sent), "{given}");
+        }
+        let before = opened().len();
+        for (given, says) in [
+            ("file:///home/tulip1/sheet.png", "computer_files"),
+            ("chrome://extensions/", "https://example.com/page"),
+            ("about:blank", "https://example.com/page"),
+            ("javascript:alert(1)", "https://example.com/page"),
+            ("mailto:dana@example.com", "https://example.com/page"),
+            ("http:example.com", "https://example.com/page"),
+            ("two words", "https://example.com/page"),
+        ] {
+            let env = call(&rig.controller, "browser_act", go(given)).await;
+            assert_eq!(code(&env), "INVALID_ARGUMENT", "{given}: {env}");
+            assert!(env["error"]["message"].as_str().unwrap().contains(says), "{given}: {env}");
+            assert_eq!(env["error"]["execution_not_started"], true, "{given}: {env}");
+        }
+        assert_eq!(opened().len(), before, "nothing else opened");
+        assert_eq!(rig.desktop.acts(), 0);
     });
 }

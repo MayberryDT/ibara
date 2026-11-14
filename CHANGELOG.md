@@ -5,6 +5,7 @@
 - Stop refusing page elements when another frame of the page navigates, such as an advertisement reloading, and keep a page's recent elements usable when its latest read found no controls for a moment. The page reader still checks each element before input.
 - Refuse a click on a page element while the page holds the pointer locked, as a game that captures the mouse does, and say so, instead of sending a press that only the game's own pointer would take. Nothing is sent; Escape releases the pointer.
 - Point an agent to browser_act when a web page element's place, as the browser reports it, is outside its window. The browser can misplace page elements, and the page route scrolls an element into view and checks the click.
+- Open a bare host and path given to browser_act navigate, such as example.com/page, over https. Other schemes are still refused, and the refusal names the accepted forms with an example; for a file:// address it names computer_files and the address bar.
 - Say why a page target was refused: the page or its frame is loading or went elsewhere, the tab lost focus or closed, or which part of the element changed. A browser_act refused this way, or because something covers its target, shows the page as it is now in the text reply too, so the agent need not observe again.
 
 # 0.3.7

@@ -2206,13 +2206,10 @@ impl Controller {
         let class = stricter("change", effect);
         let (target, op, describe, said, route) = match action {
             BrowserAction::Navigate(n) => {
-                let url = n.url.trim();
-                let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
-                if !matches!(scheme.as_deref(), Some("http" | "https")) || url.len() > 4096 {
-                    return Err(invalid("action.url: an http or https address of at most 4096 characters.").with("execution_not_started", true));
-                }
-                let said = format!("go to {}", approval::page_words(url).unwrap_or_else(|| "a web page".into()));
-                (None, BrowserOp::Navigate(url.to_string()), format!("open {}", clip(url, 80)), said, "browser_navigate")
+                let url = web_address(&n.url)?;
+                let said = format!("go to {}", approval::page_words(&url).unwrap_or_else(|| "a web page".into()));
+                let describe = format!("open {}", clip(&url, 80));
+                (None, BrowserOp::Navigate(url), describe, said, "browser_navigate")
             }
             BrowserAction::Click(t) => {
                 let (args, what, words) = node(&t.target, "click")?;
@@ -3862,6 +3859,42 @@ fn text_runs(text: &str) -> Vec<(&str, bool)> {
     runs
 }
 
+
+/// The address `browser_act` navigate opens: an http or https address as
+/// given, or a bare host with an optional port and path (`example.com/a`,
+/// `localhost:8000/x`), opened over https. The page reader reads only http
+/// and https pages, so every other scheme is refused before anything is sent.
+fn web_address(given: &str) -> Result<String> {
+    let url = given.trim();
+    const FORMS: &str = "browser_act opens http and https addresses, such as https://example.com/page or http://localhost:8000/, or a bare host and path such as example.com/page, which opens over https";
+    let refuse = |why: String| Err(invalid(format!("action.url: {why}. {FORMS}.")).with("execution_not_started", true));
+    if url.is_empty() || url.len() > 4096 || url.chars().any(char::is_whitespace) {
+        return refuse("an address of at most 4096 characters, without spaces".into());
+    }
+    let (head, rest) = url.split_once(':').unwrap_or((url, ""));
+    // `localhost:8000/x` is a host and port, `mailto:x` a scheme.
+    let port = rest.split(['/', '?', '#']).next().is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    let scheme = (!rest.is_empty() || url.ends_with(':')) && !port
+        && head.starts_with(|c: char| c.is_ascii_alphabetic()) && head.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c));
+    if scheme {
+        return match head.to_ascii_lowercase().as_str() {
+            "http" | "https" if rest.starts_with("//") && rest.len() > 2 => Ok(url.to_string()),
+            "file" => Err(invalid("action.url: browser_act does not open file:// addresses: the page reader cannot read them. Read a file of this computer with computer_files, or type its address into the address bar with computer_act (key ctrl+l, type, key Return) to look at it.")
+                .with("execution_not_started", true)),
+            "http" | "https" => refuse(format!("{} has no host after {head}://", clip(url, 60))),
+            other => refuse(format!("{other}: addresses are not web pages")),
+        };
+    }
+    let host = url.split(['/', '?', '#']).next().unwrap_or("");
+    let name = if port { head } else { host };
+    let labels: Vec<&str> = name.split('.').collect();
+    let plausible = name == "localhost"
+        || (labels.len() >= 2 && labels.iter().all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_alphanumeric() || c == '-')));
+    if !plausible {
+        return refuse(format!("\"{}\" is not an address", clip(url, 60)));
+    }
+    Ok(format!("https://{url}"))
+}
 
 /// Where a page went, without its query or fragment: a form sent with GET
 /// carries what was typed in its address.

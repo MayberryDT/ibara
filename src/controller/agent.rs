@@ -2434,9 +2434,11 @@ impl Controller {
                 Ok((Done { note, ..done }, data, true))
             }
             (Some(true), _) => {
-                let instead = seen.get("reached").and_then(Value::as_str).filter(|r| !r.is_empty())
-                    .map(|r| format!("The click reached {} instead of the element chosen; observe the page.", clip(r, 80)))
-                    .unwrap_or_else(|| "The click reached a different element than the one chosen; observe the page.".to_string());
+                let instead = match (seen.get("locked").and_then(Value::as_str), seen.get("reached").and_then(Value::as_str).filter(|r| !r.is_empty())) {
+                    (Some(lock), _) => format!("The page had locked the pointer to {}, so the click went to it at the page's own pointer, not to the element chosen; observe the page, and release the pointer (Escape) before clicking its controls.", clip(lock, 80)),
+                    (None, Some(r)) => format!("The click reached {} instead of the element chosen; observe the page.", clip(r, 80)),
+                    (None, None) => "The click reached a different element than the one chosen; observe the page.".to_string(),
+                };
                 Err(fail("OUTCOME_UNKNOWN", instead, false))
             }
             _ if seen.get("gone").and_then(Value::as_bool) == Some(true) => {
@@ -3877,6 +3879,14 @@ fn page_refusal(data: &Value) -> Result<()> {
         let e = fail(code, format!("{message}; nothing was sent."), true).with("execution_not_started", true);
         Err(match next { Some(next) => e.with("next", next), None => e })
     };
+    // A game or a drawing surface that captures the mouse takes every press
+    // at its own pointer, wherever the pointer is put.
+    if let Some(lock) = data.get("locked").and_then(Value::as_str) {
+        return Err(unavailable(format!("The page holds the pointer locked to {}, so a click would go to it at the page's own pointer, not to that element; nothing was sent.", clip(lock, 80)))
+            .with("reason", "pointer_locked")
+            .with("execution_not_started", true)
+            .with("next", "Release the pointer as a person would, with Escape (browser_act key \"Escape\"; the page may react to the key too), then click again. Or use the page's own keyboard shortcut for that control."));
+    }
     if data.get("covered").and_then(Value::as_bool) == Some(true) {
         return refuse("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog)", Some("Deal with what covers it, then choose again."));
     }

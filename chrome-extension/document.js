@@ -325,7 +325,10 @@ export async function documentOperation(message) {
         const found=sameMeaning(w.meaning);
         if(found.length===1&&reaches(found[0],target)){hit=true;redrawn=true;w.el=found[0];}
       }
-      w.result={hit,redrawn,...(hit?{}:{reached:reached(target)})};
+      // While the page holds the pointer locked (a game's captured mouse),
+      // every press goes to the locked element, at the page's own pointer.
+      const lock=document.pointerLockElement;
+      w.result={hit,redrawn,...(hit?{}:{reached:reached(target),...(lock?{locked:reached(lock)}:{})})};
       post({press:{watch:w.id,...w.result}});
     },true);
     addEventListener('submit',e=>{
@@ -423,7 +426,7 @@ export async function documentOperation(message) {
   }
   if(message.op==='verify') {
     const w=state.watch;state.watch=null;
-    return {observed:!!w?.result,hit:w?.result?w.result.hit:null,...(w?.result?.redrawn?{redrawn:true}:{}),...(w?.result?.reached?{reached:w.result.reached}:{})};
+    return {observed:!!w?.result,hit:w?.result?w.result.hit:null,...(w?.result?.redrawn?{redrawn:true}:{}),...(w?.result?.reached?{reached:w.result.reached}:{}),...(w?.result?.locked?{locked:w.result.locked}:{})};
   }
   if(message.op==='selected') {
     const selection=state.selecting;
@@ -454,6 +457,11 @@ export async function documentOperation(message) {
   if(message.op==='locate'||message.op==='reveal') {
     let el=find();
     if(!el)return refuse();
+    // A page that holds the pointer locked (a game's captured mouse) gives
+    // every press to the locked element, at its own pointer: a press cannot
+    // reach any other element, so none is located.
+    const lock=document.pointerLockElement;
+    if(message.op==='locate'&&lock&&lock!==el&&!el.contains(lock))return {locked:reached(lock)};
     const scrolled=!inView(el);
     if(scrolled)el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
     if(message.op==='reveal')return {revealed:true};

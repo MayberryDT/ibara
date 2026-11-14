@@ -15,6 +15,13 @@
 //!    the page's earlier observations unknown, though the reader still holds
 //!    and checks them.
 //! 5. ...while an element of another document must stay refused, unasked.
+//!
+//! A page that holds the pointer locked (a game's captured mouse):
+//! 6. A click is still sent, though the press can only reach the locked
+//!    element at the page's own pointer; or the refusal does not name what
+//!    holds the pointer and how to release it.
+//! 7. A press the lock took is reported as a click that "reached canvas"
+//!    without saying why, or as a success.
 use super::*;
 
 fn text(env: &Value) -> String {
@@ -123,5 +130,28 @@ fn a_page_read_with_no_controls_keeps_the_pages_earlier_elements_but_not_another
         let env = call(&rig.controller, "browser_act", click_next(&task, "other-document")).await;
         assert_eq!(code(&env), "STALE_TARGET", "{env}");
         assert_eq!(locates(), before, "nothing asked of the new document");
+    });
+}
+
+#[test]
+fn a_page_holding_the_pointer_locked_refuses_a_click_before_any_input() {
+    run(async {
+        let rig = browser_rig();
+        shop(&rig);
+        let task = observe_page(&rig.controller).await;
+        rig.desktop.extension.borrow_mut().insert("locate".into(), json!({"locked": "canvas \"Arena\""}));
+        let env = call(&rig.controller, "browser_act", click_next(&task, "locked-1")).await;
+        assert_eq!(code(&env), "CAPABILITY_UNAVAILABLE", "{env}");
+        let message = env["error"]["message"].as_str().unwrap();
+        assert!(message.contains("canvas \"Arena\"") && message.contains("nothing was sent"), "{env}");
+        assert!(env["error"]["next"].as_str().unwrap().contains("Escape"), "{env}");
+        assert_eq!((&env["error"]["execution_not_started"], &env["error"]["reason"]), (&json!(true), &json!("pointer_locked")), "{env}");
+        assert_eq!(rig.desktop.acts(), 0, "no press goes to the locked canvas");
+        // The page locked the pointer between locating and pressing.
+        rig.desktop.extension.borrow_mut().insert("locate".into(), json!({ "x": 100, "y": 50, "outer": [1000, 1000], "inner": [1000, 913], "zoom": 1 }));
+        rig.desktop.extension.borrow_mut().insert("verify".into(), json!({"observed": true, "hit": false, "reached": "canvas \"Arena\"", "locked": "canvas \"Arena\""}));
+        let env = call(&rig.controller, "browser_act", click_next(&task, "locked-2")).await;
+        assert_eq!(env["result"]["steps"][0]["outcome"], "unknown", "a press at the page's own pointer is no success: {env}");
+        assert!(env["result"]["steps"][0]["effect"].as_str().unwrap().contains("locked the pointer"), "{env}");
     });
 }

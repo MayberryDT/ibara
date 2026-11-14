@@ -18,6 +18,12 @@
 //    located, or refused without saying why.
 // 4. An element whose card text, name or enabled state changed, or which is
 //    hidden now, is located, or refused without saying which of these it was.
+// 5. The page holds the pointer locked to another element (a game's
+//    canvas): a point is still returned, though a press would reach the
+//    locked element at the page's own pointer and never the chosen one.
+// 6. With the lock released, the same element is refused.
+// 7. A press made while the page holds the lock is reported without saying
+//    that the lock took it.
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -50,6 +56,11 @@ const pages = {
   '/inframe': `<title>Outer</title><p>Outer page</p><iframe src="/inner"></iframe>`,
   '/inner': `<title>Inner</title><button>Inner</button>`,
   '/card': `<title>Card</title><div><h3>Order 12</h3><span id=count>3 items</span><button id=add>Add</button></div><button id=other>Other</button>`,
+  // A game's arena: a canvas under its HUD that captures the pointer when
+  // pressed (at once, or 400 ms later with ?later).
+  '/lock': `<title>Arena</title><style>body{margin:0}canvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:0}#hud{position:fixed;right:20px;top:20px;z-index:1}</style>
+    <canvas aria-label="Arena"></canvas><div id=hud><button>Max level</button></div>
+    <script>const c=document.querySelector('canvas');c.addEventListener('pointerdown',()=>{if(!document.pointerLockElement)setTimeout(()=>c.requestPointerLock(),location.search==='?later'?400:0)});</script>`,
 };
 const server = http.createServer(async (request, response) => {
   const route = request.url.split('?')[0];
@@ -224,6 +235,34 @@ for (const [change, script, what] of [
     check('wanted', `refused as changed: ${what}`, answer?.refused && answer.why === 'changed' && answer.changed === what, plain(answer));
   });
 }
+
+await scenario('a pointer the page locked to its canvas refuses a click elsewhere', async check => {
+  await open('/lock');
+  await press(50, 400);
+  check('setup', 'the canvas holds the pointer', await until(() => evaluate(`document.pointerLockElement?.tagName === 'CANVAS'`), 3000, 'the lock'));
+  const max = target(await observe(), 'Max level');
+  const answer = await locate(max);
+  check('wanted', 'not located', !located(answer), plain(answer));
+  check('wanted', 'names the element holding the pointer', answer?.locked === 'canvas "Arena"', plain(answer));
+  await evaluate(`document.exitPointerLock(); true`);
+  await until(() => evaluate(`!document.pointerLockElement`), 3000, 'the lock to go');
+  const released = await locate(target(await observe(), 'Max level'));
+  check('safe', 'located once the lock is released', located(released), plain(released));
+});
+
+await scenario('a press the locked pointer took is reported as the lock\'s', async check => {
+  await open('/lock?later');
+  const max = target(await observe(), 'Max level');
+  await press(50, 400);
+  const answer = await locate(max);
+  check('setup', 'located before the page locks the pointer', located(answer), plain(answer));
+  await until(() => evaluate(`document.pointerLockElement?.tagName === 'CANVAS'`), 3000, 'the lock');
+  await press(answer.x, answer.y);
+  const seen = (await ask('verify', { ...max, navigation: false })).result;
+  check('safe', 'not a hit', seen?.observed === true && seen.hit === false, seen);
+  check('wanted', 'says the locked pointer took the press', seen?.locked === 'canvas "Arena"', seen);
+  await evaluate(`document.exitPointerLock(); true`);
+});
 
 // The sandbox stays on: no --no-sandbox, and renderers run under seccomp.
 const processes = fs.readdirSync('/proc').filter(p => /^\d+$/.test(p)).flatMap(p => {

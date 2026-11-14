@@ -137,7 +137,7 @@ chrome.runtime.onConnect.addListener(p=>{
   if(!a||a.port||p.name!=='press:'+a.watch||s?.id!==chrome.runtime.id||s.tab?.id!==a.tabId||s.documentId!==a.documentId){p.disconnect();return;}
   a.port=p;
   p.onMessage.addListener(m=>{
-    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true,redrawn:m.press.redrawn===true,...(typeof m.press.reached==='string'?{reached:m.press.reached.slice(0,80)}:{})};a.pressedAt=Date.now();}
+    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true,redrawn:m.press.redrawn===true,...(typeof m.press.reached==='string'?{reached:m.press.reached.slice(0,80)}:{}),...(typeof m.press.locked==='string'?{locked:m.press.locked.slice(0,80)}:{})};a.pressedAt=Date.now();}
     else if(m?.submit?.watch===a.watch&&!a.submit)a.submit={hit:m.submit.hit===true};
     else if(m?.leaving?.watch===a.watch)a.leaving=true;
   });
@@ -256,7 +256,7 @@ async function pressed(a,navigation) {
   await until(()=>a.press||a.submit||a.gone,500);
   const hit=a.press?a.press.hit:a.submit?a.submit.hit:null;
   if(hit===null)return {observed:false,hit:null,...(a.gone?{gone:true}:{})};
-  if(!hit)return {observed:true,hit,...(a.press?.reached?{reached:a.press.reached}:{})};
+  if(!hit)return {observed:true,hit,...(a.press?.reached?{reached:a.press.reached}:{}),...(a.press?.locked?{locked:a.press.locked}:{})};
   const redrawn=a.press?.redrawn?{redrawn:true}:{};
   if(!navigation)return {observed:true,hit,...redrawn};
   // A form submits and the page leaves just after the press; a pending

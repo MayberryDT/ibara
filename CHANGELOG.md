@@ -3,13 +3,13 @@
 - Keep computers answering while the journal retention pass runs. Old task evidence is found through indexes, built once on an existing journal when ibarad starts. A task whose evidence is gone is not read again, and each pass stops after 100 ms or 1,000 deleted rows outside metadata pressure, so its cost no longer grows with history.
 - Close sign-in requests 24 hours after their partial, blocked or interrupted task ended, while running and at startup, so they stop counting as attention. A later task can still continue a request within that time.
 - Stop refusing page elements when another frame of the page navigates, such as an advertisement reloading, and keep a page's recent elements usable when its latest read found no controls for a moment. The page reader still checks each element before input.
+- Say why a page target was refused: the page or its frame is loading or went elsewhere, the tab lost focus or closed, or which part of the element changed. A browser_act refused this way, or because something covers its target, shows the page as it is now in the text reply too, so the agent need not observe again.
 - Refuse a click on a page element while the page holds the pointer locked, as a game that captures the mouse does, and say so, instead of sending a press that only the game's own pointer would take. Nothing is sent; Escape releases the pointer.
 - Point an agent to browser_act when a web page element's place, as the browser reports it, is outside its window. The browser can misplace page elements, and the page route scrolls an element into view and checks the click.
 - Open a bare host and path given to browser_act navigate, such as example.com/page, over https. Other schemes are still refused, and the refusal names the accepted forms with an example; for a file:// address it names computer_files and the address bar.
 - Tell an agent refused by a busy computer what to do instead: no tool waits for it, status shows which computers are ready, and a begin that names no computer takes one. When every ready computer refuses such a begin, say so for the whole fleet rather than in one computer's words.
 - Name the lookalikes of an ambiguous page target and send the agent to a point on a picture, which tells them apart, instead of a query, which cannot. Name what covers a covered page target.
 - Report the commit each computer's ibara was built from, marked when its checkout had changes, as `build` in operator status, so the console can show which computers run different builds. Packages built outside a git checkout leave it out.
-- Say why a page target was refused: the page or its frame is loading or went elsewhere, the tab lost focus or closed, or which part of the element changed. A browser_act refused this way, or because something covers its target, shows the page as it is now in the text reply too, so the agent need not observe again.
 
 # 0.3.7
 

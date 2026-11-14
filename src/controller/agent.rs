@@ -2189,7 +2189,7 @@ impl Controller {
                 let message = if alike.is_empty() {
                     format!("{what} cannot be told apart from another element on the page by its role, name and the text around it, so nothing was sent.")
                 } else {
-                    format!("{what} is alike in role, name and the text around it with {}, so ibara cannot tell which one you mean; nothing was sent.", alike.join(", "))
+                    format!("{what} has the same role, name and surrounding text as {}, so ibara cannot tell which one you mean; nothing was sent.", alike.join(", "))
                 };
                 return Err(fail("AMBIGUOUS_TARGET", message, true).with("execution_not_started", true)
                     .with("next", "Their places tell them apart: take a picture (computer_observe with view \"image\") and click the one you mean at its point with computer_act; for a field, type into it with computer_act after that click."));

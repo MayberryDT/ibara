@@ -155,9 +155,18 @@ impl Controller {
             .ok_or_else(|| denied("Task is private or this principal has no active group grant."))
     }
 
-    /// `redactedBusy`.
+    /// `redactedBusy`: another session holds the control a task call needs.
+    /// Whose it is stays private; the situation line says another agent.
     pub(crate) fn redacted_busy(&self) -> IbaraError {
-        fail("BUSY", "Control is unavailable.", true)
+        fail("BUSY", "Another session holds this computer's control (another task, or yours in another live session), so nothing was done.", true)
+            .with("next", "A live session of yours keeps its task while it is connected: carry on there. If this task's control has ended, computer_status says so; then begin again on a ready computer.")
+    }
+
+    /// A begin while another task holds the computer. Agents repeated this
+    /// call dozens of times; nothing waits for a busy computer.
+    pub(crate) fn held_elsewhere(&self) -> IbaraError {
+        fail("BUSY", "Another task holds this computer, so no task was started.", true)
+            .with("next", "Do not repeat this begin at once: no tool waits for a busy computer. computer_status shows which computers are ready. A computer_begin without naming a computer takes a ready one; or begin here again, with a new request_id, once this one shows ready. Do other work meanwhile.")
     }
 
     /// Why agents wait, while only ibara paused the computer; `None` while a

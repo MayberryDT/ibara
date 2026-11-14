@@ -1316,7 +1316,7 @@ impl Controller {
                     .with("task_ref", &active.task_ref)
                     .with("next", format!("computer_act or computer_observe to continue {}; computer_finish it before beginning another task.", active.task_ref)));
             }
-            return Err(self.redacted_busy());
+            return Err(self.held_elsewhere());
         }
         if self.journal.get_control()?.unsettled || self.settling.get() || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
             self.journal.set_control(crate::store::ControlPatch { unsettled: Some(true), ..Default::default() })?;

@@ -23,7 +23,7 @@ You may use **multiple computers for separate independent tasks** in the same ag
 
 ## One task, start to finish
 
-A task holds the computer: your person sees it in their console, and no other agent can use that computer until you finish. A busy computer does not block work on other free computers. If all suitable machines are unavailable, continue independent work and report the actual states. Never steal a lease or override a person’s pause.
+A task holds the computer: your person sees it in their console, and no other agent can use that computer until you finish. A busy computer does not block work on other free computers. If all suitable machines are unavailable, continue independent work and report the actual states. Nothing waits for a busy computer: don't repeat a refused `computer_begin` in a loop; check `computer_status` later. Never steal a lease or override a person’s pause.
 
 1. **Prepare before you begin.** Have the URLs, text and your definition of done ready before `computer_begin`.
 2. **Begin with checks that prove the result.** Give `computer_begin` a `goal` and `checks`. Prefer typed checks (`file_exists`, `file_content`, `url`, `text_present`, `element`, `delivered`); ibara proves those itself. Checks without a type are yours to assess honestly at finish, and so is a typed check ibara can't read: text in a terminal, which has no accessibility tree, is `unknown` until your assessment decides it. The reply has your `task_ref` and the first frame.

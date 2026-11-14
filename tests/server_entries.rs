@@ -820,11 +820,11 @@ fn a_second_session_of_the_same_agent_cannot_take_a_live_sessions_control() {
     // Long enough for a silent first session to count as gone.
     std::thread::sleep(Duration::from_millis(1500));
     let begin = second.call("computer_begin", json!({ "goal": "Write another note", "request_id": "begin-2" }));
-    assert_eq!((begin["error"]["code"].as_str(), begin["error"]["message"].as_str()), (Some("BUSY"), Some("Control is unavailable.")), "{begin}");
+    assert_eq!((begin["error"]["code"].as_str(), begin["error"]["message"].as_str()), (Some("BUSY"), Some("Another task holds this computer, so no task was started.")), "{begin}");
     assert!(begin["error"]["task_ref"].is_null(), "{begin}");
     assert!(situation(&begin).contains("another agent controls"), "{begin}");
     let taken = second.call("computer_files", json!({ "task_ref": task, "request_id": "write-2", "op": "write", "path": "note.txt", "text": "second\n" }));
-    assert_eq!((taken["error"]["code"].as_str(), taken["error"]["message"].as_str()), (Some("BUSY"), Some("Control is unavailable.")), "{taken}");
+    assert_eq!((taken["error"]["code"].as_str(), taken["error"]["message"].as_str()), (Some("BUSY"), Some("Another session holds this computer's control (another task, or yours in another live session), so nothing was done.")), "{taken}");
     assert_eq!(lease()["connection_id"], held["connection_id"], "the first session keeps its control");
 
     let wrote = first.call("computer_files", json!({ "task_ref": task, "request_id": "write-1", "op": "write", "path": "note.txt", "text": "first\n" }));

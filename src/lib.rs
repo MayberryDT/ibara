@@ -39,3 +39,10 @@ pub fn version() -> String {
         _ => format!("{}-dev.{}", env!("CARGO_PKG_VERSION"), option_env!("IBARA_BUILD_ID").unwrap_or("local")),
     }
 }
+
+/// The source commit this binary was built from, `-dirty` when tracked files
+/// differed from it, as packaging/PKGBUILD sets IBARA_BUILD; `None` when the
+/// build did not know it. The console compares it across computers.
+pub fn build() -> Option<&'static str> {
+    option_env!("IBARA_BUILD").filter(|build| !build.is_empty())
+}

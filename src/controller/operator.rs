@@ -505,6 +505,9 @@ impl Controller {
         out.insert("wake".into(), self.wake_info().await);
         out.insert("disk_password".into(), self.disk_password().await);
         out.insert("version".into(), json!(crate::version()));
+        if let Some(build) = crate::build() {
+            out.insert("build".into(), json!(build));
+        }
         out.insert("omarchy_update".into(), crate::install::omarchy_update::status());
         out.insert("ibara_update".into(), crate::install::update::status());
         if let Some(a)=crate::access::Access::load(&self.journal)? {

@@ -8,6 +8,7 @@
 - Open a bare host and path given to browser_act navigate, such as example.com/page, over https. Other schemes are still refused, and the refusal names the accepted forms with an example; for a file:// address it names computer_files and the address bar.
 - Tell an agent refused by a busy computer what to do instead: no tool waits for it, status shows which computers are ready, and a begin that names no computer takes one. When every ready computer refuses such a begin, say so for the whole fleet rather than in one computer's words.
 - Name the lookalikes of an ambiguous page target and send the agent to a point on a picture, which tells them apart, instead of a query, which cannot. Name what covers a covered page target.
+- Report the commit each computer's ibara was built from, marked when its checkout had changes, as `build` in operator status, so the console can show which computers run different builds. Packages built outside a git checkout leave it out.
 - Say why a page target was refused: the page or its frame is loading or went elsewhere, the tab lost focus or closed, or which part of the element changed. A browser_act refused this way, or because something covers its target, shows the page as it is now in the text reply too, so the agent need not observe again.
 
 # 0.3.7

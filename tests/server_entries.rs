@@ -1204,6 +1204,24 @@ fn seed_tasks(db: &rusqlite::Connection, prefix: &str, count: u32, state: &str, 
     )).unwrap();
 }
 
+/// One new effect (each records an intent and so runs a retention pass); its
+/// milliseconds. Steps are at least 150 ms apart, within a connection's
+/// request rate (80 in 10 s).
+fn step_ms(agent: &mut Agent, task: &str, request_id: &str) -> u128 {
+    let started = std::time::Instant::now();
+    let done = agent.call("computer_exec", json!({"task_ref": task, "request_id": request_id, "command": ["/bin/true"]}));
+    let ms = started.elapsed().as_millis();
+    assert_eq!(done["status"], "ok", "{done}");
+    std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
+    ms
+}
+
+fn median(values: &[u128]) -> u128 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 fn stopped(daemon: &mut Daemon) -> rusqlite::Connection {
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();
@@ -1236,4 +1254,133 @@ fn retention_with_old_empty_tasks_does_not_stall_daemon_startup() {
     work_artifact("retention-latency", json!({"old_tasks": 960, "retained_observations": count, "startup_ms": startup_ms}));
     assert_eq!(count, 20000, "retention must preserve recent evidence");
     assert!(startup_ms < 2000, "retention blocked daemon startup for {startup_ms} ms");
+}
+
+#[test]
+fn retention_cost_does_not_grow_with_pruned_history() {
+    // What a step costs on a computer without history.
+    let fresh = Daemon::start_with("retention-no-history", true);
+    let mut agent = Agent::start(&fresh, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    let baseline: Vec<u128> = (0..10).map(|i| step_ms(&mut agent, &task, &format!("baseline-{i}"))).collect();
+    drop(agent);
+    drop(fresh);
+    // Twenty thousand finished tasks whose evidence earlier passes already
+    // removed: about ten months at Dell's rate.
+    let mut daemon = Daemon::start_with("retention-history", true);
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    seed_tasks(&db, "old-", 20_000, "completed", LONG_AGO);
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let mut agent = Agent::start(&daemon, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    // Passes may visit that history once; then a step costs what it costs without it.
+    let settled_ms = median(&baseline) + 25;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut steps: Vec<u128> = Vec::new();
+    let settled = loop {
+        if steps.len() >= 10 && median(&steps[steps.len() - 10..]) <= settled_ms {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
+    };
+    let slowest = steps.iter().copied().max().unwrap_or(0);
+    work_artifact("retention-history", json!({"old_tasks": 20_000, "startup_ms": startup_ms, "baseline_ms": baseline,
+        "steps_ms": steps, "settled": settled, "steps_to_settle": if settled { steps.len() } else { 0 }, "slowest_step_ms": slowest}));
+    assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+    assert!(settled, "steps never returned to the cost without history ({settled_ms} ms): {steps:?}");
+    assert!(slowest < 1500, "a step waited {slowest} ms for retention");
+}
+
+#[test]
+fn retention_backlog_does_not_delay_status() {
+    let mut daemon = Daemon::start_with("retention-backlog", true);
+    let db = stopped(&mut daemon);
+    // Two backlogs of finished tasks still holding settled receipts and
+    // observations: one already old when ibarad starts, one that ages out
+    // while it runs. Pruning either at once takes seconds.
+    db.execute_batch("BEGIN").unwrap();
+    for (backlog, at) in [("start", LONG_AGO), ("later", "2999-01-01T00:00:00.000Z")] {
+        seed_tasks(&db, &format!("{backlog}-"), 1000, "completed", at);
+        db.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<240000)
+             INSERT INTO operations(operation_ref,request_id,principal,task_ref,tool,fingerprint,created_at,updated_at,receipt,dispatched)
+             SELECT '{backlog}-op-'||x,'{backlog}-step-'||x,'test','{backlog}-'||(x%1000+1),'computer_act','f','{LONG_AGO}','{LONG_AGO}',
+                    '{{\"execution\":\"completed\",\"verification\":\"not_requested\",\"effect\":\"none\"}}',1 FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40000)
+             INSERT INTO observations(observation_ref,task_ref,principal,record)
+             SELECT '{backlog}-obs-'||x,'{backlog}-'||(x%1000+1),'test',json_object('proof',hex(zeroblob(1024))) FROM n;"
+        )).unwrap();
+    }
+    // What retention keeps: an old task whose effect is still unknown, and young evidence.
+    seed_tasks(&db, "unknown-", 1, "completed", LONG_AGO);
+    seed_tasks(&db, "young-", 1, "completed", "2999-01-01T00:00:00.000Z");
+    db.execute_batch(&format!(
+        "INSERT INTO operations(operation_ref,request_id,principal,task_ref,tool,fingerprint,created_at,updated_at,receipt,dispatched)
+         VALUES('unknown-op','unknown-step','test','unknown-1','computer_act','f','{LONG_AGO}','{LONG_AGO}','{{\"execution\":\"unknown\",\"verification\":\"unknown\",\"effect\":\"unknown\"}}',1);
+         WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10)
+         INSERT INTO observations(observation_ref,task_ref,principal,record)
+         SELECT 'kept-'||t||'-'||x,t||'-1','test','{{}}' FROM n, (SELECT 'unknown' AS t UNION ALL SELECT 'young');
+         COMMIT;"
+    )).unwrap();
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let mut agent = Agent::start(&daemon, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    // Another client keeps reading status, as the console does.
+    let mut watcher = Agent::start(&daemon, "claude");
+    let stop = Arc::new(AtomicBool::new(false));
+    let polling = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut waits = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let status = watcher.call("computer_status", json!({}));
+                waits.push((started.elapsed().as_millis(), status["status"] == "ok"));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            waits
+        })
+    };
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let left = |backlog: &str| -> i64 {
+        db.query_row(&format!("SELECT (SELECT count(*) FROM observations WHERE task_ref GLOB '{backlog}-*') + (SELECT count(*) FROM operations WHERE task_ref GLOB '{backlog}-*')"), [], |r| r.get(0)).unwrap()
+    };
+    let mut phases = Vec::new();
+    let mut steps: Vec<u128> = Vec::new();
+    for backlog in ["start", "later"] {
+        if backlog == "later" {
+            db.execute("UPDATE tasks SET updated_at = ? WHERE task_ref GLOB 'later-*'", [LONG_AGO]).unwrap();
+        }
+        let (before, first) = (left(backlog), steps.len());
+        let deadline = std::time::Instant::now() + Duration::from_secs(240);
+        while left(backlog) > 0 && std::time::Instant::now() < deadline {
+            steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
+        }
+        phases.push(json!({"backlog": backlog, "rows_when_steps_began": before, "rows_left": left(backlog), "steps": steps.len() - first}));
+    }
+    stop.store(true, Ordering::SeqCst);
+    let waits = polling.join().unwrap();
+    let reclaimed = left("start") == 0 && left("later") == 0;
+    let kept: i64 = db.query_row("SELECT count(*) FROM observations WHERE observation_ref GLOB 'kept-*'", [], |r| r.get(0)).unwrap();
+    let unknown_kept: i64 = db.query_row("SELECT count(*) FROM operations WHERE operation_ref = 'unknown-op'", [], |r| r.get(0)).unwrap();
+    let slowest_status = waits.iter().map(|w| w.0).max().unwrap_or(0);
+    let slowest_step = steps.iter().copied().max().unwrap_or(0);
+    work_artifact("retention-backlog", json!({"backlog_rows": {"start": 280_000, "later": 280_000}, "phases": phases,
+        "startup_ms": startup_ms, "slowest_step_ms": slowest_step, "median_step_ms": if steps.is_empty() { 0 } else { median(&steps) }, "steps_ms": steps,
+        "status_reads": waits.len(), "slowest_status_ms": slowest_status, "status_failures": waits.iter().filter(|w| !w.1).count(),
+        "reclaimed": reclaimed, "kept_observations": kept, "unknown_receipt_kept": unknown_kept == 1}));
+    assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+    // Half the console's attention deadline (4 s); a disk's own fsync stalls fit.
+    assert!(slowest_status < 2000, "a status read waited {slowest_status} ms");
+    assert!(waits.iter().all(|w| w.1), "a status read failed");
+    assert!(slowest_step < 2000, "a step waited {slowest_step} ms");
+    assert!(reclaimed, "old settled evidence was not reclaimed: {phases:?}");
+    assert_eq!(kept, 20, "young or uncertain evidence was reclaimed");
+    assert_eq!(unknown_kept, 1, "an unknown receipt was reclaimed");
 }

@@ -185,11 +185,13 @@ fn note_from_row(r: &Row<'_>) -> rusqlite::Result<(AppNote, String)> {
 
 /// Retention for the timeline tables, inside the journal's retention
 /// transaction. Events of tasks the journal still retains are pruned with
-/// their task (see `Journal::enforce_retention`); here: events with no task or
-/// an unknown task, settled attention items, and the event row cap.
+/// their task (see `Journal::enforce_retention`); here: events with no task,
+/// an unknown task or a task already pruned (written after it was), settled
+/// attention items, and the event row cap.
 pub(crate) fn prune(tx: &Transaction<'_>, cutoff: &str) -> Result<usize> {
     let mut deleted = tx.execute(
-        "DELETE FROM timeline_events WHERE at <= ?1 AND (task_ref IS NULL OR task_ref NOT IN (SELECT task_ref FROM tasks))",
+        "DELETE FROM timeline_events WHERE at <= ?1 AND (task_ref IS NULL
+           OR NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_ref = timeline_events.task_ref AND tasks.pruned_at IS NULL))",
         [cutoff],
     )?;
     deleted += tx.execute(

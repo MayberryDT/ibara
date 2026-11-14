@@ -1165,3 +1165,75 @@ fn activity_recorder_health_and_content_free_error_categories_through_process() 
     assert_eq!(disabled["result"]["recording"]["enabled"],false,"{disabled}");
     if let Some(out)=std::env::var_os("IBARA_ACTIVITY_E2E_OUT") {std::fs::create_dir_all(&out).unwrap();std::fs::write(Path::new(&out).join("recording-health.json"),serde_json::to_vec_pretty(&json!({"health":health,"invalid":bad,"facts":facts,"unavailable_spool":failure_health,"disabled":disabled})).unwrap()).unwrap();}
 }
+
+// Journal retention and ended tasks' attention (14 November 2026). Ways the
+// repair could fail, written before it:
+// - An existing journal has no task_ref indexes, so every old task's evidence
+//   lookup scans whole tables: startup and each new step stall (AK2, BMAX).
+// - Adding the indexes, or anything else, to an existing journal loses
+//   retained evidence or makes ibarad slow to start.
+// - Every pass visits again each old task it already pruned, so its cost grows
+//   with all history (BMAX: 868 such tasks, 19 s a pass without indexes).
+// - One pass with a large backlog holds ibarad's single thread past the
+//   console's deadlines (attention 4 s, status 6 s), at start or between steps.
+// - A bounded pass stops reclaiming old settled evidence, or reclaims young or
+//   uncertain evidence.
+// - Sign-in requests of tasks that ended long ago stay open, and counted,
+//   forever (Dell: 30 on partial and blocked tasks), at start and while running.
+// - Closing them also closes a request a later task may still continue.
+
+const LONG_AGO: &str = "2020-01-01T00:00:00.000Z";
+
+/// The journal of an installation from before the repair: without its indexes and column.
+fn as_before_retention_repair(db: &rusqlite::Connection) {
+    for index in ["leases_task", "operations_task", "observations_task", "checks_task", "checkpoints_task", "jobs_task", "tasks_unpruned"] {
+        db.execute_batch(&format!("DROP INDEX IF EXISTS {index}")).unwrap();
+    }
+    let marked: bool = db.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name = 'pruned_at'", [], |r| r.get(0)).unwrap();
+    if marked {
+        db.execute_batch("ALTER TABLE tasks DROP COLUMN pruned_at").unwrap();
+    }
+}
+
+/// `count` tasks `<prefix>1`… in `state`, last updated at `at`.
+fn seed_tasks(db: &rusqlite::Connection, prefix: &str, count: u32, state: &str, at: &str) {
+    db.execute_batch(&format!(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{count})
+         INSERT INTO tasks(task_ref,principal,created_at,updated_at,state,goal,success_criteria,budgets,client_flags,required_capabilities)
+         SELECT '{prefix}'||x,'test','{at}','{at}','{state}','old','[]','{{}}','{{}}','[]' FROM n;"
+    )).unwrap();
+}
+
+fn stopped(daemon: &mut Daemon) -> rusqlite::Connection {
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap()
+}
+
+fn restart_ms(daemon: &mut Daemon) -> u128 {
+    let started = std::time::Instant::now();
+    daemon.crash_and_restart();
+    started.elapsed().as_millis()
+}
+
+#[test]
+fn retention_with_old_empty_tasks_does_not_stall_daemon_startup() {
+    let mut daemon = Daemon::start_with_policy("retention-latency", false, capacity_policy(512 * 1024 * 1024, 512 * 1024 * 1024));
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    db.execute_batch("BEGIN").unwrap();
+    seed_tasks(&db, "old-", 960, "completed", LONG_AGO);
+    db.execute_batch(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+         INSERT INTO observations(observation_ref,task_ref,principal,record)
+         SELECT 'proof-'||x,'recent','test',json_object('proof',hex(zeroblob(2048))) FROM n;
+         COMMIT;",
+    ).unwrap();
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let count: u64 = db.query_row("SELECT count(*) FROM observations", [], |r| r.get(0)).unwrap();
+    work_artifact("retention-latency", json!({"old_tasks": 960, "retained_observations": count, "startup_ms": startup_ms}));
+    assert_eq!(count, 20000, "retention must preserve recent evidence");
+    assert!(startup_ms < 2000, "retention blocked daemon startup for {startup_ms} ms");
+}

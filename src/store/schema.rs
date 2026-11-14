@@ -30,6 +30,8 @@
 //!   person's logins). SQLite cannot change a CHECK in place, so the table is
 //!   rebuilt once with the same columns and rows; an older build reads the
 //!   rows as they are and never writes that kind.
+//! - Indexes on `task_ref` for retention ([`RETENTION_INDEXES`]). An older
+//!   build keeps them up to date without using them.
 //!
 //! Well-known agents' short names (`codex@vesper`, formerly
 //! `codex-mcp-client@vesper`) need no version either: at every open, what an
@@ -173,6 +175,7 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
     if !attention_sql.contains("'login'") {
         tx.execute_batch(ATTENTION_WITH_LOGIN)?;
     }
+    tx.execute_batch(RETENTION_INDEXES)?;
     crate::access::rename_agents(&tx)?;
     if from < CORE_SCHEMA_VERSION {
         tx.execute(
@@ -550,6 +553,20 @@ const ATTENTION_WITH_LOGIN: &str = r#"
       DROP TABLE attention_items;
       ALTER TABLE attention_items_login RENAME TO attention_items;
       CREATE INDEX IF NOT EXISTS attention_items_open ON attention_items(state, task_ref);
+    "#;
+
+/// Retention finds and deletes each old task's evidence by `task_ref`; without
+/// these every lookup scans its whole table (AK2 and BMAX, October and
+/// November 2026). The names are those added by hand to AK2's and Dell's
+/// journals, which therefore keep theirs. On an existing journal each is
+/// built once, in one pass over its table, when ibarad starts.
+const RETENTION_INDEXES: &str = r#"
+      CREATE INDEX IF NOT EXISTS leases_task ON leases(task_ref);
+      CREATE INDEX IF NOT EXISTS operations_task ON operations(task_ref);
+      CREATE INDEX IF NOT EXISTS observations_task ON observations(task_ref);
+      CREATE INDEX IF NOT EXISTS checks_task ON checks(task_ref);
+      CREATE INDEX IF NOT EXISTS checkpoints_task ON checkpoints(task_ref);
+      CREATE INDEX IF NOT EXISTS jobs_task ON jobs(task_ref);
     "#;
 
 /// Core schema 6: the windows each task opened.

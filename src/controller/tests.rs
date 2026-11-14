@@ -33,6 +33,7 @@ mod interaction2;
 mod interaction3;
 mod interaction4;
 mod interaction5;
+mod friction;
 
 /// The viewer certificate `vesper` registered.
 const CERT: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
@@ -76,6 +77,8 @@ struct FakeDesktop {
     extension: RefCell<HashMap<String, Value>>,
     /// The extension operations asked for, in order.
     extension_ops: RefCell<Vec<String>>,
+    /// The same operations with the arguments they were asked with.
+    extension_args: RefCell<Vec<(String, Value)>>,
     /// Scripted reader replies for races across changing browser state.
     reader_replies: RefCell<HashMap<String, std::collections::VecDeque<Value>>>,
     /// The next this many page reader requests (tabs included) are refused
@@ -297,6 +300,7 @@ impl DesktopPort for FakeDesktop {
     fn browser_call<'a>(&'a self, op: &'a str, args: Value, _: bool) -> LocalFuture<'a, crate::error::Result<Value>> {
         Box::pin(async move {
             self.extension_ops.borrow_mut().push(op.to_string());
+            self.extension_args.borrow_mut().push((op.to_string(), args.clone()));
             self.hold(op).await;
             self.reader_refused()?;
             if let Some(reply) = self.reader_replies.borrow_mut().get_mut(op).and_then(|replies| replies.pop_front()) {

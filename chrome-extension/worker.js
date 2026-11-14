@@ -27,7 +27,13 @@ chrome.webNavigation.onBeforeNavigate.addListener(d=>{
 });
 const frameSettled=d=>{const frames=pendingFrames.get(d.tabId);frames?.delete(d.frameId);if(!frames?.size)pendingFrames.delete(d.tabId);};
 // Navigation stops blocking discovery once the new document has committed.
-// Captures and input still bind its document ID and the navigation epoch.
+// A capture binds the navigation epoch of the whole tab. Input binds only
+// the documents an element depends on, the page and the frames between it
+// and the element: an advertisement's frame reloading elsewhere on the page
+// changes neither.
+const loading=(tabId,frames)=>frames.some(f=>pendingFrames.get(tabId)?.has(f));
+// Why the observed tab can no longer take input.
+const away=async tabId=>{const tab=await chrome.tabs.get(tabId).catch(()=>null);return !tab?'closed':tab.incognito||!web(tab.url)?'navigated':'unfocused';};
 chrome.webNavigation.onCommitted.addListener(frameSettled);
 chrome.webNavigation.onCompleted.addListener(frameSettled);
 chrome.webNavigation.onErrorOccurred.addListener(frameSettled);
@@ -364,7 +370,7 @@ async function handle(m,jobs) {
       }
     }
     const tab=await focusedTab(m.args.tabId);
-    if(!tab||!fresh(m))return {result:{refused:true}};
+    if(!tab||!fresh(m))return {result:{refused:true,why:tab?'late':await away(m.args.tabId)}};
     const inventory=await chrome.webNavigation.getAllFrames({tabId:tab.id});
     const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
     if(!rootId)return refused();
@@ -382,10 +388,13 @@ async function handle(m,jobs) {
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }
     const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);
-    if(pendingFrames.has(tab.id)||snapshot?.epoch!==(frameEpoch.get(tab.id)||0))return {result:{refused:true}};
-    if(!route||snapshot.tabId!==tab.id||snapshot.rootId!==rootId||m.args.documentId!==rootId)return {result:{refused:true}};
+    const refuse=why=>({result:{refused:true,why}});
+    if(!route||snapshot.tabId!==tab.id)return refuse('expired');
+    if(loading(tab.id,[0]))return refuse('loading');
+    if(snapshot.rootId!==rootId||m.args.documentId!==rootId)return refuse('navigated');
     const path=await framePath(tab.id,route.documentId,rootId);
-    if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return {result:{refused:true}};
+    if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return refuse('navigated');
+    if(loading(tab.id,path.map(step=>step.child.frameId)))return refuse('loading');
     for(let i=0;i<path.length;i++)path[i].token=route.path[i].token;
     const zoom=m.op==='locate'?await chrome.tabs.getZoom(tab.id):undefined;
     if(!fresh(m))return refused();
@@ -406,7 +415,8 @@ async function handle(m,jobs) {
     if(m.op==='locate'&&answer.watch){
       const freshPath=await framePath(tab.id,route.documentId,rootId);
       if(freshPath?.length===path.length)for(let i=0;i<path.length;i++)freshPath[i].token=path[i].token;
-      answer=freshPath&&!pendingFrames.has(tab.id)&&snapshot.epoch===(frameEpoch.get(tab.id)||0)?{...answer,...await mapPoint(tab.id,freshPath,answer)}:{refused:true};
+      const moved=!freshPath?'navigated':loading(tab.id,[0,...freshPath.map(step=>step.child.frameId)])?'loading':'';
+      answer=moved?{refused:true,why:moved}:{...answer,...await mapPoint(tab.id,freshPath,answer)};
       if(answer.refused||answer.covered)armed=null;
     }
     return {result:{...answer,documentId:rootId,...(zoom!==undefined?{zoom}:{})}};

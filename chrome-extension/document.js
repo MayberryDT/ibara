@@ -294,16 +294,16 @@ export async function documentOperation(message) {
   // Why a request found nothing, for the agent: the tab is hidden, the page
   // answered too late, went to another address or no longer holds the
   // observation, or the element is gone, changed or no longer unique.
-  let missing='';
+  let missing='',changed='';
   const unsafe=()=>document.visibilityState==='visible'?'late':'hidden';
-  const refuse=(why=missing)=>({refused:true,...(why?{why}:{})});
+  const refuse=(why=missing)=>({refused:true,...(why?{why}:{}),...(why==='changed'&&changed?{changed}:{})});
   if(!safe())return refuse(unsafe());
   const args=message.args;
   const normalize=s=>(s||'').replace(/\s+/g,' ').trim();
   // This global belongs only to the extension's isolated world, not page
   // scripts. An updated extension can meet the state and press listener its
   // previous copy left in an open page, so the key changes whenever they do.
-  const key='__ibaraPageReaderV7';
+  const key='__ibaraPageReaderV8';
   const state=globalThis[key] ||= {captures:new Map(),identities:new WeakMap(),watch:null,listening:false,selecting:null,located:null,port:null};
   if(!state.listening){
     // Which element the next trusted press reached, whether it submitted a
@@ -356,7 +356,11 @@ export async function documentOperation(message) {
   // that draws the element again replaces its node: the one element on the
   // page with exactly the same meaning is then the same element; two are
   // ambiguous. No age limit: a step held for a person's approval may run
-  // minutes later.
+  // minutes later. A changed element says what changed: it is hidden (or no
+  // longer a control), or its role, name, actions (disabled), address or
+  // context (the card or row text around it) differ.
+  const difference=(was,now)=>!now?'hidden':now.role!==was.role?'role':now.name!==was.name?'name':
+    String(now.actions)!==String(was.actions)?(now.states.includes('disabled')?'disabled':'actions'):now.href!==was.href?'address':'context';
   const find=()=>{
     const capture=state.captures.get(args.capture);
     const old=capture?.targets.get(args.token);
@@ -367,7 +371,7 @@ export async function documentOperation(message) {
       let current;
       collect('',(el,node)=>{if(el===old.el)current=pack(el,node);});
       if(current&&meaningOf(current)===meaning)return old.el;
-      missing='changed';return null;
+      missing='changed';changed=difference(old.packed,current);return null;
     }
     const found=sameMeaning(meaning);
     if(found.length===1){old.el=found[0];return found[0];}

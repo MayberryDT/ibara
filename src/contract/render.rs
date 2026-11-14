@@ -161,7 +161,7 @@ fn render_error(err: &Value, out: &mut String) {
     }
     if let Value::Object(map) = err {
         for (key, value) in map {
-            if !matches!(key.as_str(), "code" | "message" | "retry_safe" | "requires_reconciliation" | "next" | "field") {
+            if !matches!(key.as_str(), "code" | "message" | "retry_safe" | "requires_reconciliation" | "next" | "field" | "recovery_frame") {
                 flags.push(format!("{key}: {}", short(value)));
             }
         }
@@ -170,6 +170,11 @@ fn render_error(err: &Value, out: &mut String) {
         let _ = write!(out, "\n{}", flags.join(" · "));
     }
     render_next(err.get("next"), out);
+    // The screen as it is now, readable as any frame: the agent chooses from it.
+    if let Some(frame) = err.get("recovery_frame") {
+        out.push_str("\nrecovery_frame, the screen now:");
+        render_frame(frame, out);
+    }
 }
 
 /// Next moves, one per line and never cut: they are what the agent does next.

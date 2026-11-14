@@ -294,13 +294,19 @@ impl Controller {
         let task = hint
             .and_then(|t| self.journal.readable_task(principal, &t).ok().flatten())
             .or_else(|| if holds { lease.as_ref().and_then(|l| self.journal.get_task(&l.task_ref).ok().flatten()) } else { None });
+        // A page target refused before any input comes back with the screen
+        // as it is now, so the next call can choose from it instead of
+        // observing. Only for browser_act: page references keep their
+        // element's identity across frames, while a new frame renumbers the
+        // windows, native elements and choices an agent's next call may still
+        // name from the frame before.
         if tool=="browser_act" && holds && !cancel.is_cancelled() {
             if let (Err(error),Some(task),Some(lease))=(&mut outcome,task.as_ref(),lease.as_ref()) {
-                if matches!(error.code,"STALE_TARGET"|"AMBIGUOUS_TARGET") && error.details.get("execution_not_started")==Some(&json!(true)) && self.assert_authority(lease).is_ok() {
+                if matches!(error.code,"STALE_TARGET"|"AMBIGUOUS_TARGET"|"BLOCKED_BY_DIALOG") && error.details.get("execution_not_started")==Some(&json!(true)) && self.assert_authority(lease).is_ok() {
                     let spec=FrameSpec {view:View::Elements,surface:None,limit:Some(30),..FrameSpec::default()};
                     if let Ok((frame,_))=self.build_frame(task,lease,&spec).await {
                         error.details.insert("recovery_frame".into(),json!(frame.frame));
-                        error.details.insert("next".into(),json!("No input was sent. Choose a distinguishable target from recovery_frame; narrow the observation with a query if needed. Make a new explicit action; no effect was replayed."));
+                        error.details.entry("next").or_insert_with(||json!("Choose from recovery_frame, the screen as it is now, without observing again; nothing was replayed."));
                     }
                 }
             }
@@ -3861,29 +3867,47 @@ fn page_address(url: &str) -> String {
     clip(url.split(['?', '#']).next().unwrap_or(url), 120)
 }
 
-/// The extension's refusals before any input: the page changed since it was
-/// observed, something covers the element, or it has not stopped moving.
+/// The extension's refusals before any input, each with its cause: the page
+/// or the element changed since it was observed, something covers the
+/// element, or it has not stopped moving. A refused `browser_act` comes back
+/// with the screen as it is now (`recovery_frame`), so most need no `next` of
+/// their own.
 fn page_refusal(data: &Value) -> Result<()> {
+    let refuse = |code: &'static str, message: &str, next: Option<&str>| {
+        let e = fail(code, format!("{message}; nothing was sent."), true).with("execution_not_started", true);
+        Err(match next { Some(next) => e.with("next", next), None => e })
+    };
     if data.get("covered").and_then(Value::as_bool) == Some(true) {
-        return Err(fail("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog); deal with it, then observe again.", true)
-            .with("execution_not_started", true));
+        return refuse("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog)", Some("Deal with what covers it, then choose again."));
     }
     if data.get("moving").and_then(Value::as_bool) == Some(true) {
-        return Err(fail("STALE_TARGET", "That element is still moving (an animation, or the page is still loading); try again.", true)
-            .with("execution_not_started", true));
+        return refuse("STALE_TARGET", "That element is still moving (an animation, or the page is still loading)", Some("Try again."));
     }
     if data.get("refused").and_then(Value::as_bool) == Some(true) {
-        let (code, message) = match data.get("why").and_then(Value::as_str).unwrap_or("") {
-            "hidden" => ("STALE_TARGET", "The tab is hidden behind another tab or window; focus the browser window with computer_act, then observe surface \"tab\"."),
-            "late" => ("STALE_TARGET", "The page did not answer in time; observe again."),
-            "expired" => ("STALE_TARGET", "That page observation is no longer held (the page keeps its four latest); observe surface \"tab\" again."),
-            "navigated" => ("STALE_TARGET", "The page went to another address since it was observed; observe again."),
-            "changed" => ("STALE_TARGET", "That element changed since it was observed (its name, state, place or visibility); observe again."),
-            "gone" => ("STALE_TARGET", "That element is no longer on the page; observe again."),
-            "ambiguous" => ("AMBIGUOUS_TARGET", "The page drew that element again and now more than one element matches it; observe again."),
-            _ => ("STALE_TARGET", "The page changed since it was observed, or the tab is not focused; observe again."),
+        let wait = Some("Wait for the page (browser_act wait_for), then choose again.");
+        let (code, message, next) = match (data.get("why").and_then(Value::as_str).unwrap_or(""), data.get("changed").and_then(Value::as_str).unwrap_or("")) {
+            ("hidden", _) => ("STALE_TARGET", "The tab is hidden behind another tab or window", Some("Focus the browser window with computer_act, then choose again.")),
+            ("unfocused", _) => ("STALE_TARGET", "That tab is not the active tab of the focused browser window now", Some("Focus the browser window and that tab with computer_act, then choose again.")),
+            ("closed", _) => ("STALE_TARGET", "That tab was closed", None),
+            ("late", _) => ("STALE_TARGET", "The page did not answer in time", Some("Try again.")),
+            ("loading", _) => ("STALE_TARGET", "The page, or the frame that holds that element, is loading another address", wait),
+            ("expired", _) => ("STALE_TARGET", "That page observation is no longer held (the page keeps its four latest)", None),
+            ("navigated", _) => ("STALE_TARGET", "The page, or the frame that holds that element, went to another document since it was observed", None),
+            ("changed", "context") => ("STALE_TARGET", "The text around that element (its card or row) changed since it was observed, so it may belong to another record now",
+                Some("Choose it again from the page as it is now. If that text keeps changing (a live counter, a game), click the element's point on a fresh picture with computer_act instead.")),
+            ("changed", "name") => ("STALE_TARGET", "That element's name changed since it was observed", None),
+            ("changed", "disabled") => ("STALE_TARGET", "That element is disabled now", Some("Wait for it to be enabled (browser_act wait_for), or choose another element.")),
+            ("changed", "hidden") => ("STALE_TARGET", "That element is hidden now", None),
+            ("changed", "actions") => ("STALE_TARGET", "That element takes different actions now", None),
+            ("changed", "address") => ("STALE_TARGET", "That link goes to another address now", None),
+            ("changed", "role") => ("STALE_TARGET", "That element is another kind of control now", None),
+            ("changed", _) => ("STALE_TARGET", "That element changed since it was observed (its name, its state or the text around it)", None),
+            ("gone", _) => ("STALE_TARGET", "That element is no longer on the page", None),
+            ("ambiguous", _) => ("AMBIGUOUS_TARGET", "The page drew that element again and now more than one element matches it", None),
+            // An older page reader gives no reason.
+            _ => ("STALE_TARGET", "The page changed since it was observed, or the tab is not focused", None),
         };
-        return Err(fail(code, message, true).with("execution_not_started", true));
+        return refuse(code, message, next);
     }
     Ok(())
 }

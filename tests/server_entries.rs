@@ -1384,3 +1384,59 @@ fn retention_backlog_does_not_delay_status() {
     assert_eq!(kept, 20, "young or uncertain evidence was reclaimed");
     assert_eq!(unknown_kept, 1, "an unknown receipt was reclaimed");
 }
+
+#[test]
+fn ended_task_attention_closes_at_start_and_while_running() {
+    let mut daemon = Daemon::start_with("attention-ended", true);
+    let db = stopped(&mut daemon);
+    let ago = |modifier: &str| -> String { db.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now',?)", [modifier], |r| r.get(0)).unwrap() };
+    let login = r#"{"assistance":{"version":1,"revision":0,"notification":"attention"},"sites":[{"site":"accounts.test","state":"asking"}]}"#;
+    let raise = |task: &str, state: &str, ended: &str, att: &str, kind: &str| {
+        seed_tasks(&db, task, 1, state, ended);
+        db.execute(
+            "INSERT INTO attention_items(att_ref,task_ref,principal,kind,question,details,state,created_at) VALUES(?,?,'test',?,'Sign in to accounts.test?',?,'open',?)",
+            rusqlite::params![att, format!("{task}1"), kind, if kind == "login" { Some(login) } else { None }, ended],
+        ).unwrap();
+    };
+    // Dell, 14 November: 30 sign-in requests of partial and blocked tasks that ended 10 to 25 days earlier.
+    for i in 0..30 {
+        raise(&format!("ended-{i}-"), if i < 25 { "partial" } else { "blocked" }, &ago(&format!("-{} hours", 240 + i * 12)), &format!("att_ended_{i}"), "login");
+    }
+    // A request of a task that ended an hour ago: a later task may still continue it.
+    raise("recent-", "partial", &ago("-1 hours"), "att_recent", "login");
+    // Other kinds of item close with their task, as before.
+    raise("question-", "blocked", &ago("-20 days"), "att_question", "question");
+    // An old task's request no longer keeps its evidence from retention.
+    raise("old-", "partial", &ago("-40 days"), "att_old", "login");
+    db.execute("INSERT INTO observations(observation_ref,task_ref,principal,record) VALUES('old-proof','old-1','test','{}')", []).unwrap();
+    let open = |db: &rusqlite::Connection| -> Vec<String> {
+        db.prepare("SELECT att_ref FROM attention_items WHERE state = 'open' ORDER BY att_ref").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    };
+    let open_before = open(&db).len();
+    let two_days_ago = ago("-2 days");
+    drop(db);
+    daemon.crash_and_restart();
+    let mut agent = Agent::start(&daemon, "codex");
+    let started = situation(&agent.call("computer_status", json!({}))).to_string();
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let open_after_start = open(&db);
+    let old_evidence: i64 = db.query_row("SELECT count(*) FROM observations WHERE observation_ref = 'old-proof'", [], |r| r.get(0)).unwrap();
+    // While ibarad runs, the remaining request's task has now ended two days ago.
+    db.execute("UPDATE tasks SET updated_at = ? WHERE task_ref = 'recent-1'", [&two_days_ago]).unwrap();
+    let waited = std::time::Instant::now();
+    while !open(&db).is_empty() && waited.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let open_while_running = open(&db);
+    let closed_after_ms = waited.elapsed().as_millis();
+    let running = situation(&agent.call("computer_status", json!({}))).to_string();
+    work_artifact("attention-ended", json!({"open_before_start": open_before, "open_after_start": open_after_start,
+        "situation_after_start": started, "old_task_evidence_left": old_evidence, "open_while_running": open_while_running,
+        "closed_while_running_after_ms": closed_after_ms, "situation_while_running": running}));
+    assert_eq!(open_after_start, ["att_recent"], "{started}");
+    assert!(started.contains(" 1 attention"), "{started}");
+    assert_eq!(old_evidence, 0, "an expired request still kept its old task's evidence");
+    assert!(open_while_running.is_empty(), "still open after {closed_after_ms} ms: {open_while_running:?}");
+    assert!(running.contains(" 0 attention"), "{running}");
+}

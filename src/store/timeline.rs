@@ -9,7 +9,7 @@
 use super::clip;
 use super::journal::{Journal, parse_json};
 use crate::error::{Result, invalid};
-use crate::ids::id;
+use crate::ids::{id, iso_from_millis, millis_from_iso, now_millis};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +24,10 @@ const MAX_TEXT_CHARS: usize = 4_000;
 const MAX_KEY_CHARS: usize = 256;
 const MAX_OPTIONS: usize = 20;
 const MAX_LIST: i64 = 500;
+/// How long a sign-in request outlives the partial, blocked or interrupted
+/// task that raised it, so a later task can continue it
+/// (`login: {action: "continue"}`). After that no agent is coming back for it.
+pub const LOGIN_CONTINUATION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// One timeline event. `id` is the revision: strictly increasing, never reused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,6 +185,11 @@ fn note_from_row(r: &Row<'_>) -> rusqlite::Result<(AppNote, String)> {
         },
         r.get("fact")?,
     ))
+}
+
+/// Tasks that ended before this no longer keep their sign-in requests.
+fn continuation_cutoff(now_iso: &str) -> String {
+    iso_from_millis(millis_from_iso(now_iso).unwrap_or_else(now_millis) - LOGIN_CONTINUATION_MS)
 }
 
 /// Retention for the timeline tables, inside the journal's retention
@@ -393,11 +402,15 @@ impl Journal {
             (None, Some(t)) => self.list_attention(Some("open"), Some(t), MAX_LIST)?,
             (None, None) => return Err(invalid("Name an attention item or a task.")),
         };
-        // Only non-secret login assistance survives a released/partial task.
-        // Explicit expiry, completed/cancelled work and all old effect approvals still expire.
+        // Only non-secret login assistance survives a released/partial task,
+        // for LOGIN_CONTINUATION_MS after it ended. Explicit expiry,
+        // completed/cancelled work and all old effect approvals still expire.
         if att_ref.is_none() {
             if let Some(task_ref) = task_ref {
-                let keep_assistance = self.get_task(task_ref)?.is_some_and(|t| !matches!(t.state.as_str(), "completed" | "cancelled"));
+                let since = continuation_cutoff(now_iso);
+                let keep_assistance = self
+                    .get_task(task_ref)?
+                    .is_some_and(|t| !matches!(t.state.as_str(), "completed" | "cancelled") && t.updated_at > since);
                 if keep_assistance {
                     open.retain(|item| !(item.kind == "login" && item.details.pointer("/assistance/version").and_then(Value::as_u64) == Some(1)));
                 }
@@ -427,8 +440,9 @@ impl Journal {
 
     /// Expire the open items of every task that has ended (finished, or
     /// interrupted when its control ended): no agent is left to read an
-    /// answer. Items that belong to no task (access requests) stay. Returns
-    /// how many expired.
+    /// answer. A sign-in request stays for [`LOGIN_CONTINUATION_MS`] after
+    /// a partial, blocked or interrupted task ended. Items that belong to no
+    /// task (access requests) stay. Returns how many expired.
     pub fn expire_attention_of_ended_tasks(&self, actor: &str, now_iso: &str) -> Result<usize> {
         let ended: Vec<String> = self
             .db()
@@ -437,6 +451,25 @@ impl Journal {
                  WHERE a.state = 'open' AND t.state NOT IN ('active', 'created', 'waiting_for_human')",
             )?
             .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut expired = 0;
+        for task_ref in &ended {
+            expired += self.expire_attention(None, Some(task_ref), actor, now_iso)?;
+        }
+        Ok(expired)
+    }
+
+    /// While ibarad runs: expire the sign-in requests of tasks that ended
+    /// more than [`LOGIN_CONTINUATION_MS`] ago and that no later task
+    /// continued (continuing moves a request to the new task).
+    pub fn expire_unclaimed_logins(&self, actor: &str, now_iso: &str) -> Result<usize> {
+        let ended: Vec<String> = self
+            .db()
+            .prepare_cached(
+                "SELECT DISTINCT a.task_ref FROM attention_items a JOIN tasks t ON t.task_ref = a.task_ref
+                 WHERE a.state = 'open' AND a.kind = 'login' AND t.state NOT IN ('active', 'created', 'waiting_for_human') AND t.updated_at <= ?",
+            )?
+            .query_map([continuation_cutoff(now_iso)], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut expired = 0;
         for task_ref in &ended {

@@ -1,3 +1,8 @@
+# Unreleased
+
+- Keep computers answering while the journal retention pass runs. Old task evidence is found through indexes, built once on an existing journal when ibarad starts. A task whose evidence is gone is not read again, and each pass stops after 100 ms or 1,000 deleted rows outside metadata pressure, so its cost no longer grows with history.
+- Close sign-in requests 24 hours after their partial, blocked or interrupted task ended, while running and at startup, so they stop counting as attention. A later task can still continue a request within that time.
+
 # 0.3.7
 
 - Keep sign-up proposal details out of the saved popup dismissal file. Dismissals store only a fingerprint, and files from earlier versions are converted when the console loads. A damaged entry in that file no longer stops dismissals from working.

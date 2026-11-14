@@ -2180,7 +2180,19 @@ impl Controller {
                 .or_else(|| self.frames.borrow().recent_browser(frame, target))
                 .ok_or_else(|| fail("STALE_TARGET", format!("action.target: {} is not in the page's latest observations; observe again", clip(target, 40)), true))?;
             if node.states.iter().any(|s| matches!(s.as_str(), "ambiguous" | "context_truncated")) {
-                return Err(fail("AMBIGUOUS_TARGET", format!("{target} is not distinguishable from another element; observe with a query."), true));
+                // Elements alike in role, name and the text around them: a
+                // query matches them all; only their places tell them apart.
+                let alike: Vec<&str> = frame.browser.iter()
+                    .filter(|n| n.id != node.id && n.role == node.role && n.name == node.name && n.context == node.context)
+                    .map(|n| n.id.as_str()).take(8).collect();
+                let what = format!("{target} ({} \"{}\")", node.role, squash(&node.name, 40));
+                let message = if alike.is_empty() {
+                    format!("{what} cannot be told apart from another element on the page by its role, name and the text around it, so nothing was sent.")
+                } else {
+                    format!("{what} is alike in role, name and the text around it with {}, so ibara cannot tell which one you mean; nothing was sent.", alike.join(", "))
+                };
+                return Err(fail("AMBIGUOUS_TARGET", message, true).with("execution_not_started", true)
+                    .with("next", "Their places tell them apart: take a picture (computer_observe with view \"image\") and click the one you mean at its point with computer_act; for a field, type into it with computer_act after that click."));
             }
             if !node.actions.iter().any(|a| a == wanted) {
                 if node.states.iter().any(|s| s == "disabled") {
@@ -3921,7 +3933,11 @@ fn page_refusal(data: &Value) -> Result<()> {
             .with("next", "Release the pointer as a person would, with Escape (browser_act key \"Escape\"; the page may react to the key too), then click again. Or use the page's own keyboard shortcut for that control."));
     }
     if data.get("covered").and_then(Value::as_bool) == Some(true) {
-        return refuse("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog)", Some("Deal with what covers it, then choose again."));
+        let next = Some("Deal with what covers it (close it, or scroll so the element is clear), then choose again.");
+        return match data.get("cover").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+            Some(cover) => refuse("BLOCKED_BY_DIALOG", &format!("{} covers that element", clip(cover, 80)), next),
+            None => refuse("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog)", next),
+        };
     }
     if data.get("moving").and_then(Value::as_bool) == Some(true) {
         return refuse("STALE_TARGET", "That element is still moving (an animation, or the page is still loading)", Some("Try again."));

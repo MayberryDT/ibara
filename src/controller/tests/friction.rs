@@ -30,6 +30,11 @@
 //!    javascript:, mailto:) is opened, or refused without naming the accepted
 //!    forms with an example, or a file:// address without the routes that
 //!    show a file of the computer.
+//!
+//! Ambiguous and covered page targets:
+//! 10. An ambiguous target's refusal sends the agent to "observe with a
+//!    query", which cannot tell lookalikes apart, and names none of them.
+//! 11. A covered target's refusal does not say what covers it.
 use super::*;
 
 fn text(env: &Value) -> String {
@@ -199,6 +204,38 @@ fn navigate_opens_a_bare_host_as_https_and_names_the_forms_it_takes() {
             assert_eq!(env["error"]["execution_not_started"], true, "{given}: {env}");
         }
         assert_eq!(opened().len(), before, "nothing else opened");
+        assert_eq!(rig.desktop.acts(), 0);
+    });
+}
+
+#[test]
+fn an_ambiguous_page_target_names_its_lookalikes_and_the_route_that_tells_them_apart() {
+    run(async {
+        let rig = browser_rig();
+        // Three unnamed fields in one form; the page reader marks them ambiguous.
+        let field = |id: &str, token: &str| json!({ "role": "textbox", "name": "", "actions": ["click", "fill"], "states": ["enabled", "ambiguous"], "ancestor": "form:Profile", "elementId": id, "token": token });
+        page(&rig, "d1", "c1", json!([field("first", "t1"), field("second", "t2"), field("third", "t3"),
+            { "role": "button", "name": "Save", "actions": ["click"], "states": ["enabled"], "elementId": "save", "token": "t4" }]));
+        let task = observe_page(&rig.controller).await;
+        let env = call(&rig.controller, "browser_act", json!({"task_ref": task, "request_id": "ambiguous-1", "action": {"kind": "type", "target": "b2", "text": "Dana"}})).await;
+        assert_eq!(code(&env), "AMBIGUOUS_TARGET", "{env}");
+        let message = env["error"]["message"].as_str().unwrap();
+        assert!(message.contains("b1") && message.contains("b3") && !message.contains("observe with a query"), "names the lookalikes: {env}");
+        assert!(env["error"]["next"].as_str().unwrap().contains("view \"image\""), "the picture tells them apart: {env}");
+        assert_eq!(rig.desktop.acts(), 0);
+    });
+}
+
+#[test]
+fn a_covered_page_target_names_what_covers_it() {
+    run(async {
+        let rig = browser_rig();
+        shop(&rig);
+        let task = observe_page(&rig.controller).await;
+        rig.desktop.extension.borrow_mut().insert("locate".into(), json!({"covered": true, "cover": "dialog \"Cookie choices\""}));
+        let env = call(&rig.controller, "browser_act", click_next(&task, "covered-2")).await;
+        assert_eq!(code(&env), "BLOCKED_BY_DIALOG", "{env}");
+        assert!(env["error"]["message"].as_str().unwrap().starts_with("dialog \"Cookie choices\" covers that element"), "{env}");
         assert_eq!(rig.desktop.acts(), 0);
     });
 }

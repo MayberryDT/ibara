@@ -501,7 +501,12 @@ export async function documentOperation(message) {
       rest=Math.abs(after[0]-before[0])<=1&&Math.abs(after[1]-before[1])<=1&&(!point||reaches(el,hitAt(point.x,point.y)));
     }
     if(!rest)return {moving:true};
-    if(!point)return {covered:true};
+    if(!point){
+      // What is on top at the element's centre (within the window): the
+      // agent's next move depends on whether it is a dialog, a banner or a panel.
+      const [x,y]=centre(el),top=hitAt(Math.min(Math.max(x,0),innerWidth-1),Math.min(Math.max(y,0),innerHeight-1));
+      return {covered:true,...(top&&!reaches(el,top)?{cover:reached(top)}:{})};
+    }
     const bound=state.captures.get(args.capture)?.targets.get(args.token);
     state.watch={el,id:message.watch,result:null,meaning:bound?meaningOf(bound.packed):null};
     state.located={el,capture:args.capture,token:args.token};

@@ -24,6 +24,7 @@
 // 6. With the lock released, the same element is refused.
 // 7. A press made while the page holds the lock is reported without saying
 //    that the lock took it.
+// 8. Something covers the element and the refusal does not say what.
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -61,6 +62,9 @@ const pages = {
   '/lock': `<title>Arena</title><style>body{margin:0}canvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:0}#hud{position:fixed;right:20px;top:20px;z-index:1}</style>
     <canvas aria-label="Arena"></canvas><div id=hud><button>Max level</button></div>
     <script>const c=document.querySelector('canvas');c.addEventListener('pointerdown',()=>{if(!document.pointerLockElement)setTimeout(()=>c.requestPointerLock(),location.search==='?later'?400:0)});</script>`,
+  // A cookie banner over the whole page, not modal, so Buy stays listed.
+  '/covered': `<title>Shop</title><button style="position:fixed;left:20px;top:20px">Buy</button>
+    <div role=dialog aria-label="Cookie choices" style="position:fixed;inset:0;background:#fffe"><p>We use cookies.</p><button>Accept</button></div>`,
 };
 const server = http.createServer(async (request, response) => {
   const route = request.url.split('?')[0];
@@ -262,6 +266,13 @@ await scenario('a press the locked pointer took is reported as the lock\'s', asy
   check('safe', 'not a hit', seen?.observed === true && seen.hit === false, seen);
   check('wanted', 'says the locked pointer took the press', seen?.locked === 'canvas "Arena"', seen);
   await evaluate(`document.exitPointerLock(); true`);
+});
+
+await scenario('a covered element names what covers it', async check => {
+  await open('/covered');
+  const answer = await locate(target(await observe(), 'Buy'));
+  check('safe', 'not located', !located(answer), plain(answer));
+  check('wanted', 'names the cover', answer?.covered === true && answer.cover === 'dialog "Cookie choices"', plain(answer));
 });
 
 // The sandbox stays on: no --no-sandbox, and renderers run under seccomp.

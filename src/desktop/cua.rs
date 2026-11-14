@@ -706,9 +706,17 @@ impl Cua {
         let inside = center.filter(|&(x, y)| {
             x >= window.x as f64 && y >= window.y as f64 && x < (window.x + window.width) as f64 && y < (window.y + window.height) as f64
         });
+        // A web page's element: the browser's accessibility tree can place it
+        // wrongly (a sticky header of a scrolled page, seen outside the window
+        // while on screen), and the page reader's route scrolls it into view
+        // and checks where the click lands.
+        let web = selector["identity"]["path"].as_array().is_some_and(|path| path.iter().any(|step| step[0] == "document web"));
         let pointer = |refused: Option<IbaraError>| match inside {
             Some(at) => Ok(ElementClick::Pointer { at }),
-            None => Err(refused.unwrap_or_else(|| {
+            None => Err(refused.unwrap_or_else(|| if web {
+                unavailable("Nothing was sent: the browser places that web page element outside its window on the screen, so the pointer cannot reach it. It may be on the page all the same: a browser can misplace a page's elements, such as a sticky header of a scrolled page.")
+                    .with("next", "Use browser_act with the page's elements (computer_observe with surface \"tab\"): it scrolls an element into view and checks where the click lands. Or click its point on a fresh picture (computer_observe with view \"image\"), as in an incognito window, which has no page reader.")
+            } else {
                 unavailable("Nothing was sent: that element is not inside its window on the screen now, so the pointer cannot reach it.")
                     .with("next", "Scroll it into view, observe again and click it; or click a point from computer_observe with view \"image\".")
             })),
@@ -2154,6 +2162,42 @@ esac
 
         cua.stop().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A field whose box its toolkit places below its 400×300 window, in a
+    /// web page (Chromium's tree, which the fleet's 70 such refusals all
+    /// came from) or in a native app. Failure cases: anything is sent; the
+    /// web page's refusal only says the pointer cannot reach it, so the agent
+    /// scrolls blind or tries again, when the page reader's route scrolls the
+    /// element into view and checks the click; a native app's element is
+    /// sent to browser_act.
+    #[tokio::test]
+    async fn an_element_placed_outside_its_window_is_refused_with_the_route_that_reaches_it() {
+        for web in [true, false] {
+            let dir = temp_dir();
+            let element = |i: u64, parent: Option<u64>, role: &str, label: &str, frame: [u64; 4]| {
+                json!({"element_index": i, "parent_index": parent, "role": role, "label": label, "enabled": true, "actions": ["doDefault"],
+                    "element_token": format!("s1:{i}"), "frame": {"x": frame[0], "y": frame[1], "w": frame[2], "h": frame[3]}})
+            };
+            let mut tree = vec![element(0, None, "frame", "Notes - Example", [0, 0, 400, 300]), element(1, Some(0), "panel", "", [0, 0, 400, 300])];
+            if web {
+                tree.push(element(2, Some(1), "document web", "Notes", [0, 80, 400, 220]));
+            }
+            tree.push(element(3, Some(if web { 2 } else { 1 }), "entry", "Title", [100, 900, 80, 20]));
+            let reply = json!({"isError": false, "content": [], "structuredContent": {"elements_complete": true, "truncated": false, "elements": tree}});
+            let cua = cua(&dir, fake_cua(&dir, true, &format!("      get_window_state) reply='\"result\":{reply}';;")));
+            let page = cua.elements(1, 1, None, 40, None).await.unwrap();
+            let field = page.elements.iter().find(|e| e.role == "entry").unwrap_or_else(|| panic!("the frame offers the field: {page:?}"));
+            let window = Rect { x: 0, y: 0, width: 400, height: 300 };
+            let refused = cua.click_element(&field.selector, &field.role, &field.name, "click", window, None, &Screens::of(&[])).await.unwrap_err();
+            assert_eq!(refused.code, "CAPABILITY_UNAVAILABLE", "{}", refused.message);
+            assert!(refused.message.starts_with("Nothing was sent"), "{}", refused.message);
+            let next = refused.details["next"].as_str().unwrap();
+            assert_eq!(next.contains("browser_act"), web, "web page {web}: {next}");
+            assert!(!lines(dir.join("calls.log")).iter().any(|c| matches!(c.as_str(), "click" | "move_cursor")), "nothing sent");
+            cua.stop().await;
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// A window too slow to read whole even in ibara's time: an element

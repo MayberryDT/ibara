@@ -4,6 +4,7 @@
 - Close sign-in requests 24 hours after their partial, blocked or interrupted task ended, while running and at startup, so they stop counting as attention. A later task can still continue a request within that time.
 - Stop refusing page elements when another frame of the page navigates, such as an advertisement reloading, and keep a page's recent elements usable when its latest read found no controls for a moment. The page reader still checks each element before input.
 - Refuse a click on a page element while the page holds the pointer locked, as a game that captures the mouse does, and say so, instead of sending a press that only the game's own pointer would take. Nothing is sent; Escape releases the pointer.
+- Point an agent to browser_act when a web page element's place, as the browser reports it, is outside its window. The browser can misplace page elements, and the page route scrolls an element into view and checks the click.
 - Say why a page target was refused: the page or its frame is loading or went elsewhere, the tab lost focus or closed, or which part of the element changed. A browser_act refused this way, or because something covers its target, shows the page as it is now in the text reply too, so the agent need not observe again.
 
 # 0.3.7

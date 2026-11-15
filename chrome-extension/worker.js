@@ -399,6 +399,15 @@ async function handle(m,jobs) {
     const zoom=m.op==='locate'?await chrome.tabs.getZoom(tab.id):undefined;
     if(!fresh(m))return refused();
     dispatching=EFFECTS.includes(m.op);
+    if(m.op==='locate'){
+      // A pointer locked in another frame of the tab takes every press too,
+      // and document.js sees only its own document's lock. The page's own
+      // locked element is named; of another frame only its host, so nothing
+      // of that frame's page is told.
+      const locks=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[{...m,op:'lock'}]});
+      const held=locks.find(r=>r.result?.locked!==undefined&&r.documentId!==route.documentId);
+      if(held)return {result:{locked:held.frameId===0?held.result.locked:held.result.host?'a frame from '+held.result.host:'a frame of the page',documentId:rootId}};
+    }
     if(['locate','reveal'].includes(m.op)){
       const ready=await mapPoint(tab.id,[...path].reverse(),null,true);
       if(!ready.ready)return {result:ready};

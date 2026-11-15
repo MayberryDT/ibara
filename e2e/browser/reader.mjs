@@ -25,6 +25,12 @@
 // 7. A press made while the page holds the lock is reported without saying
 //    that the lock took it.
 // 8. Something covers the element and the refusal does not say what.
+// 9. The page holds the pointer locked in another frame than the element's
+//    (a game in a frame under the page's own button, or the page's canvas
+//    under a frame's button): a point is still returned, though a press can
+//    only reach the locked element; or the refusal does not say what holds
+//    it, or names an element inside another frame instead of only that
+//    frame's host.
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -62,6 +68,13 @@ const pages = {
   '/lock': `<title>Arena</title><style>body{margin:0}canvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:0}#hud{position:fixed;right:20px;top:20px;z-index:1}</style>
     <canvas aria-label="Arena"></canvas><div id=hud><button>Max level</button></div>
     <script>const c=document.querySelector('canvas');c.addEventListener('pointerdown',()=>{if(!document.pointerLockElement)setTimeout(()=>c.requestPointerLock(),location.search==='?later'?400:0)});</script>`,
+  // The arena in a frame under the page's own Settings button, and the
+  // arena as the page itself with a frame's button over it.
+  '/framegame': `<title>Game page</title><style>body{margin:0}iframe{position:fixed;inset:0;width:100vw;height:100vh;border:0;z-index:0}button{position:fixed;left:20px;top:20px;z-index:1}</style>
+    <iframe src="/lock"></iframe><button>Settings</button>`,
+  '/gameframe': `<title>Arena with a frame</title><style>body{margin:0}canvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:0}iframe{position:fixed;right:20px;top:20px;width:300px;height:150px;z-index:1}</style>
+    <canvas aria-label="Arena"></canvas><iframe src="/inner"></iframe>
+    <script>const c=document.querySelector('canvas');c.addEventListener('pointerdown',()=>{if(!document.pointerLockElement)c.requestPointerLock()});</script>`,
   // A cookie banner over the whole page, not modal, so Buy stays listed.
   '/covered': `<title>Shop</title><button style="position:fixed;left:20px;top:20px">Buy</button>
     <div role=dialog aria-label="Cookie choices" style="position:fixed;inset:0;background:#fffe"><p>We use cookies.</p><button>Accept</button></div>`,
@@ -273,6 +286,31 @@ await scenario('a covered element names what covers it', async check => {
   const answer = await locate(target(await observe(), 'Buy'));
   check('safe', 'not located', !located(answer), plain(answer));
   check('wanted', 'names the cover', answer?.covered === true && answer.cover === 'dialog "Cookie choices"', plain(answer));
+});
+
+await scenario('a pointer a frame locked refuses a click on the page', async check => {
+  await open('/framegame');
+  await press(500, 400);
+  const framed = `document.querySelector('iframe').contentDocument`;
+  check('setup', 'the frame\'s canvas holds the pointer', await until(() => evaluate(`${framed}.pointerLockElement?.tagName === 'CANVAS'`), 3000, 'the lock'));
+  const settings = target(await observe(), 'Settings');
+  const answer = await locate(settings);
+  check('wanted', 'not located', !located(answer), plain(answer));
+  check('wanted', 'names only the frame\'s host', answer?.locked === 'a frame from 127.0.0.1', plain(answer));
+  await evaluate(`${framed}.exitPointerLock(); true`);
+  await until(() => evaluate(`!${framed}.pointerLockElement`), 3000, 'the lock to go');
+  const released = await locate(target(await observe(), 'Settings'));
+  check('safe', 'located once the lock is released', located(released), plain(released));
+});
+
+await scenario('a pointer the page locked refuses a click in a frame', async check => {
+  await open('/gameframe');
+  await press(50, 400);
+  check('setup', 'the page\'s canvas holds the pointer', await until(() => evaluate(`document.pointerLockElement?.tagName === 'CANVAS'`), 3000, 'the lock'));
+  const answer = await locate(target(await observe(), 'Inner'));
+  check('wanted', 'not located', !located(answer), plain(answer));
+  check('wanted', 'names the element holding the pointer', answer?.locked === 'canvas "Arena"', plain(answer));
+  await evaluate(`document.exitPointerLock(); true`);
 });
 
 // The sandbox stays on: no --no-sandbox, and renderers run under seccomp.

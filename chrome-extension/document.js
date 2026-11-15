@@ -17,6 +17,7 @@
 //            reports that press, a form it submits and the page leaving,
 //            the moment each happens
 //   verify   whether that press reached the element (or something inside it)
+//   lock     whether this document holds the pointer locked, and on what
 //   selected the label that list now shows
 //   reveal   scroll an element into view
 //   field    whether the element last located has the keyboard focus (the
@@ -423,6 +424,12 @@ export async function documentOperation(message) {
     // innerText excludes hidden rendered text and does not expose password values.
     const text=(document.body?.innerText||'').slice(0,200000);
     return {found:normalize(text).includes(normalize(args.text)),truncated:(document.body?.innerText||'').length>200000};
+  }
+  if(message.op==='lock') {
+    // Whether this document holds the pointer locked, for the worker's check
+    // of every frame before a locate: its locked element and this frame's host.
+    const lock=document.pointerLockElement;
+    return lock?{locked:reached(lock),host:location.hostname}:{};
   }
   if(message.op==='verify') {
     const w=state.watch;state.watch=null;

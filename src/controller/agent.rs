@@ -294,13 +294,19 @@ impl Controller {
         let task = hint
             .and_then(|t| self.journal.readable_task(principal, &t).ok().flatten())
             .or_else(|| if holds { lease.as_ref().and_then(|l| self.journal.get_task(&l.task_ref).ok().flatten()) } else { None });
+        // A page target refused before any input comes back with the screen
+        // as it is now, so the next call can choose from it instead of
+        // observing. Only for browser_act: page references keep their
+        // element's identity across frames, while a new frame renumbers the
+        // windows, native elements and choices an agent's next call may still
+        // name from the frame before.
         if tool=="browser_act" && holds && !cancel.is_cancelled() {
             if let (Err(error),Some(task),Some(lease))=(&mut outcome,task.as_ref(),lease.as_ref()) {
-                if matches!(error.code,"STALE_TARGET"|"AMBIGUOUS_TARGET") && error.details.get("execution_not_started")==Some(&json!(true)) && self.assert_authority(lease).is_ok() {
+                if matches!(error.code,"STALE_TARGET"|"AMBIGUOUS_TARGET"|"BLOCKED_BY_DIALOG") && error.details.get("execution_not_started")==Some(&json!(true)) && self.assert_authority(lease).is_ok() {
                     let spec=FrameSpec {view:View::Elements,surface:None,limit:Some(30),..FrameSpec::default()};
                     if let Ok((frame,_))=self.build_frame(task,lease,&spec).await {
                         error.details.insert("recovery_frame".into(),json!(frame.frame));
-                        error.details.insert("next".into(),json!("No input was sent. Choose a distinguishable target from recovery_frame; narrow the observation with a query if needed. Make a new explicit action; no effect was replayed."));
+                        error.details.entry("next").or_insert_with(||json!("Choose from recovery_frame, the screen as it is now, without observing again; nothing was replayed."));
                     }
                 }
             }
@@ -1310,7 +1316,7 @@ impl Controller {
                     .with("task_ref", &active.task_ref)
                     .with("next", format!("computer_act or computer_observe to continue {}; computer_finish it before beginning another task.", active.task_ref)));
             }
-            return Err(self.redacted_busy());
+            return Err(self.held_elsewhere());
         }
         if self.journal.get_control()?.unsettled || self.settling.get() || self.queue_depth.get() > 0 || self.storage.has_active_jobs(None) {
             self.journal.set_control(crate::store::ControlPatch { unsettled: Some(true), ..Default::default() })?;
@@ -2174,7 +2180,19 @@ impl Controller {
                 .or_else(|| self.frames.borrow().recent_browser(frame, target))
                 .ok_or_else(|| fail("STALE_TARGET", format!("action.target: {} is not in the page's latest observations; observe again", clip(target, 40)), true))?;
             if node.states.iter().any(|s| matches!(s.as_str(), "ambiguous" | "context_truncated")) {
-                return Err(fail("AMBIGUOUS_TARGET", format!("{target} is not distinguishable from another element; observe with a query."), true));
+                // Elements alike in role, name and the text around them: a
+                // query matches them all; only their places tell them apart.
+                let alike: Vec<&str> = frame.browser.iter()
+                    .filter(|n| n.id != node.id && n.role == node.role && n.name == node.name && n.context == node.context)
+                    .map(|n| n.id.as_str()).take(8).collect();
+                let what = format!("{target} ({} \"{}\")", node.role, squash(&node.name, 40));
+                let message = if alike.is_empty() {
+                    format!("{what} cannot be told apart from another element on the page by its role, name and the text around it, so nothing was sent.")
+                } else {
+                    format!("{what} has the same role, name and surrounding text as {}, so ibara cannot tell which one you mean; nothing was sent.", alike.join(", "))
+                };
+                return Err(fail("AMBIGUOUS_TARGET", message, true).with("execution_not_started", true)
+                    .with("next", "Their places tell them apart: take a picture (computer_observe with view \"image\") and click the one you mean at its point with computer_act; for a field, type into it with computer_act after that click."));
             }
             if !node.actions.iter().any(|a| a == wanted) {
                 if node.states.iter().any(|s| s == "disabled") {
@@ -2200,13 +2218,10 @@ impl Controller {
         let class = stricter("change", effect);
         let (target, op, describe, said, route) = match action {
             BrowserAction::Navigate(n) => {
-                let url = n.url.trim();
-                let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
-                if !matches!(scheme.as_deref(), Some("http" | "https")) || url.len() > 4096 {
-                    return Err(invalid("action.url: an http or https address of at most 4096 characters.").with("execution_not_started", true));
-                }
-                let said = format!("go to {}", approval::page_words(url).unwrap_or_else(|| "a web page".into()));
-                (None, BrowserOp::Navigate(url.to_string()), format!("open {}", clip(url, 80)), said, "browser_navigate")
+                let url = web_address(&n.url)?;
+                let said = format!("go to {}", approval::page_words(&url).unwrap_or_else(|| "a web page".into()));
+                let describe = format!("open {}", clip(&url, 80));
+                (None, BrowserOp::Navigate(url), describe, said, "browser_navigate")
             }
             BrowserAction::Click(t) => {
                 let (args, what, words) = node(&t.target, "click")?;
@@ -2428,9 +2443,11 @@ impl Controller {
                 Ok((Done { note, ..done }, data, true))
             }
             (Some(true), _) => {
-                let instead = seen.get("reached").and_then(Value::as_str).filter(|r| !r.is_empty())
-                    .map(|r| format!("The click reached {} instead of the element chosen; observe the page.", clip(r, 80)))
-                    .unwrap_or_else(|| "The click reached a different element than the one chosen; observe the page.".to_string());
+                let instead = match (seen.get("locked").and_then(Value::as_str), seen.get("reached").and_then(Value::as_str).filter(|r| !r.is_empty())) {
+                    (Some(lock), _) => format!("The page had locked the pointer to {}, so the click went to it at the page's own pointer, not to the element chosen; observe the page, and release the pointer (Escape) before clicking its controls.", clip(lock, 80)),
+                    (None, Some(r)) => format!("The click reached {} instead of the element chosen; observe the page.", clip(r, 80)),
+                    (None, None) => "The click reached a different element than the one chosen; observe the page.".to_string(),
+                };
                 Err(fail("OUTCOME_UNKNOWN", instead, false))
             }
             _ if seen.get("gone").and_then(Value::as_bool) == Some(true) => {
@@ -3855,35 +3872,111 @@ fn text_runs(text: &str) -> Vec<(&str, bool)> {
 }
 
 
+/// The address `browser_act` navigate opens: an http or https address as
+/// given, or a bare host with an optional port and path (`example.com/a`,
+/// `localhost:8000/x`). A bare host opens over https, except `localhost`
+/// (and names under it) and an IPv4 address, which open over http, as
+/// Chromium's address bar opens them typed: a development or LAN server
+/// rarely has a certificate, and over https its failed handshake would leave
+/// an error page behind a step that says it opened the address. The page
+/// reader reads only http and https pages, so every other scheme is refused
+/// before anything is sent.
+fn web_address(given: &str) -> Result<String> {
+    let url = given.trim();
+    const FORMS: &str = "browser_act opens http and https addresses, such as https://example.com/page or http://localhost:8000/, or a bare host and path such as example.com/page, which opens over https (localhost and IP addresses over http)";
+    let refuse = |why: String| Err(invalid(format!("action.url: {why}. {FORMS}.")).with("execution_not_started", true));
+    if url.is_empty() || url.len() > 4096 {
+        return refuse("an address of at most 4096 characters".into());
+    }
+    // A scheme's colon, or a port's, comes before the first slash, question
+    // mark or hash; a colon after them is the path's (`/watch?t=1:30`).
+    let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+    let (head, port) = authority.split_once(':').map_or((authority, None), |(h, p)| (h, Some(p)));
+    // `localhost:8000/x` is a host and port, `mailto:x` a scheme.
+    let port = port.filter(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    let scheme = authority.contains(':') && port.is_none()
+        && head.starts_with(|c: char| c.is_ascii_alphabetic()) && head.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c));
+    if scheme {
+        let rest = &url[head.len() + 1..];
+        return match head.to_ascii_lowercase().as_str() {
+            "http" | "https" if rest.starts_with("//") && rest.len() > 2 => Ok(url.to_string()),
+            "file" => Err(invalid("action.url: browser_act does not open file:// addresses: the page reader cannot read them. Read a file of this computer with computer_files, or type its address into the address bar with computer_act (key ctrl+l, type, key Return) to look at it.")
+                .with("execution_not_started", true)),
+            "http" | "https" => refuse(format!("{} has no host after {head}://", clip(url, 60))),
+            other => refuse(format!("{other}: addresses are not web pages")),
+        };
+    }
+    let name = if port.is_some() { head } else { authority };
+    let labels: Vec<&str> = name.split('.').collect();
+    let plausible = name.eq_ignore_ascii_case("localhost")
+        || (labels.len() >= 2 && labels.iter().all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_alphanumeric() || c == '-')));
+    if !plausible || url.chars().any(char::is_whitespace) {
+        return refuse(format!("\"{}\" is not an address", clip(url, 60)));
+    }
+    let lower = name.to_ascii_lowercase();
+    let plain = lower == "localhost" || lower.ends_with(".localhost") || name.parse::<std::net::Ipv4Addr>().is_ok();
+    Ok(format!("{}://{url}", if plain { "http" } else { "https" }))
+}
+
 /// Where a page went, without its query or fragment: a form sent with GET
 /// carries what was typed in its address.
 fn page_address(url: &str) -> String {
     clip(url.split(['?', '#']).next().unwrap_or(url), 120)
 }
 
-/// The extension's refusals before any input: the page changed since it was
-/// observed, something covers the element, or it has not stopped moving.
+/// The extension's refusals before any input, each with its cause: the page
+/// or the element changed since it was observed, something covers the
+/// element, or it has not stopped moving. A refused `browser_act` comes back
+/// with the screen as it is now (`recovery_frame`), so most need no `next` of
+/// their own.
 fn page_refusal(data: &Value) -> Result<()> {
+    let refuse = |code: &'static str, message: &str, next: Option<&str>| {
+        let e = fail(code, format!("{message}; nothing was sent."), true).with("execution_not_started", true);
+        Err(match next { Some(next) => e.with("next", next), None => e })
+    };
+    // A game or a drawing surface that captures the mouse takes every press
+    // at its own pointer, wherever the pointer is put.
+    if let Some(lock) = data.get("locked").and_then(Value::as_str) {
+        return Err(unavailable(format!("The page holds the pointer locked to {}, so a click would go to it at the page's own pointer, not to that element; nothing was sent.", clip(lock, 80)))
+            .with("reason", "pointer_locked")
+            .with("execution_not_started", true)
+            .with("next", "Release the pointer as a person would, with Escape (browser_act key \"Escape\"; the page may react to the key too), then click again. Or use the page's own keyboard shortcut for that control."));
+    }
     if data.get("covered").and_then(Value::as_bool) == Some(true) {
-        return Err(fail("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog); deal with it, then observe again.", true)
-            .with("execution_not_started", true));
+        let next = Some("Deal with what covers it (close it, or scroll so the element is clear), then choose again.");
+        return match data.get("cover").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+            Some(cover) => refuse("BLOCKED_BY_DIALOG", &format!("{} covers that element", clip(cover, 80)), next),
+            None => refuse("BLOCKED_BY_DIALOG", "Something covers that element (a banner, menu or dialog)", next),
+        };
     }
     if data.get("moving").and_then(Value::as_bool) == Some(true) {
-        return Err(fail("STALE_TARGET", "That element is still moving (an animation, or the page is still loading); try again.", true)
-            .with("execution_not_started", true));
+        return refuse("STALE_TARGET", "That element is still moving (an animation, or the page is still loading)", Some("Try again."));
     }
     if data.get("refused").and_then(Value::as_bool) == Some(true) {
-        let (code, message) = match data.get("why").and_then(Value::as_str).unwrap_or("") {
-            "hidden" => ("STALE_TARGET", "The tab is hidden behind another tab or window; focus the browser window with computer_act, then observe surface \"tab\"."),
-            "late" => ("STALE_TARGET", "The page did not answer in time; observe again."),
-            "expired" => ("STALE_TARGET", "That page observation is no longer held (the page keeps its four latest); observe surface \"tab\" again."),
-            "navigated" => ("STALE_TARGET", "The page went to another address since it was observed; observe again."),
-            "changed" => ("STALE_TARGET", "That element changed since it was observed (its name, state, place or visibility); observe again."),
-            "gone" => ("STALE_TARGET", "That element is no longer on the page; observe again."),
-            "ambiguous" => ("AMBIGUOUS_TARGET", "The page drew that element again and now more than one element matches it; observe again."),
-            _ => ("STALE_TARGET", "The page changed since it was observed, or the tab is not focused; observe again."),
+        let wait = Some("Wait for the page (browser_act wait_for), then choose again.");
+        let (code, message, next) = match (data.get("why").and_then(Value::as_str).unwrap_or(""), data.get("changed").and_then(Value::as_str).unwrap_or("")) {
+            ("hidden", _) => ("STALE_TARGET", "The tab is hidden behind another tab or window", Some("Focus the browser window with computer_act, then choose again.")),
+            ("unfocused", _) => ("STALE_TARGET", "That tab is not the active tab of the focused browser window now", Some("Focus the browser window and that tab with computer_act, then choose again.")),
+            ("closed", _) => ("STALE_TARGET", "That tab was closed", None),
+            ("late", _) => ("STALE_TARGET", "The page did not answer in time", Some("Try again.")),
+            ("loading", _) => ("STALE_TARGET", "The page, or the frame that holds that element, is loading another address", wait),
+            ("expired", _) => ("STALE_TARGET", "That page observation is no longer held (the page keeps its four latest)", None),
+            ("navigated", _) => ("STALE_TARGET", "The page, or the frame that holds that element, went to another document since it was observed", None),
+            ("changed", "context") => ("STALE_TARGET", "The text around that element (its card or row) changed since it was observed, so it may belong to another record now",
+                Some("Choose it again from the page as it is now. If that text keeps changing (a live counter, a game), click the element's point on a fresh picture with computer_act instead.")),
+            ("changed", "name") => ("STALE_TARGET", "That element's name changed since it was observed", None),
+            ("changed", "disabled") => ("STALE_TARGET", "That element is disabled now", Some("Wait for it to be enabled (browser_act wait_for), or choose another element.")),
+            ("changed", "hidden") => ("STALE_TARGET", "That element is hidden now", None),
+            ("changed", "actions") => ("STALE_TARGET", "That element takes different actions now", None),
+            ("changed", "address") => ("STALE_TARGET", "That link goes to another address now", None),
+            ("changed", "role") => ("STALE_TARGET", "That element is another kind of control now", None),
+            ("changed", _) => ("STALE_TARGET", "That element changed since it was observed (its name, its state or the text around it)", None),
+            ("gone", _) => ("STALE_TARGET", "That element is no longer on the page", None),
+            ("ambiguous", _) => ("AMBIGUOUS_TARGET", "The page drew that element again and now more than one element matches it", None),
+            // An older page reader gives no reason.
+            _ => ("STALE_TARGET", "The page changed since it was observed, or the tab is not focused", None),
         };
-        return Err(fail(code, message, true).with("execution_not_started", true));
+        return refuse(code, message, next);
     }
     Ok(())
 }

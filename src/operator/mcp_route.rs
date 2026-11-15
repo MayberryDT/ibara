@@ -551,9 +551,12 @@ impl Router {
         // Stable request-specific ordering spreads unrelated agents across free
         // computers; replay goes to the durable binding, regardless of readiness.
         ready.sort_by_key(|t|Sha256::digest(format!("{key}:{}",t.computer_id).as_bytes()).to_vec());
+        // A begin sent again with its request_id goes only to the computer its route remembers.
+        let remembered=bound.is_some();
         let mut selected=bound;
         let mut refused=None::<String>;
         let mut last=None;
+        let mut turned_away=Vec::<String>::new();
         loop {
             if selected.is_none() {
                 let Some(candidate)=ready.first().cloned() else {break;};
@@ -576,9 +579,19 @@ impl Router {
                 && e.pointer("/result/task_ref").is_none()
                 && matches!(e.pointer("/error/code").and_then(Value::as_str),Some("BUSY"|"HUMAN_CONTROL"|"CONTROL_UNSETTLED")));
             if !definitely_refused {return Some(reply);}
+            let why=match envelope.as_ref().and_then(|e|e.pointer("/error/code")).and_then(Value::as_str) {
+                Some("BUSY")=>"busy", Some("HUMAN_CONTROL")=>"a person has it", _=>"settling earlier work",
+            };
+            turned_away.push(format!("{}: {why}",target.label));
             // A bound replay never selects a new host after an uncertain send.
             // These three errors are pre-acquisition refusals, retained by the target.
             refused=Some(id); last=Some(reply);
+        }
+        // Every ready computer refused a begin that named none: say so for the
+        // fleet, not in the last one's words about "this computer". A begin
+        // sent again only to its remembered computer has that computer's answer.
+        if !remembered && !turned_away.is_empty() && fleet.len()>1 {
+            return Some(self.local_error(&IbaraError::new("BUSY",format!("No free computer right now: every ready one refused ({}). No task started. Continue independent work, then retry computer_begin without computer, with a fresh request_id.",turned_away.join(", ")),true),fleet.len()));
         }
         if let Some(reply)=last {return Some(reply);}
         let states=answers.iter().map(|(t,a)|{

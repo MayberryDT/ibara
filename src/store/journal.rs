@@ -10,16 +10,27 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde_json::{Map, Value, json};
 use std::io::Read;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_METADATA_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_METADATA_GROWTH_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_METADATA_HEADROOM_BYTES: u64 = 1024 * 1024;
 const DEFAULT_METADATA_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-const TERMINAL_SETTLED_STATES: &[&str] = &["completed", "cancelled", "partial"];
+/// ibarad answers status and attention on the thread that runs retention, so
+/// outside metadata pressure a pass starts no task once it has run this long
+/// or deleted this many rows (written out when it commits, the rest of its
+/// cost, about 2.7 KB a row on one computer in daily use); the next pass
+/// continues where it stopped.
+const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(100);
+const RETENTION_PASS_ROWS: usize = 1000;
+/// Tasks one bounded pass reads at most.
+const RETENTION_BATCH: i64 = 500;
+/// How long after a failed build of the retention indexes another is tried.
+const RETENTION_INDEX_RETRY: Duration = Duration::from_secs(600);
 
 /// Milliseconds since the epoch; injectable for tests (`JournalOptions.now`).
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -87,6 +98,11 @@ pub struct Journal {
     metadata_retention_ms: i64,
     clock: Clock,
     migration: MigrationOutcome,
+    /// The last task (`updated_at`, `task_ref`) a bounded retention pass read.
+    retention_after: RefCell<Option<(String, String)>>,
+    /// Whether the retention indexes are built, and when a build last failed.
+    retention_indexed: Cell<bool>,
+    retention_index_failed: Cell<Option<Instant>>,
 }
 
 impl Journal {
@@ -130,6 +146,9 @@ impl Journal {
             metadata_retention_ms: options.metadata_retention_ms.unwrap_or(DEFAULT_METADATA_RETENTION_MS).max(0),
             clock,
             migration,
+            retention_after: RefCell::new(None),
+            retention_indexed: Cell::new(false),
+            retention_index_failed: Cell::new(None),
         };
         journal.enforce_retention(false)?;
         Ok(journal)
@@ -635,6 +654,7 @@ impl Journal {
                 operation.session,
             ])
             .map_err(map_capacity_error)?;
+        self.reopen(operation.task_ref.as_deref())?;
         tx.commit()?;
         Ok(Remembered::Fresh(operation))
     }
@@ -780,6 +800,7 @@ impl Journal {
         let Some(current) = self.get_operation_by_ref(operation_ref)? else {
             return Err(IbaraError::new("INTERNAL_ERROR", "Missing operation while updating receipt.", false).requires_reconciliation());
         };
+        let moved = patch.task_ref.as_ref().is_some_and(|t| *t != current.task_ref);
         let next = OperationRecord {
             receipt: patch.receipt.unwrap_or(current.receipt.clone()),
             dispatched: patch.dispatched.unwrap_or(current.dispatched),
@@ -790,6 +811,9 @@ impl Journal {
         self.db
             .prepare_cached("UPDATE operations SET receipt = ?, dispatched = ?, task_ref = ?, updated_at = ? WHERE operation_ref = ?")?
             .execute(params![next.receipt.to_string(), next.dispatched as i64, next.task_ref, next.updated_at, operation_ref])?;
+        if moved {
+            self.reopen(next.task_ref.as_deref())?;
+        }
         Ok(next)
     }
 
@@ -855,7 +879,7 @@ impl Journal {
             lease.state,
             lease.reason
         ])?;
-        Ok(())
+        self.reopen(Some(lease.task_ref.as_str()))
     }
 
     /// `getLease` (journal.ts:411).
@@ -958,7 +982,7 @@ impl Journal {
                 expired as i64,
                 record.to_string()
             ])?;
-        Ok(())
+        self.reopen(Some(task_ref))
     }
 
     /// `getObservation` (journal.ts:599).
@@ -1010,7 +1034,7 @@ impl Journal {
        ON CONFLICT(check_ref) DO UPDATE SET record = excluded.record, checked_at = excluded.checked_at",
             )?
             .execute(params![check_ref, task_ref, principal, json_to_sql(record.get("checked_at")), record.to_string()])?;
-        Ok(())
+        self.reopen(Some(task_ref))
     }
 
     /// `getCheck` (journal.ts:633). Checks never expire.
@@ -1041,7 +1065,7 @@ impl Journal {
                 iso_from_millis(self.now_ms()),
                 record.to_string()
             ])?;
-        Ok(())
+        self.reopen(record.get("task_ref").and_then(Value::as_str))
     }
 
     /// `getCheckpoint` (journal.ts:650).
@@ -1102,7 +1126,7 @@ impl Journal {
        ON CONFLICT(job_ref) DO UPDATE SET record = excluded.record, request_id = excluded.request_id",
             )?
             .execute(params![job_ref, task_ref, principal, json_to_sql(record.get("request_id")), record.to_string()])?;
-        Ok(())
+        self.reopen(Some(task_ref))
     }
 
     /// `getJob` (journal.ts:688).
@@ -1205,8 +1229,12 @@ impl Journal {
             if for_new_intent { return Err(self.capacity_error("disk_reserve")); }
             return Ok(());
         }
-        let deleted = self.prune_terminal_settled()?;
-        let pressure = self.metadata_bytes()? >= self.max_metadata_bytes.get().saturating_mul(4) / 5;
+        self.index_for_retention();
+        let pressure = || -> Result<bool> { Ok(self.metadata_bytes()? >= self.max_metadata_bytes.get().saturating_mul(4) / 5) };
+        // Under pressure admission depends on what this pass reclaims, so it
+        // prunes all it may, as before; otherwise it is bounded.
+        let deleted = self.prune_terminal_settled(!pressure()?)?;
+        let pressure = pressure()?;
         if deleted > 0 || pressure {
             self.checkpoint_wal()?;
         }
@@ -1263,10 +1291,10 @@ impl Journal {
     fn can_prune_metadata(&self) -> Result<bool> {
         let cutoff = iso_from_millis(self.now_ms() - self.metadata_retention_ms);
         let timeline_ready: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM timeline_events WHERE at<=?1 AND (task_ref IS NULL OR task_ref NOT IN (SELECT task_ref FROM tasks))) OR EXISTS(SELECT 1 FROM attention_items WHERE state!='open' AND COALESCE(answered_at,created_at)<=?1) OR EXISTS(SELECT 1 FROM timeline_events WHERE id<=(SELECT MAX(id) FROM timeline_events)-?2)",
+            "SELECT EXISTS(SELECT 1 FROM timeline_events WHERE at<=?1 AND (task_ref IS NULL OR NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_ref=timeline_events.task_ref AND pruned_at IS NULL))) OR EXISTS(SELECT 1 FROM attention_items WHERE state!='open' AND COALESCE(answered_at,created_at)<=?1) OR EXISTS(SELECT 1 FROM timeline_events WHERE id<=(SELECT MAX(id) FROM timeline_events)-?2)",
             params![cutoff,super::timeline::MAX_TIMELINE_EVENTS], |r| r.get(0))?;
         if timeline_ready { return Ok(true); }
-        let tasks = self.db.prepare_cached("SELECT task_ref FROM tasks WHERE state IN ('completed','cancelled','partial') AND updated_at<=? AND NOT EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref AND state='active') AND NOT EXISTS(SELECT 1 FROM attention_items WHERE attention_items.task_ref=tasks.task_ref AND state='open') AND (EXISTS(SELECT 1 FROM observations WHERE observations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM operations WHERE operations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checks WHERE checks.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checkpoints WHERE checkpoints.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM jobs WHERE jobs.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM timeline_events WHERE timeline_events.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref))")?
+        let tasks = self.db.prepare_cached("SELECT task_ref FROM tasks WHERE pruned_at IS NULL AND state IN ('completed', 'cancelled', 'partial') AND updated_at<=? AND NOT EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref AND state='active') AND NOT EXISTS(SELECT 1 FROM attention_items WHERE attention_items.task_ref=tasks.task_ref AND state='open') AND (EXISTS(SELECT 1 FROM observations WHERE observations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM operations WHERE operations.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checks WHERE checks.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM checkpoints WHERE checkpoints.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM jobs WHERE jobs.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM timeline_events WHERE timeline_events.task_ref=tasks.task_ref) OR EXISTS(SELECT 1 FROM leases WHERE leases.task_ref=tasks.task_ref))")?
             .query_map([cutoff], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for task in tasks {
             let jobs = self.db.prepare_cached("SELECT record FROM jobs WHERE task_ref=?")?.query_map([&task], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1335,21 +1363,40 @@ impl Journal {
     /// `pruneTerminalSettled` (journal.ts:748-784), plus the timeline tables:
     /// events older than the cutoff (except those of retained tasks),
     /// settled attention items, and the event row cap.
-    fn prune_terminal_settled(&self) -> Result<usize> {
-        let cutoff = iso_from_millis(self.now_ms() - self.metadata_retention_ms);
-        let tasks: Vec<(String, String, String)> = self
+    ///
+    /// A task whose evidence is gone is marked `pruned_at` and not read again
+    /// until something new is recorded for it ([`Journal::reopen`]), so a pass
+    /// costs what is left to prune, not all history. A `bounded` pass stops
+    /// at [`RETENTION_PASS_BUDGET`] or [`RETENTION_PASS_ROWS`] and the next
+    /// continues from there; tasks kept for now (held, or with uncertain
+    /// effects) are read again once the passes have gone round.
+    fn prune_terminal_settled(&self, bounded: bool) -> Result<usize> {
+        let started = Instant::now();
+        let now = self.now_ms();
+        let cutoff = iso_from_millis(now - self.metadata_retention_ms);
+        // An unbounded pass reads every task it may prune, from the oldest.
+        let after = self.retention_after.take().filter(|_| bounded);
+        let (after_at, after_ref) = after.unwrap_or_default();
+        let limit = if bounded { RETENTION_BATCH } else { -1 };
+        // The condition of the `tasks_unpruned` index, word for word.
+        let tasks: Vec<(String, String)> = self
             .db
-            .prepare_cached("SELECT task_ref, state, updated_at FROM tasks")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .prepare_cached(
+                "SELECT updated_at, task_ref FROM tasks
+                 WHERE pruned_at IS NULL AND state IN ('completed', 'cancelled', 'partial')
+                   AND updated_at <= ?1 AND (updated_at, task_ref) > (?2, ?3)
+                 ORDER BY updated_at, task_ref LIMIT ?4",
+            )?
+            .query_map(params![cutoff, after_at, after_ref, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let prunable: Vec<String> = tasks
-            .into_iter()
-            .filter(|(_, state, updated_at)| TERMINAL_SETTLED_STATES.contains(&state.as_str()) && updated_at.as_str() <= cutoff.as_str())
-            .map(|(task_ref, _, _)| task_ref)
-            .collect();
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut deleted = 0usize;
-        for task_ref in &prunable {
+        let mut read = 0usize;
+        for (_, task_ref) in &tasks {
+            if read > 0 && bounded && (started.elapsed() >= RETENTION_PASS_BUDGET || deleted >= RETENTION_PASS_ROWS) {
+                break;
+            }
+            read += 1;
             let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM leases WHERE task_ref=? AND state='active') OR EXISTS(SELECT 1 FROM attention_items WHERE task_ref=? AND state='open')", params![task_ref,task_ref], |r| r.get(0))?;
             if held { continue; }
             let jobs: Vec<(String, String)> = tx
@@ -1379,10 +1426,43 @@ impl Journal {
                 deleted += tx.execute("DELETE FROM operations WHERE operation_ref = ?", [operation_ref])?;
             }
             deleted += tx.execute("DELETE FROM timeline_events WHERE task_ref = ? AND at <= ?", params![task_ref, cutoff])?;
+            tx.execute("UPDATE tasks SET pruned_at = ? WHERE task_ref = ?", params![iso_from_millis(now), task_ref])?;
         }
         deleted += super::timeline::prune(&tx, &cutoff)?;
         tx.commit()?;
+        // Continue after the last task read; once all are read, from the oldest again.
+        if read < tasks.len() || tasks.len() as i64 == limit {
+            *self.retention_after.borrow_mut() = tasks.get(read - 1).cloned();
+        }
         Ok(deleted)
+    }
+
+    /// Builds the retention indexes unless they are built: normally at the
+    /// first pass, when ibarad starts. They are not part of the startup
+    /// migration, so a disk without room for them never keeps ibarad from
+    /// starting, answering status and finishing tasks. Below the disk reserve
+    /// no pass gets here; a build that fails is tried again at a pass
+    /// [`RETENTION_INDEX_RETRY`] later. Until they are built, retention reads
+    /// without them, as before they existed.
+    fn index_for_retention(&self) {
+        if self.retention_indexed.get() || self.retention_index_failed.get().is_some_and(|at| at.elapsed() < RETENTION_INDEX_RETRY) {
+            return;
+        }
+        match schema::create_retention_indexes(&self.db) {
+            Ok(()) => self.retention_indexed.set(true),
+            Err(e) => {
+                self.retention_index_failed.set(Some(Instant::now()));
+                crate::controller::log_event("retention_indexes_deferred", &e.to_string());
+            }
+        }
+    }
+
+    /// Something new was recorded for `task_ref`: retention reads the task again.
+    fn reopen(&self, task_ref: Option<&str>) -> Result<()> {
+        if let Some(task_ref) = task_ref {
+            self.db.prepare_cached("UPDATE tasks SET pruned_at = NULL WHERE task_ref = ? AND pruned_at IS NOT NULL")?.execute([task_ref])?;
+        }
+        Ok(())
     }
 
     fn checkpoint_wal(&self) -> Result<()> {

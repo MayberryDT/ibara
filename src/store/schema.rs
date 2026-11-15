@@ -30,6 +30,13 @@
 //!   person's logins). SQLite cannot change a CHECK in place, so the table is
 //!   rebuilt once with the same columns and rows; an older build reads the
 //!   rows as they are and never writes that kind.
+//! - Indexes on `task_ref` for retention ([`RETENTION_INDEXES`]), built
+//!   after the migration, once the disk has room for them
+//!   ([`create_retention_indexes`]). An older build keeps them up to date
+//!   without using them.
+//! - `tasks.pruned_at`: when retention removed the evidence of an old
+//!   finished task. Retention does not read that task again until something
+//!   new is recorded for it. An older build ignores it and prunes as before.
 //!
 //! Well-known agents' short names (`codex@vesper`, formerly
 //! `codex-mcp-client@vesper`) need no version either: at every open, what an
@@ -124,6 +131,9 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
     }
     if !task_columns.iter().any(|c| c == "deliveries") {
         tx.execute_batch("ALTER TABLE tasks ADD COLUMN deliveries TEXT NOT NULL DEFAULT '[]'")?;
+    }
+    if !task_columns.iter().any(|c| c == "pruned_at") {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN pruned_at TEXT")?;
     }
     if !columns(&tx, "control_state")?.iter().any(|c| c == "settling_generation") {
         tx.execute_batch("ALTER TABLE control_state ADD COLUMN settling_generation TEXT")?;
@@ -551,6 +561,35 @@ const ATTENTION_WITH_LOGIN: &str = r#"
       ALTER TABLE attention_items_login RENAME TO attention_items;
       CREATE INDEX IF NOT EXISTS attention_items_open ON attention_items(state, task_ref);
     "#;
+
+/// Retention finds and deletes each old task's evidence by `task_ref`; without
+/// these every lookup scans its whole table (seen on computers in daily use,
+/// October and November 2026). The names are those added by hand to two of
+/// those computers' journals, which therefore keep theirs. On an existing journal each is
+/// built once, in one pass over its table, when ibarad starts, or later if
+/// the disk has no room for it then ([`create_retention_indexes`]).
+///
+/// `tasks_unpruned` holds only the finished tasks retention has still to
+/// read, so a pass never walks the tasks it already pruned. Its condition is
+/// repeated word for word where it is used (`Journal::prune_terminal_settled`
+/// and `Journal::can_prune_metadata`), which SQLite needs to choose it.
+const RETENTION_INDEXES: &str = r#"
+      CREATE INDEX IF NOT EXISTS leases_task ON leases(task_ref);
+      CREATE INDEX IF NOT EXISTS operations_task ON operations(task_ref);
+      CREATE INDEX IF NOT EXISTS observations_task ON observations(task_ref);
+      CREATE INDEX IF NOT EXISTS checks_task ON checks(task_ref);
+      CREATE INDEX IF NOT EXISTS checkpoints_task ON checkpoints(task_ref);
+      CREATE INDEX IF NOT EXISTS jobs_task ON jobs(task_ref);
+      CREATE INDEX IF NOT EXISTS tasks_unpruned ON tasks(updated_at, task_ref)
+        WHERE pruned_at IS NULL AND state IN ('completed', 'cancelled', 'partial');
+    "#;
+
+/// Builds the retention indexes not built yet, each on its own, so those
+/// that fit stay built. Not part of [`migrate`]: on a disk without room for
+/// their pages the journal must still open (`Journal::index_for_retention`).
+pub(crate) fn create_retention_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(RETENTION_INDEXES)
+}
 
 /// Core schema 6: the windows each task opened.
 const V6_DDL: &str = r#"

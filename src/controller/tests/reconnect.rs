@@ -17,6 +17,10 @@
 //! - once the first session stops answering, the same agent still waits for
 //!   the grace, or gets new control instead of the one it held; the first
 //!   session, answering again, takes it back from the live second one
+//! - a refused begin does not say what to do instead (no tool waits for a
+//!   busy computer; status shows which are ready, and a begin that names no
+//!   computer takes a ready one), so an agent repeats it; a refused task call
+//!   is told to begin elsewhere when its own live session holds the task
 
 use super::stream::take;
 use super::*;
@@ -60,7 +64,9 @@ fn another_agent_is_kept_out_until_the_grace_releases_control() {
         let task = begin(c).await;
         c.disconnect("vesper", "connection_a").await.unwrap();
         let refused = call_as(c, "connection_c", "claude", "computer_begin", json!({ "goal": "Something else", "request_id": "other-1" })).await;
-        assert_eq!((code(&refused), refused["error"]["message"].as_str()), ("BUSY", Some("Control is unavailable.")), "{refused}");
+        assert_eq!((code(&refused), refused["error"]["message"].as_str()), ("BUSY", Some("Another task holds this computer, so no task was started.")), "{refused}");
+        let next = refused["error"]["next"].as_str().unwrap_or_default();
+        assert!(next.contains("computer_status") && next.contains("without naming a computer") && next.contains("no tool waits"), "{refused}");
         assert!(situation(&refused).contains("another agent controls"), "{refused}");
         let theirs = call_as(c, "connection_c", "claude", "computer_checkpoint", checkpoint(&task)).await;
         assert_eq!(code(&theirs), "PERMISSION_DENIED", "{theirs}");
@@ -100,11 +106,12 @@ fn a_second_session_of_the_same_agent_cannot_take_a_live_sessions_control() {
         let task = begin(c).await;
         c.heartbeat("vesper", "connection_a", true).await.unwrap();
         let begun = call_as(c, "connection_b", "codex", "computer_begin", json!({ "goal": "Something else", "request_id": "second-1" })).await;
-        assert_eq!((code(&begun), begun["error"]["message"].as_str()), ("BUSY", Some("Control is unavailable.")), "{begun}");
+        assert_eq!((code(&begun), begun["error"]["message"].as_str()), ("BUSY", Some("Another task holds this computer, so no task was started.")), "{begun}");
         assert!(begun["error"]["task_ref"].is_null(), "the other session's task stays private: {begun}");
         assert!(situation(&begun).contains("another agent controls"), "{begun}");
         let taken = call_as(c, "connection_b", "codex", "computer_checkpoint", checkpoint(&task)).await;
-        assert_eq!((code(&taken), taken["error"]["message"].as_str()), ("BUSY", Some("Control is unavailable.")), "{taken}");
+        assert_eq!((code(&taken), taken["error"]["message"].as_str()), ("BUSY", Some("Another session holds this computer's control (another task, or yours in another live session), so nothing was done.")), "{taken}");
+        assert!(taken["error"]["next"].as_str().is_some_and(|n| n.contains("carry on there")), "its own live session holds it: {taken}");
         assert_eq!(c.journal.get_active_lease().unwrap().map(|l| l.connection_id).as_deref(), Some("connection_a"));
         let first = call_as(c, "connection_a", "codex", "computer_checkpoint", checkpoint(&task)).await;
         assert_eq!(first["status"], "ok", "the first session keeps its control: {first}");
@@ -131,7 +138,7 @@ fn the_same_agent_carries_on_once_its_old_session_stops_answering() {
         // The first session's client answers again: the live second session keeps control.
         c.heartbeat("vesper", "connection_a", true).await.unwrap();
         let again = call_as(c, "connection_a", "codex", "computer_checkpoint", checkpoint(&task)).await;
-        assert_eq!((code(&again), again["error"]["message"].as_str()), ("BUSY", Some("Control is unavailable.")), "{again}");
+        assert_eq!((code(&again), again["error"]["message"].as_str()), ("BUSY", Some("Another session holds this computer's control (another task, or yours in another live session), so nothing was done.")), "{again}");
         assert_eq!(c.journal.get_active_lease().unwrap().map(|l| l.connection_id).as_deref(), Some("connection_b"));
     });
 }

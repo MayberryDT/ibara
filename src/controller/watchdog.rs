@@ -162,6 +162,10 @@ impl Controller {
         }
         // A login removed while the browser was closed goes once it connects.
         self.login_deferred_removals().await;
+        // A sign-in request no later task continued stops asking a day after its task ended.
+        if let Err(e) = self.journal.expire_unclaimed_logins("ibarad", &self.now_iso()) {
+            log_event("watchdog_failed", &e.to_string());
+        }
     }
 
     /// A person's repair (`needs_person.fix`), now: `fixed`, `still_broken`

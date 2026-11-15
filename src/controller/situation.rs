@@ -197,6 +197,9 @@ pub(crate) struct FrameState {
     pub input_for: Vec<(String, WinKey)>,
     pub elements: Vec<Element>,
     pub browser: Vec<BrowserNode>,
+    /// The tab and document the page reader read, whether or not it found
+    /// controls, and whether its references are checked again before input.
+    pub page: Option<(i64, String, bool)>,
     continuation: Option<Continuation>,
     /// The latest picture of each surface this task took (newest last):
     /// point coordinates are a picture's pixels, whatever frame came after.
@@ -281,13 +284,14 @@ impl Frames {
         }
         self.map.insert(frame.task_ref.clone(), frame);
     }
-    /// A page element of one of the task's latest page observations, of
-    /// the page the latest frame shows when it shows one.
+    /// A page element of one of the task's latest page observations, of the
+    /// document the latest frame read, also when that read found no controls
+    /// (a view changing over): the page reader checks the element again.
     pub fn recent_browser(&self, frame: &FrameState, id: &str) -> Option<BrowserNode> {
-        let page = frame.browser.first()?;
-        if !page.revalidates_refs { return None; }
+        let (tab, document, revalidates) = frame.page.as_ref()?;
+        if !revalidates { return None; }
         self.recent_browser.get(&frame.task_ref)?.iter().rev()
-            .find(|n| n.id == id && n.revalidates_refs && n.tab_id == page.tab_id && n.document_id == page.document_id).cloned()
+            .find(|n| n.id == id && n.revalidates_refs && n.tab_id == *tab && n.document_id == *document).cloned()
     }
     pub fn forget(&mut self, task_ref: &str) {
         self.map.remove(task_ref);
@@ -739,16 +743,16 @@ impl Controller {
         let cursor = continuation.as_ref().filter(|c|c.browser.is_none()).map(|c|c.offset);
         let mut page_note = (automatic_browser && !automatic_page).then(||
             "page controls unavailable (focused tab not verified); showing the native surface; use a fresh image if needed".to_string());
-        let (browser, browser_total, browser_context, modal_background, browser_next) = if explicit_page || automatic_page {
+        let ((browser, browser_total, browser_context, modal_background, browser_next), page_read) = if explicit_page || automatic_page {
             match self.observe_browser(&task.task_ref, &tabs, spec.query.as_deref(), limit, continuation.as_ref()).await {
-                Ok(nodes) => { wants_elements = false; nodes }
+                Ok((nodes, read)) => { wants_elements = false; (nodes, Some(read)) }
                 Err(e) if spec.cursor.is_none() && automatic_page && !matches!(e.code, "SESSION_UNAVAILABLE" | "HUMAN_CONTROL") => {
                     page_note = Some(format!("page controls unavailable ({}); showing the native surface; use a fresh image if needed", e.code));
-                    (Vec::new(), 0, None, None, None)
+                    ((Vec::new(), 0, None, None, None), None)
                 }
                 Err(e) => return Err(e),
             }
-        } else { (Vec::new(), 0, None, None, None) };
+        } else { ((Vec::new(), 0, None, None, None), None) };
         let page: ElementPage = match (&target, wants_elements) {
             (Some(win), true) => match self.desktop.elements(&win.key(), spec.query.as_deref(), limit, cursor).await {
                 Ok(page) => page,
@@ -925,6 +929,7 @@ impl Controller {
             input_for,
             elements: page.elements,
             browser,
+            page: page_read,
             continuation,
             pictures,
         });
@@ -948,7 +953,8 @@ impl Controller {
     }
 
     /// Page elements of the focused Chrome tab through the extension.
-    async fn observe_browser(&self, task_ref: &str, tabs: &[Tab], query: Option<&str>, limit: u32, continuation: Option<&Continuation>) -> Result<(Vec<BrowserNode>, usize, Option<(String, bool)>, Option<u64>, Option<(String,i64,u32)>)> {
+    #[allow(clippy::type_complexity)]
+    async fn observe_browser(&self, task_ref: &str, tabs: &[Tab], query: Option<&str>, limit: u32, continuation: Option<&Continuation>) -> Result<((Vec<BrowserNode>, usize, Option<(String, bool)>, Option<u64>, Option<(String,i64,u32)>), (i64, String, bool))> {
         let Some(tab) = tabs.iter().find(|t| t.focused).or(tabs.first()) else {
             return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", "No Chrome tab is available through the extension.", true)
                 .with("next", "Use computer_act on the browser window, or view \"image\"."));
@@ -1008,7 +1014,8 @@ impl Controller {
             .then(|| data.get("omittedBackground").and_then(Value::as_u64).unwrap_or(0));
         let next=data.get("next_offset").and_then(Value::as_u64).filter(|n|*n<total as u64 && *n>continuation.map_or(0,|c|c.offset as u64))
             .and_then(|n|u32::try_from(n).ok()).map(|offset|(capture.to_string(),tab.id,offset));
-        Ok((nodes, total, context, modal_background,next))
+        let read = (tab.id, document_id.to_string(), data.get("revalidates_refs").and_then(Value::as_bool) == Some(true));
+        Ok(((nodes, total, context, modal_background,next), read))
     }
 
     /// Operations of a task whose outcome is unknown and not reconciled.
@@ -1043,6 +1050,7 @@ fn empty_frame(task: &TaskRecord, lease: &LeaseRecord) -> FrameState {
         input_for: Vec::new(),
         elements: Vec::new(),
         browser: Vec::new(),
+        page: None,
         continuation: None,
         pictures: Vec::new(),
     }

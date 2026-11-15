@@ -27,7 +27,13 @@ chrome.webNavigation.onBeforeNavigate.addListener(d=>{
 });
 const frameSettled=d=>{const frames=pendingFrames.get(d.tabId);frames?.delete(d.frameId);if(!frames?.size)pendingFrames.delete(d.tabId);};
 // Navigation stops blocking discovery once the new document has committed.
-// Captures and input still bind its document ID and the navigation epoch.
+// A capture binds the navigation epoch of the whole tab. Input binds only
+// the documents an element depends on, the page and the frames between it
+// and the element: an advertisement's frame reloading elsewhere on the page
+// changes neither.
+const loading=(tabId,frames)=>frames.some(f=>pendingFrames.get(tabId)?.has(f));
+// Why the observed tab can no longer take input.
+const away=async tabId=>{const tab=await chrome.tabs.get(tabId).catch(()=>null);return !tab?'closed':tab.incognito||!web(tab.url)?'navigated':'unfocused';};
 chrome.webNavigation.onCommitted.addListener(frameSettled);
 chrome.webNavigation.onCompleted.addListener(frameSettled);
 chrome.webNavigation.onErrorOccurred.addListener(frameSettled);
@@ -131,7 +137,7 @@ chrome.runtime.onConnect.addListener(p=>{
   if(!a||a.port||p.name!=='press:'+a.watch||s?.id!==chrome.runtime.id||s.tab?.id!==a.tabId||s.documentId!==a.documentId){p.disconnect();return;}
   a.port=p;
   p.onMessage.addListener(m=>{
-    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true,redrawn:m.press.redrawn===true,...(typeof m.press.reached==='string'?{reached:m.press.reached.slice(0,80)}:{})};a.pressedAt=Date.now();}
+    if(m?.press?.watch===a.watch&&!a.press){a.press={hit:m.press.hit===true,redrawn:m.press.redrawn===true,...(typeof m.press.reached==='string'?{reached:m.press.reached.slice(0,80)}:{}),...(typeof m.press.locked==='string'?{locked:m.press.locked.slice(0,80)}:{})};a.pressedAt=Date.now();}
     else if(m?.submit?.watch===a.watch&&!a.submit)a.submit={hit:m.submit.hit===true};
     else if(m?.leaving?.watch===a.watch)a.leaving=true;
   });
@@ -236,10 +242,12 @@ async function observeFrames(m,tab,rootId) {
   const offset=m.args.offset||0,nodes=snapshot.nodes.slice(offset,offset+m.args.limit),next=offset+nodes.length<snapshot.nodes.length?offset+nodes.length:null;
   return {result:{...snapshot,routes:undefined,nodes,count:snapshot.nodes.length,documentId:rootId,revalidates_refs:true,next_offset:next,truncated:snapshot.truncated||next!==null}};
 }
+// The tab, while it is the focused window's active web tab; null otherwise,
+// also once it or its window has closed (Chrome then rejects the lookup).
 async function focusedTab(tabId) {
-  const tab=await chrome.tabs.get(tabId);
-  const win=await chrome.windows.get(tab.windowId);
-  return !tab.incognito&&tab.active&&win.focused&&web(tab.url)?tab:null;
+  const tab=await chrome.tabs.get(tabId).catch(()=>null);
+  const win=tab&&await chrome.windows.get(tab.windowId).catch(()=>null);
+  return tab&&win&&!tab.incognito&&tab.active&&win.focused&&web(tab.url)?tab:null;
 }
 // What the armed press did, from the page's own reports: which element it
 // reached and, for a plain click (navigation), where the page went when the
@@ -250,7 +258,7 @@ async function pressed(a,navigation) {
   await until(()=>a.press||a.submit||a.gone,500);
   const hit=a.press?a.press.hit:a.submit?a.submit.hit:null;
   if(hit===null)return {observed:false,hit:null,...(a.gone?{gone:true}:{})};
-  if(!hit)return {observed:true,hit,...(a.press?.reached?{reached:a.press.reached}:{})};
+  if(!hit)return {observed:true,hit,...(a.press?.reached?{reached:a.press.reached}:{}),...(a.press?.locked?{locked:a.press.locked}:{})};
   const redrawn=a.press?.redrawn?{redrawn:true}:{};
   if(!navigation)return {observed:true,hit,...redrawn};
   // A form submits and the page leaves just after the press; a pending
@@ -364,7 +372,7 @@ async function handle(m,jobs) {
       }
     }
     const tab=await focusedTab(m.args.tabId);
-    if(!tab||!fresh(m))return {result:{refused:true}};
+    if(!tab||!fresh(m))return {result:{refused:true,why:tab?'late':await away(m.args.tabId)}};
     const inventory=await chrome.webNavigation.getAllFrames({tabId:tab.id});
     const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
     if(!rootId)return refused();
@@ -382,14 +390,26 @@ async function handle(m,jobs) {
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }
     const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);
-    if(pendingFrames.has(tab.id)||snapshot?.epoch!==(frameEpoch.get(tab.id)||0))return {result:{refused:true}};
-    if(!route||snapshot.tabId!==tab.id||snapshot.rootId!==rootId||m.args.documentId!==rootId)return {result:{refused:true}};
+    const refuse=why=>({result:{refused:true,why}});
+    if(!route||snapshot.tabId!==tab.id)return refuse('expired');
+    if(loading(tab.id,[0]))return refuse('loading');
+    if(snapshot.rootId!==rootId||m.args.documentId!==rootId)return refuse('navigated');
     const path=await framePath(tab.id,route.documentId,rootId);
-    if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return {result:{refused:true}};
+    if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return refuse('navigated');
+    if(loading(tab.id,path.map(step=>step.child.frameId)))return refuse('loading');
     for(let i=0;i<path.length;i++)path[i].token=route.path[i].token;
     const zoom=m.op==='locate'?await chrome.tabs.getZoom(tab.id):undefined;
     if(!fresh(m))return refused();
     dispatching=EFFECTS.includes(m.op);
+    if(m.op==='locate'){
+      // A pointer locked in another frame of the tab takes every press too,
+      // and document.js sees only its own document's lock. The page's own
+      // locked element is named; of another frame only its host, so nothing
+      // of that frame's page is told.
+      const locks=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[{...m,op:'lock'}]});
+      const held=locks.find(r=>r.result?.locked!==undefined&&r.documentId!==route.documentId);
+      if(held)return {result:{locked:held.frameId===0?held.result.locked:held.result.host?'a frame from '+held.result.host:'a frame of the page',documentId:rootId}};
+    }
     if(['locate','reveal'].includes(m.op)){
       const ready=await mapPoint(tab.id,[...path].reverse(),null,true);
       if(!ready.ready)return {result:ready};
@@ -406,7 +426,8 @@ async function handle(m,jobs) {
     if(m.op==='locate'&&answer.watch){
       const freshPath=await framePath(tab.id,route.documentId,rootId);
       if(freshPath?.length===path.length)for(let i=0;i<path.length;i++)freshPath[i].token=path[i].token;
-      answer=freshPath&&!pendingFrames.has(tab.id)&&snapshot.epoch===(frameEpoch.get(tab.id)||0)?{...answer,...await mapPoint(tab.id,freshPath,answer)}:{refused:true};
+      const moved=!freshPath?'navigated':loading(tab.id,[0,...freshPath.map(step=>step.child.frameId)])?'loading':'';
+      answer=moved?{refused:true,why:moved}:{...answer,...await mapPoint(tab.id,freshPath,answer)};
       if(answer.refused||answer.covered)armed=null;
     }
     return {result:{...answer,documentId:rootId,...(zoom!==undefined?{zoom}:{})}};

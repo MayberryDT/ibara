@@ -78,7 +78,22 @@ build() {
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$(realpath "$_core")=/ibara --remap-path-prefix=$(realpath -m "$CARGO_TARGET_DIR")=/target"
   # `ibara --version` prints pkgver-pkgrel.
   export IBARA_PKGREL=$pkgrel
+  # Operator status names the commit it was built from (none outside a checkout).
+  unset IBARA_BUILD
+  IBARA_BUILD=$(_ibara_build "$_core") && export IBARA_BUILD
   cargo build --frozen --release --workspace --bins
+}
+
+# The commit of the git checkout at $1, with -dirty when a tracked file
+# differs from it; fails for a tree that is no checkout of its own, such as
+# a source tarball unpacked inside another repository.
+_ibara_build() {
+  local top commit
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ $top == "$(realpath "$1")" ]] || return 1
+  commit=$(git -C "$1" rev-parse --short=12 HEAD) || return 1
+  [[ -z $(git -C "$1" status --porcelain --untracked-files=no) ]] || commit+=-dirty
+  printf '%s\n' "$commit"
 }
 
 package() {

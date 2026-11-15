@@ -603,6 +603,37 @@ fn fleet_auto_begin_uses_free_targets_and_retains_request_route() {
     assert_eq!(relay.finish(),0);
 }
 
+// Failure case: every ready computer refuses a begin that named none, and the
+// agent hears only the last one's own refusal, about "this computer" as if it
+// had named it, and repeats the same begin.
+#[test]
+fn fleet_auto_begin_says_so_when_every_ready_computer_refused() {
+    let mut script=FLEET_SSH.to_string();
+    let needle="  printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\"";
+    let at=script.find(needle).unwrap();
+    script.insert_str(at,r#"  case "$line" in
+    *'"name":"computer_begin"'*) env='{"status":"error","error":{"code":"BUSY","message":"Another task holds this computer, so no task was started."},"result":null}' ;;
+  esac
+"#);
+    let f=Fixture::with("all-busy",&script,&[(COMPUTER0,ENDPOINT0,"Tulip0","tulip0"),(COMPUTER,ENDPOINT,"Tulip1","tulip1")]);
+    let mut relay=f.spawn(&["mcp","--directory-db",f.db.to_str().unwrap()],"serve"); initialize(&mut relay);
+    let reply=tool(&mut relay,json!(2),"computer_begin",json!({"goal":"race","request_id":"all-busy-1"}));
+    let refused=envelope(&reply);
+    assert_eq!(refused["error"]["code"],"BUSY","{reply}");
+    let message=refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Tulip0") && message.contains("Tulip1") && message.contains("No task started"),"{reply}");
+    assert_eq!(f.route_lines().iter().filter(|l|l.contains("computer_begin")).count(),2,"each ready computer asked once");
+    // Failure case: the same begin again (same request_id) goes only to the
+    // computer its route remembers, yet is answered as though every ready
+    // computer had been asked again.
+    let again=tool(&mut relay,json!(3),"computer_begin",json!({"goal":"race","request_id":"all-busy-1"}));
+    assert_eq!(f.route_lines().iter().filter(|l|l.contains("computer_begin")).count(),3,"only the remembered computer asked again");
+    let refused=envelope(&again);
+    assert_eq!(refused["error"]["code"],"BUSY","{again}");
+    assert_eq!(refused["error"]["message"],"Another task holds this computer, so no task was started.","{again}");
+    assert_eq!(relay.finish(),0);
+}
+
 #[test]
 fn fleet_auto_begin_falls_back_only_after_definite_refusal() {
     // Every target advertises ready; Tulip0 loses the acquisition race.

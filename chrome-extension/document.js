@@ -17,6 +17,7 @@
 //            reports that press, a form it submits and the page leaving,
 //            the moment each happens
 //   verify   whether that press reached the element (or something inside it)
+//   lock     whether this document holds the pointer locked, and on what
 //   selected the label that list now shows
 //   reveal   scroll an element into view
 //   field    whether the element last located has the keyboard focus (the
@@ -294,16 +295,16 @@ export async function documentOperation(message) {
   // Why a request found nothing, for the agent: the tab is hidden, the page
   // answered too late, went to another address or no longer holds the
   // observation, or the element is gone, changed or no longer unique.
-  let missing='';
+  let missing='',changed='';
   const unsafe=()=>document.visibilityState==='visible'?'late':'hidden';
-  const refuse=(why=missing)=>({refused:true,...(why?{why}:{})});
+  const refuse=(why=missing)=>({refused:true,...(why?{why}:{}),...(why==='changed'&&changed?{changed}:{})});
   if(!safe())return refuse(unsafe());
   const args=message.args;
   const normalize=s=>(s||'').replace(/\s+/g,' ').trim();
   // This global belongs only to the extension's isolated world, not page
   // scripts. An updated extension can meet the state and press listener its
   // previous copy left in an open page, so the key changes whenever they do.
-  const key='__ibaraPageReaderV7';
+  const key='__ibaraPageReaderV8';
   const state=globalThis[key] ||= {captures:new Map(),identities:new WeakMap(),watch:null,listening:false,selecting:null,located:null,port:null};
   if(!state.listening){
     // Which element the next trusted press reached, whether it submitted a
@@ -325,7 +326,10 @@ export async function documentOperation(message) {
         const found=sameMeaning(w.meaning);
         if(found.length===1&&reaches(found[0],target)){hit=true;redrawn=true;w.el=found[0];}
       }
-      w.result={hit,redrawn,...(hit?{}:{reached:reached(target)})};
+      // While the page holds the pointer locked (a game's captured mouse),
+      // every press goes to the locked element, at the page's own pointer.
+      const lock=document.pointerLockElement;
+      w.result={hit,redrawn,...(hit?{}:{reached:reached(target),...(lock?{locked:reached(lock)}:{})})};
       post({press:{watch:w.id,...w.result}});
     },true);
     addEventListener('submit',e=>{
@@ -356,7 +360,11 @@ export async function documentOperation(message) {
   // that draws the element again replaces its node: the one element on the
   // page with exactly the same meaning is then the same element; two are
   // ambiguous. No age limit: a step held for a person's approval may run
-  // minutes later.
+  // minutes later. A changed element says what changed: it is hidden (or no
+  // longer a control), or its role, name, actions (disabled), address or
+  // context (the card or row text around it) differ.
+  const difference=(was,now)=>!now?'hidden':now.role!==was.role?'role':now.name!==was.name?'name':
+    String(now.actions)!==String(was.actions)?(now.states.includes('disabled')?'disabled':'actions'):now.href!==was.href?'address':'context';
   const find=()=>{
     const capture=state.captures.get(args.capture);
     const old=capture?.targets.get(args.token);
@@ -367,7 +375,7 @@ export async function documentOperation(message) {
       let current;
       collect('',(el,node)=>{if(el===old.el)current=pack(el,node);});
       if(current&&meaningOf(current)===meaning)return old.el;
-      missing='changed';return null;
+      missing='changed';changed=difference(old.packed,current);return null;
     }
     const found=sameMeaning(meaning);
     if(found.length===1){old.el=found[0];return found[0];}
@@ -417,9 +425,15 @@ export async function documentOperation(message) {
     const text=(document.body?.innerText||'').slice(0,200000);
     return {found:normalize(text).includes(normalize(args.text)),truncated:(document.body?.innerText||'').length>200000};
   }
+  if(message.op==='lock') {
+    // Whether this document holds the pointer locked, for the worker's check
+    // of every frame before a locate: its locked element and this frame's host.
+    const lock=document.pointerLockElement;
+    return lock?{locked:reached(lock),host:location.hostname}:{};
+  }
   if(message.op==='verify') {
     const w=state.watch;state.watch=null;
-    return {observed:!!w?.result,hit:w?.result?w.result.hit:null,...(w?.result?.redrawn?{redrawn:true}:{}),...(w?.result?.reached?{reached:w.result.reached}:{})};
+    return {observed:!!w?.result,hit:w?.result?w.result.hit:null,...(w?.result?.redrawn?{redrawn:true}:{}),...(w?.result?.reached?{reached:w.result.reached}:{}),...(w?.result?.locked?{locked:w.result.locked}:{})};
   }
   if(message.op==='selected') {
     const selection=state.selecting;
@@ -450,6 +464,11 @@ export async function documentOperation(message) {
   if(message.op==='locate'||message.op==='reveal') {
     let el=find();
     if(!el)return refuse();
+    // A page that holds the pointer locked (a game's captured mouse) gives
+    // every press to the locked element, at its own pointer: a press cannot
+    // reach any other element, so none is located.
+    const lock=document.pointerLockElement;
+    if(message.op==='locate'&&lock&&lock!==el&&!el.contains(lock))return {locked:reached(lock)};
     const scrolled=!inView(el);
     if(scrolled)el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
     if(message.op==='reveal')return {revealed:true};
@@ -489,7 +508,12 @@ export async function documentOperation(message) {
       rest=Math.abs(after[0]-before[0])<=1&&Math.abs(after[1]-before[1])<=1&&(!point||reaches(el,hitAt(point.x,point.y)));
     }
     if(!rest)return {moving:true};
-    if(!point)return {covered:true};
+    if(!point){
+      // What is on top at the element's centre (within the window): the
+      // agent's next move depends on whether it is a dialog, a banner or a panel.
+      const [x,y]=centre(el),top=hitAt(Math.min(Math.max(x,0),innerWidth-1),Math.min(Math.max(y,0),innerHeight-1));
+      return {covered:true,...(top&&!reaches(el,top)?{cover:reached(top)}:{})};
+    }
     const bound=state.captures.get(args.capture)?.targets.get(args.token);
     state.watch={el,id:message.watch,result:null,meaning:bound?meaningOf(bound.packed):null};
     state.located={el,capture:args.capture,token:args.token};

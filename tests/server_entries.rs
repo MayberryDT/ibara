@@ -820,11 +820,11 @@ fn a_second_session_of_the_same_agent_cannot_take_a_live_sessions_control() {
     // Long enough for a silent first session to count as gone.
     std::thread::sleep(Duration::from_millis(1500));
     let begin = second.call("computer_begin", json!({ "goal": "Write another note", "request_id": "begin-2" }));
-    assert_eq!((begin["error"]["code"].as_str(), begin["error"]["message"].as_str()), (Some("BUSY"), Some("Control is unavailable.")), "{begin}");
+    assert_eq!((begin["error"]["code"].as_str(), begin["error"]["message"].as_str()), (Some("BUSY"), Some("Another task holds this computer, so no task was started.")), "{begin}");
     assert!(begin["error"]["task_ref"].is_null(), "{begin}");
     assert!(situation(&begin).contains("another agent controls"), "{begin}");
     let taken = second.call("computer_files", json!({ "task_ref": task, "request_id": "write-2", "op": "write", "path": "note.txt", "text": "second\n" }));
-    assert_eq!((taken["error"]["code"].as_str(), taken["error"]["message"].as_str()), (Some("BUSY"), Some("Control is unavailable.")), "{taken}");
+    assert_eq!((taken["error"]["code"].as_str(), taken["error"]["message"].as_str()), (Some("BUSY"), Some("Another session holds this computer's control (another task, or yours in another live session), so nothing was done.")), "{taken}");
     assert_eq!(lease()["connection_id"], held["connection_id"], "the first session keeps its control");
 
     let wrote = first.call("computer_files", json!({ "task_ref": task, "request_id": "write-1", "op": "write", "path": "note.txt", "text": "first\n" }));
@@ -1164,4 +1164,423 @@ fn activity_recorder_health_and_content_free_error_categories_through_process() 
     let disabled=unavailable.admin(&["status"],"admin.key").1;
     assert_eq!(disabled["result"]["recording"]["enabled"],false,"{disabled}");
     if let Some(out)=std::env::var_os("IBARA_ACTIVITY_E2E_OUT") {std::fs::create_dir_all(&out).unwrap();std::fs::write(Path::new(&out).join("recording-health.json"),serde_json::to_vec_pretty(&json!({"health":health,"invalid":bad,"facts":facts,"unavailable_spool":failure_health,"disabled":disabled})).unwrap()).unwrap();}
+}
+
+// Journal retention and ended tasks' attention (14 November 2026). Ways the
+// repair could fail, written before it:
+// - An existing journal has no task_ref indexes, so every old task's evidence
+//   lookup scans whole tables: startup and each new step stall (as on
+//   computers in daily use).
+// - Adding the indexes, or anything else, to an existing journal loses
+//   retained evidence or makes ibarad slow to start.
+// - Every pass visits again each old task it already pruned, so its cost grows
+//   with all history (one computer: 868 such tasks, 19 s a pass without
+//   indexes).
+// - One pass with a large backlog holds ibarad's single thread past the
+//   console's deadlines (attention 4 s, status 6 s), at start or between steps.
+// - A bounded pass stops reclaiming old settled evidence, or reclaims young or
+//   uncertain evidence.
+// - Sign-in requests of tasks that ended long ago stay open, and counted,
+//   forever (one computer: 30 on partial and blocked tasks), at start and
+//   while running.
+// - Closing them also closes a request a later task may still continue.
+
+const LONG_AGO: &str = "2020-01-01T00:00:00.000Z";
+
+/// The journal of an installation from before the repair: without its indexes and column.
+fn as_before_retention_repair(db: &rusqlite::Connection) {
+    for index in ["leases_task", "operations_task", "observations_task", "checks_task", "checkpoints_task", "jobs_task", "tasks_unpruned"] {
+        db.execute_batch(&format!("DROP INDEX IF EXISTS {index}")).unwrap();
+    }
+    let marked: bool = db.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name = 'pruned_at'", [], |r| r.get(0)).unwrap();
+    if marked {
+        db.execute_batch("ALTER TABLE tasks DROP COLUMN pruned_at").unwrap();
+    }
+}
+
+/// `count` tasks `<prefix>1`… in `state`, last updated at `at`.
+fn seed_tasks(db: &rusqlite::Connection, prefix: &str, count: u32, state: &str, at: &str) {
+    db.execute_batch(&format!(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{count})
+         INSERT INTO tasks(task_ref,principal,created_at,updated_at,state,goal,success_criteria,budgets,client_flags,required_capabilities)
+         SELECT '{prefix}'||x,'test','{at}','{at}','{state}','old','[]','{{}}','{{}}','[]' FROM n;"
+    )).unwrap();
+}
+
+/// Whether these tests also hold ibarad to their time limits. Only on a
+/// computer not busy with other work: a loaded one (CI's shared runners, a
+/// build host) misses them however retention behaves. The dedicated check
+/// sets it (`scripts/check-agent-friction.sh`, docs/internals.md).
+fn timed() -> bool {
+    std::env::var_os("IBARA_E2E_TIMING").is_some()
+}
+
+/// One new effect (each records an intent and so runs a retention pass); its
+/// milliseconds, waiting for it when a busy computer answers before
+/// `/bin/true` has exited. Steps are at least 150 ms apart, within a
+/// connection's request rate (80 in 10 s).
+fn step_ms(agent: &mut Agent, task: &str, request_id: &str) -> u128 {
+    let started = std::time::Instant::now();
+    let mut done = agent.call("computer_exec", json!({"task_ref": task, "request_id": request_id, "command": ["/bin/true"]}));
+    if done["status"] == "pending" {
+        done = agent.call("computer_wait", json!({"task_ref": task, "for": {"op": done["result"]["op_ref"]}, "deadline_ms": 60000}));
+    }
+    let ms = started.elapsed().as_millis();
+    assert_eq!(done["status"], "ok", "{done}");
+    std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
+    ms
+}
+
+fn median(values: &[u128]) -> u128 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+fn stopped(daemon: &mut Daemon) -> rusqlite::Connection {
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap()
+}
+
+fn restart_ms(daemon: &mut Daemon) -> u128 {
+    let started = std::time::Instant::now();
+    daemon.crash_and_restart();
+    started.elapsed().as_millis()
+}
+
+#[test]
+fn retention_with_old_empty_tasks_does_not_stall_daemon_startup() {
+    let mut daemon = Daemon::start_with_policy("retention-latency", false, capacity_policy(512 * 1024 * 1024, 512 * 1024 * 1024));
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    let just_now: String = db.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0)).unwrap();
+    db.execute_batch("BEGIN").unwrap();
+    seed_tasks(&db, "old-", 960, "completed", LONG_AGO);
+    // A task that finished just now, with its evidence: young, so retention keeps it.
+    seed_tasks(&db, "recent-", 1, "completed", &just_now);
+    db.execute_batch(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+         INSERT INTO observations(observation_ref,task_ref,principal,record)
+         SELECT 'proof-'||x,'recent-1','test',json_object('proof',hex(zeroblob(2048))) FROM n;
+         COMMIT;",
+    ).unwrap();
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let count: u64 = db.query_row("SELECT count(*) FROM observations WHERE task_ref = 'recent-1'", [], |r| r.get(0)).unwrap();
+    work_artifact("retention-latency", json!({"old_tasks": 960, "retained_observations": count, "startup_ms": startup_ms, "timing_checked": timed()}));
+    assert_eq!(count, 20000, "retention must preserve recent evidence");
+    if timed() {
+        assert!(startup_ms < 2000, "retention blocked daemon startup for {startup_ms} ms");
+    }
+}
+
+#[test]
+fn retention_cost_does_not_grow_with_pruned_history() {
+    // What a step costs on a computer without history.
+    let fresh = Daemon::start_with("retention-no-history", true);
+    let mut agent = Agent::start(&fresh, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    let baseline: Vec<u128> = (0..10).map(|i| step_ms(&mut agent, &task, &format!("baseline-{i}"))).collect();
+    drop(agent);
+    drop(fresh);
+    // Twenty thousand finished tasks whose evidence earlier passes already
+    // removed: about ten months of a busy computer's tasks.
+    let mut daemon = Daemon::start_with("retention-history", true);
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    seed_tasks(&db, "old-", 20_000, "completed", LONG_AGO);
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let mut agent = Agent::start(&daemon, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let unread = || -> i64 { db.query_row("SELECT count(*) FROM tasks WHERE task_ref GLOB 'old-*' AND pruned_at IS NULL", [], |r| r.get(0)).unwrap() };
+    // Passes read that history once (each old task is marked pruned); then a
+    // step costs what it costs without it.
+    let settled_ms = median(&baseline) + 25;
+    let settled = |steps: &[u128]| steps.len() >= 10 && median(&steps[steps.len() - 10..]) <= settled_ms;
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    let mut steps: Vec<u128> = Vec::new();
+    while (unread() > 0 || (timed() && !settled(&steps))) && std::time::Instant::now() < deadline {
+        steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
+    }
+    let (left_unread, settled) = (unread(), settled(&steps));
+    // Once read, an old task is not read again: later passes leave its mark as it is.
+    let marked: Option<String> = db.query_row("SELECT max(pruned_at) FROM tasks WHERE task_ref GLOB 'old-*'", [], |r| r.get(0)).unwrap();
+    for i in 0..5 {
+        steps.push(step_ms(&mut agent, &task, &format!("after-{i}")));
+    }
+    let read_again: i64 = db.query_row("SELECT count(*) FROM tasks WHERE task_ref GLOB 'old-*' AND pruned_at > ?", [&marked], |r| r.get(0)).unwrap();
+    let slowest = steps.iter().copied().max().unwrap_or(0);
+    work_artifact("retention-history", json!({"old_tasks": 20_000, "startup_ms": startup_ms, "baseline_ms": baseline,
+        "steps_ms": steps, "old_tasks_left_unread": left_unread, "old_tasks_read_again": read_again,
+        "settled": settled, "slowest_step_ms": slowest, "timing_checked": timed()}));
+    assert_eq!(left_unread, 0, "the passes never read all of the history in {} steps", steps.len());
+    assert_eq!(read_again, 0, "a pass read again old tasks it had already pruned");
+    if timed() {
+        assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+        assert!(settled, "steps never returned to the cost without history ({settled_ms} ms): {steps:?}");
+        assert!(slowest < 1500, "a step waited {slowest} ms for retention");
+    }
+}
+
+#[test]
+fn retention_backlog_does_not_delay_status() {
+    let mut daemon = Daemon::start_with("retention-backlog", true);
+    let db = stopped(&mut daemon);
+    // Two backlogs of finished tasks still holding settled receipts and
+    // observations: one already old when ibarad starts, one that ages out
+    // while it runs. Pruning either at once takes seconds.
+    db.execute_batch("BEGIN").unwrap();
+    for (backlog, at) in [("start", LONG_AGO), ("later", "2999-01-01T00:00:00.000Z")] {
+        seed_tasks(&db, &format!("{backlog}-"), 1000, "completed", at);
+        db.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<240000)
+             INSERT INTO operations(operation_ref,request_id,principal,task_ref,tool,fingerprint,created_at,updated_at,receipt,dispatched)
+             SELECT '{backlog}-op-'||x,'{backlog}-step-'||x,'test','{backlog}-'||(x%1000+1),'computer_act','f','{LONG_AGO}','{LONG_AGO}',
+                    '{{\"execution\":\"completed\",\"verification\":\"not_requested\",\"effect\":\"none\"}}',1 FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40000)
+             INSERT INTO observations(observation_ref,task_ref,principal,record)
+             SELECT '{backlog}-obs-'||x,'{backlog}-'||(x%1000+1),'test',json_object('proof',hex(zeroblob(1024))) FROM n;"
+        )).unwrap();
+    }
+    // What retention keeps: an old task whose effect is still unknown, and young evidence.
+    seed_tasks(&db, "unknown-", 1, "completed", LONG_AGO);
+    seed_tasks(&db, "young-", 1, "completed", "2999-01-01T00:00:00.000Z");
+    db.execute_batch(&format!(
+        "INSERT INTO operations(operation_ref,request_id,principal,task_ref,tool,fingerprint,created_at,updated_at,receipt,dispatched)
+         VALUES('unknown-op','unknown-step','test','unknown-1','computer_act','f','{LONG_AGO}','{LONG_AGO}','{{\"execution\":\"unknown\",\"verification\":\"unknown\",\"effect\":\"unknown\"}}',1);
+         WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10)
+         INSERT INTO observations(observation_ref,task_ref,principal,record)
+         SELECT 'kept-'||t||'-'||x,t||'-1','test','{{}}' FROM n, (SELECT 'unknown' AS t UNION ALL SELECT 'young');
+         COMMIT;"
+    )).unwrap();
+    drop(db);
+    let startup_ms = restart_ms(&mut daemon);
+    let mut agent = Agent::start(&daemon, "codex");
+    let (task, _) = begin_when_ready(&mut agent);
+    // Another client keeps reading status, as the console does.
+    let mut watcher = Agent::start(&daemon, "claude");
+    let stop = Arc::new(AtomicBool::new(false));
+    let polling = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut waits = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let status = watcher.call("computer_status", json!({}));
+                waits.push((started.elapsed().as_millis(), status["status"] == "ok"));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            waits
+        })
+    };
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let left = |backlog: &str| -> i64 {
+        db.query_row(&format!("SELECT (SELECT count(*) FROM observations WHERE task_ref GLOB '{backlog}-*') + (SELECT count(*) FROM operations WHERE task_ref GLOB '{backlog}-*')"), [], |r| r.get(0)).unwrap()
+    };
+    // Outside metadata pressure a pass starts no task once it has deleted
+    // 1,000 rows, so one step reclaims at most that and one task's rows (each
+    // backlog task holds 240 receipts and 40 observations).
+    let most_a_pass_deletes = 1000 + 280;
+    let mut phases = Vec::new();
+    let mut steps: Vec<u128> = Vec::new();
+    let mut most_one_step_reclaimed = 0;
+    for backlog in ["start", "later"] {
+        if backlog == "later" {
+            db.execute("UPDATE tasks SET updated_at = ? WHERE task_ref GLOB 'later-*'", [LONG_AGO]).unwrap();
+        }
+        let (before, first) = (left(backlog), steps.len());
+        let mut rows = before;
+        // Long enough for a loaded computer: the time limits are checked apart.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        while rows > 0 && std::time::Instant::now() < deadline {
+            steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
+            let now_left = left(backlog);
+            most_one_step_reclaimed = most_one_step_reclaimed.max(rows - now_left);
+            rows = now_left;
+        }
+        phases.push(json!({"backlog": backlog, "rows_when_steps_began": before, "rows_left": rows, "steps": steps.len() - first}));
+    }
+    stop.store(true, Ordering::SeqCst);
+    let waits = polling.join().unwrap();
+    let reclaimed = left("start") == 0 && left("later") == 0;
+    let kept: i64 = db.query_row("SELECT count(*) FROM observations WHERE observation_ref GLOB 'kept-*'", [], |r| r.get(0)).unwrap();
+    let unknown_kept: i64 = db.query_row("SELECT count(*) FROM operations WHERE operation_ref = 'unknown-op'", [], |r| r.get(0)).unwrap();
+    let slowest_status = waits.iter().map(|w| w.0).max().unwrap_or(0);
+    let slowest_step = steps.iter().copied().max().unwrap_or(0);
+    work_artifact("retention-backlog", json!({"backlog_rows": {"start": 280_000, "later": 280_000}, "phases": phases,
+        "startup_ms": startup_ms, "slowest_step_ms": slowest_step, "median_step_ms": if steps.is_empty() { 0 } else { median(&steps) }, "steps_ms": steps,
+        "status_reads": waits.len(), "slowest_status_ms": slowest_status, "status_failures": waits.iter().filter(|w| !w.1).count(),
+        "most_one_step_reclaimed": most_one_step_reclaimed, "reclaimed": reclaimed, "kept_observations": kept, "unknown_receipt_kept": unknown_kept == 1,
+        "timing_checked": timed()}));
+    assert!(waits.iter().all(|w| w.1), "a status read failed");
+    assert!(reclaimed, "old settled evidence was not reclaimed: {phases:?}");
+    assert!(most_one_step_reclaimed <= most_a_pass_deletes, "one pass deleted {most_one_step_reclaimed} rows");
+    assert_eq!(kept, 20, "young or uncertain evidence was reclaimed");
+    assert_eq!(unknown_kept, 1, "an unknown receipt was reclaimed");
+    if timed() {
+        assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+        // Half the console's attention deadline (4 s); a disk's own fsync stalls fit.
+        assert!(slowest_status < 2000, "a status read waited {slowest_status} ms");
+        assert!(slowest_step < 2000, "a step waited {slowest_step} ms");
+    }
+}
+
+#[test]
+fn ended_task_attention_closes_at_start_and_while_running() {
+    let mut daemon = Daemon::start_with("attention-ended", true);
+    let db = stopped(&mut daemon);
+    let ago = |modifier: &str| -> String { db.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now',?)", [modifier], |r| r.get(0)).unwrap() };
+    let login = r#"{"assistance":{"version":1,"revision":0,"notification":"attention"},"sites":[{"site":"accounts.test","state":"asking"}]}"#;
+    let raise = |task: &str, state: &str, ended: &str, att: &str, kind: &str| {
+        seed_tasks(&db, task, 1, state, ended);
+        db.execute(
+            "INSERT INTO attention_items(att_ref,task_ref,principal,kind,question,details,state,created_at) VALUES(?,?,'test',?,'Sign in to accounts.test?',?,'open',?)",
+            rusqlite::params![att, format!("{task}1"), kind, if kind == "login" { Some(login) } else { None }, ended],
+        ).unwrap();
+    };
+    // One computer, 14 November: 30 sign-in requests of partial and blocked tasks that ended 10 to 25 days earlier.
+    for i in 0..30 {
+        raise(&format!("ended-{i}-"), if i < 25 { "partial" } else { "blocked" }, &ago(&format!("-{} hours", 240 + i * 12)), &format!("att_ended_{i}"), "login");
+    }
+    // A request of a task that ended an hour ago: a later task may still continue it.
+    raise("recent-", "partial", &ago("-1 hours"), "att_recent", "login");
+    // Other kinds of item close with their task, as before.
+    raise("question-", "blocked", &ago("-20 days"), "att_question", "question");
+    // An old task's request no longer keeps its evidence from retention.
+    raise("old-", "partial", &ago("-40 days"), "att_old", "login");
+    db.execute("INSERT INTO observations(observation_ref,task_ref,principal,record) VALUES('old-proof','old-1','test','{}')", []).unwrap();
+    let open = |db: &rusqlite::Connection| -> Vec<String> {
+        db.prepare("SELECT att_ref FROM attention_items WHERE state = 'open' ORDER BY att_ref").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    };
+    let open_before = open(&db).len();
+    let two_days_ago = ago("-2 days");
+    drop(db);
+    daemon.crash_and_restart();
+    let mut agent = Agent::start(&daemon, "codex");
+    let started = situation(&agent.call("computer_status", json!({}))).to_string();
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let open_after_start = open(&db);
+    let old_evidence: i64 = db.query_row("SELECT count(*) FROM observations WHERE observation_ref = 'old-proof'", [], |r| r.get(0)).unwrap();
+    // While ibarad runs, the remaining request's task has now ended two days ago.
+    db.execute("UPDATE tasks SET updated_at = ? WHERE task_ref = 'recent-1'", [&two_days_ago]).unwrap();
+    let waited = std::time::Instant::now();
+    while !open(&db).is_empty() && waited.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let open_while_running = open(&db);
+    let closed_after_ms = waited.elapsed().as_millis();
+    let running = situation(&agent.call("computer_status", json!({}))).to_string();
+    work_artifact("attention-ended", json!({"open_before_start": open_before, "open_after_start": open_after_start,
+        "situation_after_start": started, "old_task_evidence_left": old_evidence, "open_while_running": open_while_running,
+        "closed_while_running_after_ms": closed_after_ms, "situation_while_running": running}));
+    assert_eq!(open_after_start, ["att_recent"], "{started}");
+    assert!(started.contains(" 1 attention"), "{started}");
+    assert_eq!(old_evidence, 0, "an expired request still kept its old task's evidence");
+    assert!(open_while_running.is_empty(), "still open after {closed_after_ms} ms: {open_while_running:?}");
+    assert!(running.contains(" 0 attention"), "{running}");
+}
+
+// The retention indexes on a disk without room for them (14 November 2026).
+// Ways it could fail, written before the change:
+// - Building them is part of the startup migration, so when the disk cannot
+//   take their pages the journal does not open and ibarad does not start: no
+//   status, no emergency finish, where 0.3.7 still served both.
+// - ibarad starts, but status or finishing a task fails afterwards.
+// - They are never built once there is room again, so retention scans whole
+//   tables from then on.
+// The disk is stood in for by a file size limit on ibarad (SIGXFSZ ignored,
+// so a write past it fails as on a full disk), lifted for the last start.
+
+/// Start the stopped daemon again: whether it became ready, and its log until then.
+fn start_again(daemon: &mut Daemon) -> (bool, Vec<String>) {
+    daemon.child = daemon.command.spawn().unwrap();
+    let stderr = daemon.child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut log = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(line) if line.contains("\"controller_ready\"") => return (true, log),
+            Ok(line) => log.push(line),
+            Err(_) => return (false, log),
+        }
+    }
+}
+
+#[test]
+fn retention_indexes_wait_for_room_and_ibarad_still_starts() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::AtomicU64;
+    let mut daemon = Daemon::start_with("retention-room", true);
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    // Evidence whose task_ref index needs far more than the 4 MiB a file may grow to.
+    db.execute_batch(
+        "BEGIN;
+         WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000)
+         INSERT INTO observations(observation_ref,task_ref,principal,record) SELECT 'o'||x,'evidence-'||(x%100),'test','{}' FROM n;
+         COMMIT;",
+    ).unwrap();
+    drop(db);
+    let limit = Arc::new(AtomicU64::new(4 * 1024 * 1024));
+    let child_limit = limit.clone();
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        daemon.command.pre_exec(move || {
+            let bytes = child_limit.load(Ordering::SeqCst);
+            if bytes > 0 {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                libc::getrlimit(libc::RLIMIT_FSIZE, &mut r);
+                r.rlim_cur = bytes.min(r.rlim_max);
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &r) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let indexes = |db: &rusqlite::Connection| -> Vec<String> {
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('leases_task','operations_task','observations_task','checks_task','checkpoints_task','jobs_task','tasks_unpruned') ORDER BY name")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    };
+    let (ready, log) = start_again(&mut daemon);
+    assert!(ready, "ibarad did not start while its files could not grow (exit {:?}): {log:#?}", daemon.child.try_wait());
+    let mut agent = Agent::start(&daemon, "codex");
+    let status = agent.call("computer_status", json!({}));
+    assert_eq!(status["status"], "ok", "{status}");
+    let (task, _) = begin_when_ready(&mut agent);
+    let finished = agent.call("computer_finish", json!({"task_ref": task, "request_id": "finish-full", "outcome": "complete", "summary": "Finished on a full disk"}));
+    assert_eq!(finished["status"], "ok", "{finished}");
+    drop(agent);
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let while_full = indexes(&db);
+    let observations: i64 = db.query_row("SELECT count(*) FROM observations WHERE task_ref GLOB 'evidence-*'", [], |r| r.get(0)).unwrap();
+    drop(db);
+    // Room again: the next start builds them, as on any journal from before them.
+    limit.store(0, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let (ready_again, _) = start_again(&mut daemon);
+    let startup_ms = started.elapsed().as_millis();
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let with_room = indexes(&db);
+    work_artifact("retention-room", json!({"started_while_full": ready, "log_while_full": log, "status_while_full": status["status"],
+        "finished_while_full": finished["status"], "indexes_while_full": while_full, "observations_kept": observations,
+        "started_with_room": ready_again, "indexes_with_room": with_room, "startup_with_room_ms": startup_ms}));
+    // The limit did bite: the large index could not be built while it held.
+    assert!(!while_full.iter().any(|i| i == "observations_task"), "{while_full:?}");
+    assert_eq!(observations, 400_000, "evidence was lost");
+    assert!(ready_again, "ibarad did not start again");
+    assert_eq!(with_room, ["checkpoints_task", "checks_task", "jobs_task", "leases_task", "observations_task", "operations_task", "tasks_unpruned"]);
 }

@@ -35,6 +35,8 @@
 //!    on the sleeping one's network, or claims to have been sent when no
 //!    computer there is on, or when this computer is on another network that
 //!    uses the same private range.
+//! 12. Status does not carry the commit the computer's ibarad was built from
+//!    when its build named one, or invents one when it did not.
 //!
 //! `IBARA_E2E_EVIDENCE=DIR` keeps every console exchange as JSON lines in DIR.
 
@@ -252,6 +254,10 @@ fn a_computer_is_looked_after_from_another_over_the_pairing_route() {
     assert_eq!(directory_row(&mut vesper, &id)["wake"], wake, "kept for when Tulip1 sleeps");
     let status = ok_on(&mut vesper, &id, &e, "operator-status", &[]);
     assert_eq!((status["paused"].as_bool(), status["pause_origin"].as_str(), &status["disk_password"]), (Some(true), Some("system"), &json!(true)));
+    // The commit Tulip1's ibarad was built from, as packaging names it in
+    // IBARA_BUILD (this test is built with the same environment); absent when
+    // the build did not know it.
+    assert_eq!(status.get("build").and_then(Value::as_str), option_env!("IBARA_BUILD").filter(|b| !b.is_empty()), "{status}");
 
     // Logs: the newest lines of ibara's own unit, or of its screen sharing (the stream's own log).
     let logs = ok_on(&mut vesper, &id, &e, "operator-logs", &["--which", "ibara", "--lines", "3"]);

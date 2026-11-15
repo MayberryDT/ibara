@@ -1204,12 +1204,24 @@ fn seed_tasks(db: &rusqlite::Connection, prefix: &str, count: u32, state: &str, 
     )).unwrap();
 }
 
+/// Whether these tests also hold ibarad to their time limits. Only on a
+/// computer not busy with other work: a loaded one (CI's shared runners, a
+/// build host) misses them however retention behaves. The dedicated check
+/// sets it (`scripts/check-agent-friction.sh`, docs/internals.md).
+fn timed() -> bool {
+    std::env::var_os("IBARA_E2E_TIMING").is_some()
+}
+
 /// One new effect (each records an intent and so runs a retention pass); its
-/// milliseconds. Steps are at least 150 ms apart, within a connection's
-/// request rate (80 in 10 s).
+/// milliseconds, waiting for it when a busy computer answers before
+/// `/bin/true` has exited. Steps are at least 150 ms apart, within a
+/// connection's request rate (80 in 10 s).
 fn step_ms(agent: &mut Agent, task: &str, request_id: &str) -> u128 {
     let started = std::time::Instant::now();
-    let done = agent.call("computer_exec", json!({"task_ref": task, "request_id": request_id, "command": ["/bin/true"]}));
+    let mut done = agent.call("computer_exec", json!({"task_ref": task, "request_id": request_id, "command": ["/bin/true"]}));
+    if done["status"] == "pending" {
+        done = agent.call("computer_wait", json!({"task_ref": task, "for": {"op": done["result"]["op_ref"]}, "deadline_ms": 60000}));
+    }
     let ms = started.elapsed().as_millis();
     assert_eq!(done["status"], "ok", "{done}");
     std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
@@ -1239,21 +1251,26 @@ fn retention_with_old_empty_tasks_does_not_stall_daemon_startup() {
     let mut daemon = Daemon::start_with_policy("retention-latency", false, capacity_policy(512 * 1024 * 1024, 512 * 1024 * 1024));
     let db = stopped(&mut daemon);
     as_before_retention_repair(&db);
+    let just_now: String = db.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0)).unwrap();
     db.execute_batch("BEGIN").unwrap();
     seed_tasks(&db, "old-", 960, "completed", LONG_AGO);
+    // A task that finished just now, with its evidence: young, so retention keeps it.
+    seed_tasks(&db, "recent-", 1, "completed", &just_now);
     db.execute_batch(
         "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
          INSERT INTO observations(observation_ref,task_ref,principal,record)
-         SELECT 'proof-'||x,'recent','test',json_object('proof',hex(zeroblob(2048))) FROM n;
+         SELECT 'proof-'||x,'recent-1','test',json_object('proof',hex(zeroblob(2048))) FROM n;
          COMMIT;",
     ).unwrap();
     drop(db);
     let startup_ms = restart_ms(&mut daemon);
     let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
-    let count: u64 = db.query_row("SELECT count(*) FROM observations", [], |r| r.get(0)).unwrap();
-    work_artifact("retention-latency", json!({"old_tasks": 960, "retained_observations": count, "startup_ms": startup_ms}));
+    let count: u64 = db.query_row("SELECT count(*) FROM observations WHERE task_ref = 'recent-1'", [], |r| r.get(0)).unwrap();
+    work_artifact("retention-latency", json!({"old_tasks": 960, "retained_observations": count, "startup_ms": startup_ms, "timing_checked": timed()}));
     assert_eq!(count, 20000, "retention must preserve recent evidence");
-    assert!(startup_ms < 2000, "retention blocked daemon startup for {startup_ms} ms");
+    if timed() {
+        assert!(startup_ms < 2000, "retention blocked daemon startup for {startup_ms} ms");
+    }
 }
 
 #[test]
@@ -1275,25 +1292,35 @@ fn retention_cost_does_not_grow_with_pruned_history() {
     let startup_ms = restart_ms(&mut daemon);
     let mut agent = Agent::start(&daemon, "codex");
     let (task, _) = begin_when_ready(&mut agent);
-    // Passes may visit that history once; then a step costs what it costs without it.
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let unread = || -> i64 { db.query_row("SELECT count(*) FROM tasks WHERE task_ref GLOB 'old-*' AND pruned_at IS NULL", [], |r| r.get(0)).unwrap() };
+    // Passes read that history once (each old task is marked pruned); then a
+    // step costs what it costs without it.
     let settled_ms = median(&baseline) + 25;
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let settled = |steps: &[u128]| steps.len() >= 10 && median(&steps[steps.len() - 10..]) <= settled_ms;
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
     let mut steps: Vec<u128> = Vec::new();
-    let settled = loop {
-        if steps.len() >= 10 && median(&steps[steps.len() - 10..]) <= settled_ms {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
+    while (unread() > 0 || (timed() && !settled(&steps))) && std::time::Instant::now() < deadline {
         steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
-    };
+    }
+    let (left_unread, settled) = (unread(), settled(&steps));
+    // Once read, an old task is not read again: later passes leave its mark as it is.
+    let marked: Option<String> = db.query_row("SELECT max(pruned_at) FROM tasks WHERE task_ref GLOB 'old-*'", [], |r| r.get(0)).unwrap();
+    for i in 0..5 {
+        steps.push(step_ms(&mut agent, &task, &format!("after-{i}")));
+    }
+    let read_again: i64 = db.query_row("SELECT count(*) FROM tasks WHERE task_ref GLOB 'old-*' AND pruned_at > ?", [&marked], |r| r.get(0)).unwrap();
     let slowest = steps.iter().copied().max().unwrap_or(0);
     work_artifact("retention-history", json!({"old_tasks": 20_000, "startup_ms": startup_ms, "baseline_ms": baseline,
-        "steps_ms": steps, "settled": settled, "steps_to_settle": if settled { steps.len() } else { 0 }, "slowest_step_ms": slowest}));
-    assert!(startup_ms < 2000, "startup took {startup_ms} ms");
-    assert!(settled, "steps never returned to the cost without history ({settled_ms} ms): {steps:?}");
-    assert!(slowest < 1500, "a step waited {slowest} ms for retention");
+        "steps_ms": steps, "old_tasks_left_unread": left_unread, "old_tasks_read_again": read_again,
+        "settled": settled, "slowest_step_ms": slowest, "timing_checked": timed()}));
+    assert_eq!(left_unread, 0, "the passes never read all of the history in {} steps", steps.len());
+    assert_eq!(read_again, 0, "a pass read again old tasks it had already pruned");
+    if timed() {
+        assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+        assert!(settled, "steps never returned to the cost without history ({settled_ms} ms): {steps:?}");
+        assert!(slowest < 1500, "a step waited {slowest} ms for retention");
+    }
 }
 
 #[test]
@@ -1351,18 +1378,28 @@ fn retention_backlog_does_not_delay_status() {
     let left = |backlog: &str| -> i64 {
         db.query_row(&format!("SELECT (SELECT count(*) FROM observations WHERE task_ref GLOB '{backlog}-*') + (SELECT count(*) FROM operations WHERE task_ref GLOB '{backlog}-*')"), [], |r| r.get(0)).unwrap()
     };
+    // Outside metadata pressure a pass starts no task once it has deleted
+    // 1,000 rows, so one step reclaims at most that and one task's rows (each
+    // backlog task holds 240 receipts and 40 observations).
+    let most_a_pass_deletes = 1000 + 280;
     let mut phases = Vec::new();
     let mut steps: Vec<u128> = Vec::new();
+    let mut most_one_step_reclaimed = 0;
     for backlog in ["start", "later"] {
         if backlog == "later" {
             db.execute("UPDATE tasks SET updated_at = ? WHERE task_ref GLOB 'later-*'", [LONG_AGO]).unwrap();
         }
         let (before, first) = (left(backlog), steps.len());
-        let deadline = std::time::Instant::now() + Duration::from_secs(240);
-        while left(backlog) > 0 && std::time::Instant::now() < deadline {
+        let mut rows = before;
+        // Long enough for a loaded computer: the time limits are checked apart.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        while rows > 0 && std::time::Instant::now() < deadline {
             steps.push(step_ms(&mut agent, &task, &format!("step-{}", steps.len())));
+            let now_left = left(backlog);
+            most_one_step_reclaimed = most_one_step_reclaimed.max(rows - now_left);
+            rows = now_left;
         }
-        phases.push(json!({"backlog": backlog, "rows_when_steps_began": before, "rows_left": left(backlog), "steps": steps.len() - first}));
+        phases.push(json!({"backlog": backlog, "rows_when_steps_began": before, "rows_left": rows, "steps": steps.len() - first}));
     }
     stop.store(true, Ordering::SeqCst);
     let waits = polling.join().unwrap();
@@ -1374,15 +1411,19 @@ fn retention_backlog_does_not_delay_status() {
     work_artifact("retention-backlog", json!({"backlog_rows": {"start": 280_000, "later": 280_000}, "phases": phases,
         "startup_ms": startup_ms, "slowest_step_ms": slowest_step, "median_step_ms": if steps.is_empty() { 0 } else { median(&steps) }, "steps_ms": steps,
         "status_reads": waits.len(), "slowest_status_ms": slowest_status, "status_failures": waits.iter().filter(|w| !w.1).count(),
-        "reclaimed": reclaimed, "kept_observations": kept, "unknown_receipt_kept": unknown_kept == 1}));
-    assert!(startup_ms < 2000, "startup took {startup_ms} ms");
-    // Half the console's attention deadline (4 s); a disk's own fsync stalls fit.
-    assert!(slowest_status < 2000, "a status read waited {slowest_status} ms");
+        "most_one_step_reclaimed": most_one_step_reclaimed, "reclaimed": reclaimed, "kept_observations": kept, "unknown_receipt_kept": unknown_kept == 1,
+        "timing_checked": timed()}));
     assert!(waits.iter().all(|w| w.1), "a status read failed");
-    assert!(slowest_step < 2000, "a step waited {slowest_step} ms");
     assert!(reclaimed, "old settled evidence was not reclaimed: {phases:?}");
+    assert!(most_one_step_reclaimed <= most_a_pass_deletes, "one pass deleted {most_one_step_reclaimed} rows");
     assert_eq!(kept, 20, "young or uncertain evidence was reclaimed");
     assert_eq!(unknown_kept, 1, "an unknown receipt was reclaimed");
+    if timed() {
+        assert!(startup_ms < 2000, "startup took {startup_ms} ms");
+        // Half the console's attention deadline (4 s); a disk's own fsync stalls fit.
+        assert!(slowest_status < 2000, "a status read waited {slowest_status} ms");
+        assert!(slowest_step < 2000, "a step waited {slowest_step} ms");
+    }
 }
 
 #[test]

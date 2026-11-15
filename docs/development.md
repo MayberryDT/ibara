@@ -22,7 +22,7 @@ cargo test
 
 The tests expect Arch's system files: one relies on `/etc/shadow` having mode 0600, so on other distributions it fails. cargo stops at the first failing test program, so use `cargo test --no-fail-fast` to see every failure at once.
 
-`node e2e/browser/reader.mjs DIR` runs the page reader (`chrome-extension/`) in headless Chromium, with its sandbox on, and asks it what `ibarad` asks over native messaging; trusted pointer input comes from the DevTools protocol. `scripts/check-agent-friction.sh DIR` runs it with the controller, operator, packaging and status tests of the November 2026 agent friction changes and keeps every log and a `summary.json` in DIR.
+`node e2e/browser/reader.mjs DIR` runs the page reader (`chrome-extension/`) in headless Chromium, with its sandbox on, and asks it what `ibarad` asks over native messaging; trusted pointer input comes from the DevTools protocol. `scripts/check-agent-friction.sh DIR` runs it with the controller, operator, packaging, retention and status tests of the November 2026 agent friction changes and keeps every log and a `summary.json` in DIR. It checks the retention tests' time limits too (`IBARA_E2E_TIMING=1`), so run it on a computer not busy with other work.
 
 CI runs the same `cargo test --locked` as an ordinary user in an `archlinux:base-devel` container on every pull request and every push to `main` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)).
 

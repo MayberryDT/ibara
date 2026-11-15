@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs every check of the agent friction changes (November 2026) and keeps
 # their output in ARTIFACT_DIR: the controller and Cua tests, the operator
-# and PKGBUILD tests, operator status through real daemons with and without a
-# build identity, and the page reader in headless Chromium.
+# and PKGBUILD tests, journal retention with its time limits, operator status
+# through real daemons with and without a build identity, and the page reader
+# in headless Chromium.
 #
 #   scripts/check-agent-friction.sh ARTIFACT_DIR
 #
@@ -26,6 +27,8 @@ run() {
 }
 run controller cargo test --locked --lib -- controller::tests::friction controller::tests::reconnect desktop::cua::tests::an_element_placed_outside
 run operator-and-packaging cargo test --locked --test operator --test build_identity
+# With their time limits, which assume a computer not busy with other work.
+run retention env IBARA_E2E_TIMING=1 IBARA_E2E_ARTIFACTS="$out/retention" cargo test --locked --test server_entries -- retention ended_task_attention --test-threads=1
 run status-without-build env -u IBARA_BUILD IBARA_E2E_EVIDENCE="$out/status-without-build" cargo test --locked --test everyday -- a_computer_is_looked_after
 run status-with-build env IBARA_BUILD="$commit-check" IBARA_E2E_EVIDENCE="$out/status-with-build" cargo test --locked --test everyday -- a_computer_is_looked_after
 run page-reader node e2e/browser/reader.mjs "$out"

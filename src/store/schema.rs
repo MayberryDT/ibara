@@ -30,8 +30,10 @@
 //!   person's logins). SQLite cannot change a CHECK in place, so the table is
 //!   rebuilt once with the same columns and rows; an older build reads the
 //!   rows as they are and never writes that kind.
-//! - Indexes on `task_ref` for retention ([`RETENTION_INDEXES`]). An older
-//!   build keeps them up to date without using them.
+//! - Indexes on `task_ref` for retention ([`RETENTION_INDEXES`]), built
+//!   after the migration, once the disk has room for them
+//!   ([`create_retention_indexes`]). An older build keeps them up to date
+//!   without using them.
 //! - `tasks.pruned_at`: when retention removed the evidence of an old
 //!   finished task. Retention does not read that task again until something
 //!   new is recorded for it. An older build ignores it and prunes as before.
@@ -181,7 +183,6 @@ pub(crate) fn migrate(conn: &Connection, storage_path: &Path, now_iso: &str) -> 
     if !attention_sql.contains("'login'") {
         tx.execute_batch(ATTENTION_WITH_LOGIN)?;
     }
-    tx.execute_batch(RETENTION_INDEXES)?;
     crate::access::rename_agents(&tx)?;
     if from < CORE_SCHEMA_VERSION {
         tx.execute(
@@ -565,7 +566,8 @@ const ATTENTION_WITH_LOGIN: &str = r#"
 /// these every lookup scans its whole table (AK2 and BMAX, October and
 /// November 2026). The names are those added by hand to AK2's and Dell's
 /// journals, which therefore keep theirs. On an existing journal each is
-/// built once, in one pass over its table, when ibarad starts.
+/// built once, in one pass over its table, when ibarad starts, or later if
+/// the disk has no room for it then ([`create_retention_indexes`]).
 ///
 /// `tasks_unpruned` holds only the finished tasks retention has still to
 /// read, so a pass never walks the tasks it already pruned. Its condition is
@@ -581,6 +583,13 @@ const RETENTION_INDEXES: &str = r#"
       CREATE INDEX IF NOT EXISTS tasks_unpruned ON tasks(updated_at, task_ref)
         WHERE pruned_at IS NULL AND state IN ('completed', 'cancelled', 'partial');
     "#;
+
+/// Builds the retention indexes not built yet, each on its own, so those
+/// that fit stay built. Not part of [`migrate`]: on a disk without room for
+/// their pages the journal must still open (`Journal::index_for_retention`).
+pub(crate) fn create_retention_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(RETENTION_INDEXES)
+}
 
 /// Core schema 6: the windows each task opened.
 const V6_DDL: &str = r#"

@@ -1481,3 +1481,103 @@ fn ended_task_attention_closes_at_start_and_while_running() {
     assert!(open_while_running.is_empty(), "still open after {closed_after_ms} ms: {open_while_running:?}");
     assert!(running.contains(" 0 attention"), "{running}");
 }
+
+// The retention indexes on a disk without room for them (14 November 2026).
+// Ways it could fail, written before the change:
+// - Building them is part of the startup migration, so when the disk cannot
+//   take their pages the journal does not open and ibarad does not start: no
+//   status, no emergency finish, where 0.3.7 still served both.
+// - ibarad starts, but status or finishing a task fails afterwards.
+// - They are never built once there is room again, so retention scans whole
+//   tables from then on.
+// The disk is stood in for by a file size limit on ibarad (SIGXFSZ ignored,
+// so a write past it fails as on a full disk), lifted for the last start.
+
+/// Start the stopped daemon again: whether it became ready, and its log until then.
+fn start_again(daemon: &mut Daemon) -> (bool, Vec<String>) {
+    daemon.child = daemon.command.spawn().unwrap();
+    let stderr = daemon.child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut log = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(line) if line.contains("\"controller_ready\"") => return (true, log),
+            Ok(line) => log.push(line),
+            Err(_) => return (false, log),
+        }
+    }
+}
+
+#[test]
+fn retention_indexes_wait_for_room_and_ibarad_still_starts() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::AtomicU64;
+    let mut daemon = Daemon::start_with("retention-room", true);
+    let db = stopped(&mut daemon);
+    as_before_retention_repair(&db);
+    // Evidence whose task_ref index needs far more than the 4 MiB a file may grow to.
+    db.execute_batch(
+        "BEGIN;
+         WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000)
+         INSERT INTO observations(observation_ref,task_ref,principal,record) SELECT 'o'||x,'evidence-'||(x%100),'test','{}' FROM n;
+         COMMIT;",
+    ).unwrap();
+    drop(db);
+    let limit = Arc::new(AtomicU64::new(4 * 1024 * 1024));
+    let child_limit = limit.clone();
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        daemon.command.pre_exec(move || {
+            let bytes = child_limit.load(Ordering::SeqCst);
+            if bytes > 0 {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                libc::getrlimit(libc::RLIMIT_FSIZE, &mut r);
+                r.rlim_cur = bytes.min(r.rlim_max);
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &r) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let indexes = |db: &rusqlite::Connection| -> Vec<String> {
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('leases_task','operations_task','observations_task','checks_task','checkpoints_task','jobs_task','tasks_unpruned') ORDER BY name")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    };
+    let (ready, log) = start_again(&mut daemon);
+    assert!(ready, "ibarad did not start while its files could not grow (exit {:?}): {log:#?}", daemon.child.try_wait());
+    let mut agent = Agent::start(&daemon, "codex");
+    let status = agent.call("computer_status", json!({}));
+    assert_eq!(status["status"], "ok", "{status}");
+    let (task, _) = begin_when_ready(&mut agent);
+    let finished = agent.call("computer_finish", json!({"task_ref": task, "request_id": "finish-full", "outcome": "complete", "summary": "Finished on a full disk"}));
+    assert_eq!(finished["status"], "ok", "{finished}");
+    drop(agent);
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let while_full = indexes(&db);
+    let observations: i64 = db.query_row("SELECT count(*) FROM observations WHERE task_ref GLOB 'evidence-*'", [], |r| r.get(0)).unwrap();
+    drop(db);
+    // Room again: the next start builds them, as on any journal from before them.
+    limit.store(0, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let (ready_again, _) = start_again(&mut daemon);
+    let startup_ms = started.elapsed().as_millis();
+    let db = rusqlite::Connection::open(daemon.root.join("state/journal.sqlite")).unwrap();
+    let with_room = indexes(&db);
+    work_artifact("retention-room", json!({"started_while_full": ready, "log_while_full": log, "status_while_full": status["status"],
+        "finished_while_full": finished["status"], "indexes_while_full": while_full, "observations_kept": observations,
+        "started_with_room": ready_again, "indexes_with_room": with_room, "startup_with_room_ms": startup_ms}));
+    // The limit did bite: the large index could not be built while it held.
+    assert!(!while_full.iter().any(|i| i == "observations_task"), "{while_full:?}");
+    assert_eq!(observations, 400_000, "evidence was lost");
+    assert!(ready_again, "ibarad did not start again");
+    assert_eq!(with_room, ["checkpoints_task", "checks_task", "jobs_task", "leases_task", "observations_task", "operations_task", "tasks_unpruned"]);
+}

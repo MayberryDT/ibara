@@ -28,6 +28,8 @@ const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(100);
 const RETENTION_PASS_ROWS: usize = 1000;
 /// Tasks one bounded pass reads at most.
 const RETENTION_BATCH: i64 = 500;
+/// How long after a failed build of the retention indexes another is tried.
+const RETENTION_INDEX_RETRY: Duration = Duration::from_secs(600);
 
 /// Milliseconds since the epoch; injectable for tests (`JournalOptions.now`).
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -97,6 +99,9 @@ pub struct Journal {
     migration: MigrationOutcome,
     /// The last task (`updated_at`, `task_ref`) a bounded retention pass read.
     retention_after: RefCell<Option<(String, String)>>,
+    /// Whether the retention indexes are built, and when a build last failed.
+    retention_indexed: Cell<bool>,
+    retention_index_failed: Cell<Option<Instant>>,
 }
 
 impl Journal {
@@ -141,6 +146,8 @@ impl Journal {
             clock,
             migration,
             retention_after: RefCell::new(None),
+            retention_indexed: Cell::new(false),
+            retention_index_failed: Cell::new(None),
         };
         journal.enforce_retention(false)?;
         Ok(journal)
@@ -1221,6 +1228,7 @@ impl Journal {
             if for_new_intent { return Err(self.capacity_error("disk_reserve")); }
             return Ok(());
         }
+        self.index_for_retention();
         let pressure = || -> Result<bool> { Ok(self.metadata_bytes()? >= self.max_metadata_bytes.get().saturating_mul(4) / 5) };
         // Under pressure admission depends on what this pass reclaims, so it
         // prunes all it may, as before; otherwise it is bounded.
@@ -1426,6 +1434,26 @@ impl Journal {
             *self.retention_after.borrow_mut() = tasks.get(read - 1).cloned();
         }
         Ok(deleted)
+    }
+
+    /// Builds the retention indexes unless they are built: normally at the
+    /// first pass, when ibarad starts. They are not part of the startup
+    /// migration, so a disk without room for them never keeps ibarad from
+    /// starting, answering status and finishing tasks. Below the disk reserve
+    /// no pass gets here; a build that fails is tried again at a pass
+    /// [`RETENTION_INDEX_RETRY`] later. Until they are built, retention reads
+    /// without them, as before they existed.
+    fn index_for_retention(&self) {
+        if self.retention_indexed.get() || self.retention_index_failed.get().is_some_and(|at| at.elapsed() < RETENTION_INDEX_RETRY) {
+            return;
+        }
+        match schema::create_retention_indexes(&self.db) {
+            Ok(()) => self.retention_indexed.set(true),
+            Err(e) => {
+                self.retention_index_failed.set(Some(Instant::now()));
+                crate::controller::log_event("retention_indexes_deferred", &e.to_string());
+            }
+        }
     }
 
     /// Something new was recorded for `task_ref`: retention reads the task again.

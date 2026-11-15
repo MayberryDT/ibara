@@ -1169,17 +1169,20 @@ fn activity_recorder_health_and_content_free_error_categories_through_process() 
 // Journal retention and ended tasks' attention (14 November 2026). Ways the
 // repair could fail, written before it:
 // - An existing journal has no task_ref indexes, so every old task's evidence
-//   lookup scans whole tables: startup and each new step stall (AK2, BMAX).
+//   lookup scans whole tables: startup and each new step stall (as on
+//   computers in daily use).
 // - Adding the indexes, or anything else, to an existing journal loses
 //   retained evidence or makes ibarad slow to start.
 // - Every pass visits again each old task it already pruned, so its cost grows
-//   with all history (BMAX: 868 such tasks, 19 s a pass without indexes).
+//   with all history (one computer: 868 such tasks, 19 s a pass without
+//   indexes).
 // - One pass with a large backlog holds ibarad's single thread past the
 //   console's deadlines (attention 4 s, status 6 s), at start or between steps.
 // - A bounded pass stops reclaiming old settled evidence, or reclaims young or
 //   uncertain evidence.
 // - Sign-in requests of tasks that ended long ago stay open, and counted,
-//   forever (Dell: 30 on partial and blocked tasks), at start and while running.
+//   forever (one computer: 30 on partial and blocked tasks), at start and
+//   while running.
 // - Closing them also closes a request a later task may still continue.
 
 const LONG_AGO: &str = "2020-01-01T00:00:00.000Z";
@@ -1283,7 +1286,7 @@ fn retention_cost_does_not_grow_with_pruned_history() {
     drop(agent);
     drop(fresh);
     // Twenty thousand finished tasks whose evidence earlier passes already
-    // removed: about ten months at Dell's rate.
+    // removed: about ten months of a busy computer's tasks.
     let mut daemon = Daemon::start_with("retention-history", true);
     let db = stopped(&mut daemon);
     as_before_retention_repair(&db);
@@ -1439,7 +1442,7 @@ fn ended_task_attention_closes_at_start_and_while_running() {
             rusqlite::params![att, format!("{task}1"), kind, if kind == "login" { Some(login) } else { None }, ended],
         ).unwrap();
     };
-    // Dell, 14 November: 30 sign-in requests of partial and blocked tasks that ended 10 to 25 days earlier.
+    // One computer, 14 November: 30 sign-in requests of partial and blocked tasks that ended 10 to 25 days earlier.
     for i in 0..30 {
         raise(&format!("ended-{i}-"), if i < 25 { "partial" } else { "blocked" }, &ago(&format!("-{} hours", 240 + i * 12)), &format!("att_ended_{i}"), "login");
     }

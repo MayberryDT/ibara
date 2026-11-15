@@ -23,7 +23,8 @@ const DEFAULT_METADATA_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// ibarad answers status and attention on the thread that runs retention, so
 /// outside metadata pressure a pass starts no task once it has run this long
 /// or deleted this many rows (written out when it commits, the rest of its
-/// cost, about 2.7 KB a row on Dell); the next pass continues where it stopped.
+/// cost, about 2.7 KB a row on one computer in daily use); the next pass
+/// continues where it stopped.
 const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(100);
 const RETENTION_PASS_ROWS: usize = 1000;
 /// Tasks one bounded pass reads at most.

@@ -563,9 +563,9 @@ const ATTENTION_WITH_LOGIN: &str = r#"
     "#;
 
 /// Retention finds and deletes each old task's evidence by `task_ref`; without
-/// these every lookup scans its whole table (AK2 and BMAX, October and
-/// November 2026). The names are those added by hand to AK2's and Dell's
-/// journals, which therefore keep theirs. On an existing journal each is
+/// these every lookup scans its whole table (seen on computers in daily use,
+/// October and November 2026). The names are those added by hand to two of
+/// those computers' journals, which therefore keep theirs. On an existing journal each is
 /// built once, in one pass over its table, when ibarad starts, or later if
 /// the disk has no room for it then ([`create_retention_indexes`]).
 ///

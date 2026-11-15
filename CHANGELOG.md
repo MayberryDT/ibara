@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.8
 
 - Keep computers answering while the journal retention pass runs. Old task evidence is found through indexes, built once on an existing journal when ibarad starts; on a disk without room for them, ibarad still starts and builds them once there is room. A task whose evidence is gone is not read again, and each pass stops after 100 ms or 1,000 deleted rows outside metadata pressure, so its cost no longer grows with history.
 - Close sign-in requests 24 hours after their partial, blocked or interrupted task ended, while running and at startup, so they stop counting as attention. A later task can still continue a request within that time.
@@ -10,6 +10,10 @@
 - Tell an agent refused by a busy computer what to do instead: no tool waits for it, status shows which computers are ready, and a begin that names no computer takes one. When every ready computer refuses such a begin, say so for the whole fleet rather than in one computer's words.
 - Name the lookalikes of an ambiguous page target and send the agent to a point on a picture, which tells them apart, instead of a query, which cannot. Name what covers a covered page target.
 - Report the commit each computer's ibara was built from, marked when its checkout had changes, as `build` in operator status, so the console can show which computers run different builds. Packages built outside a git checkout leave it out.
+- Show a computer as Offline in the console only when its status goes unanswered: three reads in a row, the first at least 30 seconds earlier. Any answer, even a refusal, starts the count over, and one answered status or one picture brings the computer back as it is. A late picture keeps the last one with "Busy · picture is late" over it, instead of making the computer Offline or turning the bar red.
+- Clear a refused computer's picture and lists in the console again, and clear every picture, request and list when the console loses its access. Since September a call to a removed function stopped this partway, and a card could show "clearWatchAcknowledgment is not defined".
+- Say on a computer's card when it runs another ibara version or build than most of the fleet, and name the fleet's build in its System tab. A computer whose ibara reports no build is compared by version only.
+- Bring back the quick panel's Dismiss requests, which puts away every request it lists while each stays answerable in the console, with the `visible_requests` and `dismissals_ready` fields of the console's IPC `status` and IPC `dismissRequests`. Releases 0.3.5 to 0.3.7 were built without them. Dismissals still store no request text.
 
 # 0.3.7
 

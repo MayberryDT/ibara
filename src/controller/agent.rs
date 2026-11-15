@@ -3874,21 +3874,30 @@ fn text_runs(text: &str) -> Vec<(&str, bool)> {
 
 /// The address `browser_act` navigate opens: an http or https address as
 /// given, or a bare host with an optional port and path (`example.com/a`,
-/// `localhost:8000/x`), opened over https. The page reader reads only http
-/// and https pages, so every other scheme is refused before anything is sent.
+/// `localhost:8000/x`). A bare host opens over https, except `localhost`
+/// (and names under it) and an IPv4 address, which open over http, as
+/// Chromium's address bar opens them typed: a development or LAN server
+/// rarely has a certificate, and over https its failed handshake would leave
+/// an error page behind a step that says it opened the address. The page
+/// reader reads only http and https pages, so every other scheme is refused
+/// before anything is sent.
 fn web_address(given: &str) -> Result<String> {
     let url = given.trim();
-    const FORMS: &str = "browser_act opens http and https addresses, such as https://example.com/page or http://localhost:8000/, or a bare host and path such as example.com/page, which opens over https";
+    const FORMS: &str = "browser_act opens http and https addresses, such as https://example.com/page or http://localhost:8000/, or a bare host and path such as example.com/page, which opens over https (localhost and IP addresses over http)";
     let refuse = |why: String| Err(invalid(format!("action.url: {why}. {FORMS}.")).with("execution_not_started", true));
-    if url.is_empty() || url.len() > 4096 || url.chars().any(char::is_whitespace) {
-        return refuse("an address of at most 4096 characters, without spaces".into());
+    if url.is_empty() || url.len() > 4096 {
+        return refuse("an address of at most 4096 characters".into());
     }
-    let (head, rest) = url.split_once(':').unwrap_or((url, ""));
+    // A scheme's colon, or a port's, comes before the first slash, question
+    // mark or hash; a colon after them is the path's (`/watch?t=1:30`).
+    let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+    let (head, port) = authority.split_once(':').map_or((authority, None), |(h, p)| (h, Some(p)));
     // `localhost:8000/x` is a host and port, `mailto:x` a scheme.
-    let port = rest.split(['/', '?', '#']).next().is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
-    let scheme = (!rest.is_empty() || url.ends_with(':')) && !port
+    let port = port.filter(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    let scheme = authority.contains(':') && port.is_none()
         && head.starts_with(|c: char| c.is_ascii_alphabetic()) && head.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c));
     if scheme {
+        let rest = &url[head.len() + 1..];
         return match head.to_ascii_lowercase().as_str() {
             "http" | "https" if rest.starts_with("//") && rest.len() > 2 => Ok(url.to_string()),
             "file" => Err(invalid("action.url: browser_act does not open file:// addresses: the page reader cannot read them. Read a file of this computer with computer_files, or type its address into the address bar with computer_act (key ctrl+l, type, key Return) to look at it.")
@@ -3897,15 +3906,16 @@ fn web_address(given: &str) -> Result<String> {
             other => refuse(format!("{other}: addresses are not web pages")),
         };
     }
-    let host = url.split(['/', '?', '#']).next().unwrap_or("");
-    let name = if port { head } else { host };
+    let name = if port.is_some() { head } else { authority };
     let labels: Vec<&str> = name.split('.').collect();
-    let plausible = name == "localhost"
+    let plausible = name.eq_ignore_ascii_case("localhost")
         || (labels.len() >= 2 && labels.iter().all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_alphanumeric() || c == '-')));
-    if !plausible {
+    if !plausible || url.chars().any(char::is_whitespace) {
         return refuse(format!("\"{}\" is not an address", clip(url, 60)));
     }
-    Ok(format!("https://{url}"))
+    let lower = name.to_ascii_lowercase();
+    let plain = lower == "localhost" || lower.ends_with(".localhost") || name.parse::<std::net::Ipv4Addr>().is_ok();
+    Ok(format!("{}://{url}", if plain { "http" } else { "https" }))
 }
 
 /// Where a page went, without its query or fragment: a form sent with GET

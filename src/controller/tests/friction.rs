@@ -30,6 +30,17 @@
 //!    javascript:, mailto:) is opened, or refused without naming the accepted
 //!    forms with an example, or a file:// address without the routes that
 //!    show a file of the computer.
+//! 8a. A bare localhost or IP address (a development or LAN server, almost
+//!    never with a certificate) opens over https, so the TLS handshake fails
+//!    and the step still reports done.
+//! 8b. An http or https address with a space in it, which 0.3.7 opened, is
+//!    refused; a bare host whose path has a colon (`example.com/watch?t=1:30`)
+//!    is refused as not an address.
+//! 9a. Any of these opens as something other than an http or https address,
+//!    or with another host than it names: `user@host`, `user:pass@host`,
+//!    `host:80@evil`, `data:`, `javascript:8000/`, `http:example.com`, a
+//!    backslash before the host's end, a bare IPv6 address, a trailing dot; or
+//!    an internationalized name is changed.
 //!
 //! Ambiguous and covered page targets:
 //! 10. An ambiguous target's refusal sends the agent to "observe with a
@@ -180,9 +191,20 @@ fn navigate_opens_a_bare_host_as_https_and_names_the_forms_it_takes() {
         let opened = || rig.desktop.extension_args.borrow().iter().filter(|(op, _)| op == "navigate").map(|(_, a)| a["url"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         for (given, sent) in [
             ("example.com/a?b=1#c", "https://example.com/a?b=1#c"),
-            ("localhost:8000/report.html", "https://localhost:8000/report.html"),
+            ("example.com:8443/a", "https://example.com:8443/a"),
+            ("localhost:8000/report.html", "http://localhost:8000/report.html"),
+            ("LOCALHOST:3000", "http://LOCALHOST:3000"),
+            ("app.localhost:5173/", "http://app.localhost:5173/"),
+            ("127.0.0.1:8080/x", "http://127.0.0.1:8080/x"),
+            ("192.168.1.20/admin", "http://192.168.1.20/admin"),
+            ("example.com/watch?t=1:30", "https://example.com/watch?t=1:30"),
+            ("example.com/a#b:c", "https://example.com/a#b:c"),
+            ("bücher.de/katalog", "https://bücher.de/katalog"),
             ("  https://shop.example/cart ", "https://shop.example/cart"),
             ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/"),
+            ("https://example.com/a b", "https://example.com/a b"),
+            ("HTTP://example.com/", "HTTP://example.com/"),
+            ("http://[::1]:8000/", "http://[::1]:8000/"),
         ] {
             let env = call(&rig.controller, "browser_act", go(given)).await;
             assert_eq!(env["result"]["steps"][0]["outcome"], "done", "{given}: {env}");
@@ -197,6 +219,18 @@ fn navigate_opens_a_bare_host_as_https_and_names_the_forms_it_takes() {
             ("mailto:dana@example.com", "https://example.com/page"),
             ("http:example.com", "https://example.com/page"),
             ("two words", "https://example.com/page"),
+            ("example.com/a b", "https://example.com/page"),
+            ("user@host", "https://example.com/page"),
+            ("user@example.com/x", "https://example.com/page"),
+            ("user:pass@example.com", "https://example.com/page"),
+            ("host:80@evil.example", "https://example.com/page"),
+            ("data:text/html,<p>x</p>", "https://example.com/page"),
+            ("javascript:8000/", "https://example.com/page"),
+            ("view-source:https://example.com/", "https://example.com/page"),
+            ("example.com\\@evil.example/", "https://example.com/page"),
+            ("example.com.", "https://example.com/page"),
+            ("[::1]:8000/x", "https://example.com/page"),
+            ("localhost:", "https://example.com/page"),
         ] {
             let env = call(&rig.controller, "browser_act", go(given)).await;
             assert_eq!(code(&env), "INVALID_ARGUMENT", "{given}: {env}");

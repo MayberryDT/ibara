@@ -31,6 +31,8 @@
 //    only reach the locked element; or the refusal does not say what holds
 //    it, or names an element inside another frame instead of only that
 //    frame's host.
+// 10. The tab the element was observed in has closed, and the refusal does
+//    not say so.
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -311,6 +313,19 @@ await scenario('a pointer the page locked refuses a click in a frame', async che
   check('wanted', 'not located', !located(answer), plain(answer));
   check('wanted', 'names the element holding the pointer', answer?.locked === 'canvas "Arena"', plain(answer));
   await evaluate(`document.exitPointerLock(); true`);
+});
+
+// Last: it closes the tab the DevTools connection is on.
+await scenario('a tab that closed says so', async check => {
+  await open('/card');
+  const add = target(await observe(), 'Add');
+  // Another tab keeps the browser running; then the observed one closes.
+  await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
+  await fetch(`http://127.0.0.1:${port}/json/close/${pageTarget.id}`);
+  await until(async () => !(await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).some(t => t.id === pageTarget.id), 5000, 'the tab to close');
+  const answer = await ask('locate', add);
+  check('safe', 'not located', !located(answer.result), answer);
+  check('wanted', 'refused as closed', answer.result?.refused === true && answer.result.why === 'closed', answer);
 });
 
 // The sandbox stays on: no --no-sandbox, and renderers run under seccomp.

@@ -242,10 +242,12 @@ async function observeFrames(m,tab,rootId) {
   const offset=m.args.offset||0,nodes=snapshot.nodes.slice(offset,offset+m.args.limit),next=offset+nodes.length<snapshot.nodes.length?offset+nodes.length:null;
   return {result:{...snapshot,routes:undefined,nodes,count:snapshot.nodes.length,documentId:rootId,revalidates_refs:true,next_offset:next,truncated:snapshot.truncated||next!==null}};
 }
+// The tab, while it is the focused window's active web tab; null otherwise,
+// also once it or its window has closed (Chrome then rejects the lookup).
 async function focusedTab(tabId) {
-  const tab=await chrome.tabs.get(tabId);
-  const win=await chrome.windows.get(tab.windowId);
-  return !tab.incognito&&tab.active&&win.focused&&web(tab.url)?tab:null;
+  const tab=await chrome.tabs.get(tabId).catch(()=>null);
+  const win=tab&&await chrome.windows.get(tab.windowId).catch(()=>null);
+  return tab&&win&&!tab.incognito&&tab.active&&win.focused&&web(tab.url)?tab:null;
 }
 // What the armed press did, from the page's own reports: which element it
 // reached and, for a plain click (navigation), where the page went when the

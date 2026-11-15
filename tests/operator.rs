@@ -623,6 +623,14 @@ fn fleet_auto_begin_says_so_when_every_ready_computer_refused() {
     let message=refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("Tulip0") && message.contains("Tulip1") && message.contains("No task started"),"{reply}");
     assert_eq!(f.route_lines().iter().filter(|l|l.contains("computer_begin")).count(),2,"each ready computer asked once");
+    // Failure case: the same begin again (same request_id) goes only to the
+    // computer its route remembers, yet is answered as though every ready
+    // computer had been asked again.
+    let again=tool(&mut relay,json!(3),"computer_begin",json!({"goal":"race","request_id":"all-busy-1"}));
+    assert_eq!(f.route_lines().iter().filter(|l|l.contains("computer_begin")).count(),3,"only the remembered computer asked again");
+    let refused=envelope(&again);
+    assert_eq!(refused["error"]["code"],"BUSY","{again}");
+    assert_eq!(refused["error"]["message"],"Another task holds this computer, so no task was started.","{again}");
     assert_eq!(relay.finish(),0);
 }
 

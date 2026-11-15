@@ -551,6 +551,8 @@ impl Router {
         // Stable request-specific ordering spreads unrelated agents across free
         // computers; replay goes to the durable binding, regardless of readiness.
         ready.sort_by_key(|t|Sha256::digest(format!("{key}:{}",t.computer_id).as_bytes()).to_vec());
+        // A begin sent again with its request_id goes only to the computer its route remembers.
+        let remembered=bound.is_some();
         let mut selected=bound;
         let mut refused=None::<String>;
         let mut last=None;
@@ -586,8 +588,9 @@ impl Router {
             refused=Some(id); last=Some(reply);
         }
         // Every ready computer refused a begin that named none: say so for the
-        // fleet, not in the last one's words about "this computer".
-        if !turned_away.is_empty() && fleet.len()>1 {
+        // fleet, not in the last one's words about "this computer". A begin
+        // sent again only to its remembered computer has that computer's answer.
+        if !remembered && !turned_away.is_empty() && fleet.len()>1 {
             return Some(self.local_error(&IbaraError::new("BUSY",format!("No free computer right now: every ready one refused ({}). No task started. Continue independent work, then retry computer_begin without computer, with a fresh request_id.",turned_away.join(", ")),true),fleet.len()));
         }
         if let Some(reply)=last {return Some(reply);}

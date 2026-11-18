@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
@@ -90,6 +90,8 @@ pub struct StorageOptions {
     pub initial_wait_ms: u64,
     pub artifact_retention_ms: i64,
     pub job_log_retention_ms: i64,
+    /// How long a task's workspace outlives the task (a day below the disk warning).
+    pub workspace_retention_ms: i64,
     pub now: Option<NowFn>,
     pub clock: Option<ClockFn>,
     pub statfs: Option<StatfsFn>,
@@ -122,6 +124,7 @@ impl StorageOptions {
             initial_wait_ms: 250,
             artifact_retention_ms: 30 * DAY_MS,
             job_log_retention_ms: 30 * DAY_MS,
+            workspace_retention_ms: 7 * DAY_MS,
             now: None,
             clock: None,
             statfs: None,
@@ -173,6 +176,9 @@ impl StorageOptions {
         if let Some(n) = limit("job_log_retention_ms")? {
             o.job_log_retention_ms = n as i64;
         }
+        if let Some(n) = limit("workspace_retention_ms")? {
+            o.workspace_retention_ms = n as i64;
+        }
         Ok(o)
     }
 }
@@ -196,6 +202,7 @@ pub struct ResolvedOptions {
     pub initial_wait_ms: u64,
     pub artifact_retention_ms: i64,
     pub job_log_retention_ms: i64,
+    pub workspace_retention_ms: i64,
 }
 
 /// A task as the journal holds it, after the engine's authority check.
@@ -314,6 +321,8 @@ struct Inner {
     downloads: Mutex<HashMap<String, operator_files::DownloadJob>>,
     journal: RwLock<Option<Arc<dyn JournalView>>>,
     closed: AtomicBool,
+    /// When the last complete workspace pass finished (storage clock, ms).
+    workspace_pass_ms: AtomicI64,
 }
 
 fn absolute(p: &Path) -> PathBuf {
@@ -351,6 +360,7 @@ impl StorageService {
             initial_wait_ms: options.initial_wait_ms,
             artifact_retention_ms: options.artifact_retention_ms,
             job_log_retention_ms: options.job_log_retention_ms,
+            workspace_retention_ms: options.workspace_retention_ms,
         };
         // storage.ts:689: ids /^[a-z][a-z0-9_-]{0,63}$/, absolute normalized roots.
         let operator_roots = options
@@ -383,6 +393,7 @@ impl StorageService {
                 downloads: Mutex::new(HashMap::new()),
                 journal: RwLock::new(None),
                 closed: AtomicBool::new(false),
+                workspace_pass_ms: AtomicI64::new(0),
             }),
         };
         let conn = Connection::open(service.inner.opts.state_dir.join("storage.sqlite"))?;
@@ -404,6 +415,7 @@ impl StorageService {
         *self.inner.journal.write() = Some(view);
         let _ = self.expire_collected_artifacts();
         let _ = self.prune_resolved_job_logs();
+        let _ = self.prune_ended_workspaces();
     }
 
     fn journal(&self) -> Option<Arc<dyn JournalView>> {
@@ -461,6 +473,82 @@ impl StorageService {
         Ok(directory)
     }
 
+    /// Remove the workspaces of tasks that ended over `workspace_retention_ms`
+    /// ago, or a day ago while free disk is below the warning, and that have no
+    /// live or unconfirmed job and no unsettled or unresolved operation.
+    /// Published artifacts are separate copies and stay. A complete pass runs
+    /// at most every ten minutes and a pass stops after 100 ms, so a backlog
+    /// is worked through over several status reads without stalling them. A
+    /// workspace is renamed out of the way at once and deleted on its own
+    /// thread, so one with many files does not hold up this one. Without the
+    /// journal, on a journal error, or for a folder the journal has no task
+    /// for, nothing is removed. Symlinks are never followed.
+    fn prune_ended_workspaces(&self) -> Result<()> {
+        const EVERY_MS: i64 = 10 * 60 * 1000;
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let Some(view) = self.journal() else { return Ok(()) };
+        let now = self.clock();
+        let last = self.inner.workspace_pass_ms.load(Ordering::SeqCst);
+        if last != 0 && (now - last).abs() < EVERY_MS {
+            return Ok(());
+        }
+        let (keep_ms, warn) = (self.inner.opts.workspace_retention_ms, self.inner.opts.warn_free_bytes);
+        let low = warn > 0 && self.free_bytes().is_ok_and(|free| free < warn);
+        let cutoff = crate::ids::iso_from_millis(now - if low { keep_ms.min(DAY_MS) } else { keep_ms });
+        let started = std::time::Instant::now();
+        let root = self.workspace_root();
+        let Ok(entries) = std::fs::read_dir(&root) else { return Ok(()) };
+        let mut doomed = Vec::new();
+        for entry in entries.flatten() {
+            if started.elapsed() > BUDGET {
+                break;
+            }
+            let name = entry.file_name();
+            // Left by a removal an earlier ibarad did not finish.
+            if name.to_str().is_some_and(|n| n.starts_with(".removed-")) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                doomed.push(entry.path());
+                continue;
+            }
+            let Some(task_ref) = name.to_str().filter(|n| fsx::assert_id(n, "task_ref").is_ok()) else { continue };
+            // `file_type` does not follow a symlink.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            match view.task_state(task_ref) {
+                Ok(Some(task)) if is_journal_terminal_state(&task.state) && task.updated_at.as_str() <= cutoff.as_str() => {}
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+            match (view.has_unsettled(task_ref), view.has_unresolved(task_ref)) {
+                (Ok(false), Ok(false)) => {}
+                (Ok(_), Ok(_)) => continue,
+                _ => break,
+            }
+            let unconfirmed: bool = self.with_db(|db| {
+                Ok(db.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE task_ref = ?1 AND (state IN ('unknown', 'running') OR termination_confirmed = 0))",
+                    [task_ref],
+                    |r| r.get(0),
+                )?)
+            })?;
+            if unconfirmed || self.has_active_jobs(Some(task_ref)) {
+                continue;
+            }
+            let aside = root.join(format!(".removed-{task_ref}-{}", crate::ids::now_millis()));
+            if std::fs::rename(entry.path(), &aside).is_ok() {
+                doomed.push(aside);
+            }
+        }
+        let complete = started.elapsed() <= BUDGET;
+        if !doomed.is_empty() {
+            std::thread::spawn(move || doomed.iter().for_each(|dir| remove_tree(dir)));
+        }
+        if complete {
+            self.inner.workspace_pass_ms.store(now, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     /// storage.ts:1475-1478 `freeBytes`.
     fn free_bytes(&self) -> Result<u64> {
         Ok(self.statfs(&self.inner.opts.root_dir)?)
@@ -483,6 +571,7 @@ impl StorageService {
         self.ensure_open()?;
         self.expire_collected_artifacts()?;
         self.prune_resolved_job_logs()?;
+        self.prune_ended_workspaces()?;
         let tested = self.now_iso();
         let free = self.free_bytes()?;
         let (min, warn) = (self.inner.opts.min_free_bytes, self.inner.opts.warn_free_bytes);
@@ -510,6 +599,30 @@ impl StorageService {
         self.kill_running_jobs_now();
         self.inner.db.lock().take();
     }
+}
+
+/// Remove a folder tree without following symlinks (std's remove_dir_all
+/// removes a symlink, never its target), first making its own folders
+/// writable when a read-only one, as a Go module cache leaves, stops it.
+fn remove_tree(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+        return;
+    }
+    fn writable(dir: &Path) {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
+        if !meta.is_dir() {
+            return;
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.permissions().mode() | 0o700));
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                writable(&entry.path());
+            }
+        }
+    }
+    writable(dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn closed_error() -> IbaraError {

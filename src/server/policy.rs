@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Limit keys that must be positive safe integers when present (`server.ts:132`).
-pub const LIMIT_KEYS: [&str; 10] = [
+pub const LIMIT_KEYS: [&str; 11] = [
     "max_process_output_chars",
     "max_artifact_bytes",
     "max_metadata_bytes",
@@ -22,6 +22,7 @@ pub const LIMIT_KEYS: [&str; 10] = [
     "warn_free_bytes",
     "artifact_retention_ms",
     "job_log_retention_ms",
+    "workspace_retention_ms",
 ];
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;

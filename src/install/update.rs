@@ -646,7 +646,48 @@ pub fn system_update(desktop: &Account, pairs: &[&str]) -> Result<(), String> {
         output(Command::new(Path::new(LIB).join("bin/ibara")).args(["system","refresh"]))?;
     }
     prune_cache();
+    prune_journal_backups(desktop);
     Ok(())
+}
+
+/// The `before-` journal copies to remove: all but the newest, and for each
+/// kept release the copy `ibara rollback` restores for it (the greatest name
+/// with its prefix, as [`restore_journals_if_newer`] picks). Other names are
+/// never returned.
+fn stale_backups(names: &[String], kept: &[String]) -> Vec<String> {
+    // No kept release could be read: rollback may still need any copy.
+    if kept.is_empty() {
+        return Vec::new();
+    }
+    let made = |n: &String| n.strip_prefix("before-").and_then(|r| r.rsplit_once('-')).and_then(|(v, ms)| (!v.is_empty()).then_some(ms)).and_then(|ms| ms.parse::<u64>().ok());
+    let copies: Vec<&String> = names.iter().filter(|n| made(n).is_some()).collect();
+    let mut keep: Vec<&String> = copies.iter().copied().max_by_key(|n| made(n)).into_iter().collect();
+    for version in kept {
+        let prefix = format!("before-{}-", safe(version));
+        keep.extend(copies.iter().copied().filter(|n| n.starts_with(&prefix) && n[prefix.len()..].parse::<u64>().is_ok()).max());
+    }
+    copies.into_iter().filter(|n| !keep.contains(n)).cloned().collect()
+}
+
+/// Remove journal copies no kept release can go back to, as the person who
+/// owns them, only when the kept releases could be read. Best effort: a
+/// failure here never fails the update.
+fn prune_journal_backups(desktop: &Account) {
+    let backups = desktop.home.join(".local/state/ibara/backups");
+    if !std::fs::symlink_metadata(&backups).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let names: Vec<String> = std::fs::read_dir(&backups).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+    let mut kept: Vec<String> = Vec::new();
+    for (version, _) in cached() {
+        if !kept.contains(&version) {
+            kept.push(version);
+        }
+    }
+    for name in stale_backups(&names, &kept) {
+        // rm never follows a symlink it is given or finds inside.
+        let _ = output(Command::new("runuser").args(["-u", &desktop.name, "--", "/usr/bin/rm", "-rf", "--one-file-system", "--"]).arg(backups.join(name)));
+    }
 }
 
 /// A copy of the controller's journals, made by the desktop account itself
@@ -965,7 +1006,7 @@ pub fn whats_new_seen() -> Result<Value, String> {
 ///    the older access revision valid.
 #[cfg(test)]
 mod tests {
-    use super::{PACKAGES, narrow_access, package_version, verify};
+    use super::{PACKAGES, narrow_access, package_version, stale_backups, verify};
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1023,6 +1064,43 @@ mod tests {
             "packages": packages, "notes": ["Updates install themselves."],
         }))
         .unwrap()
+    }
+
+    /// docs/disk-retention-failure-cases.md 11 to 14: each kept release keeps
+    /// the copy `ibara rollback` would restore for it, the newest copy stays,
+    /// and nothing but a `before-` copy is ever named.
+    #[test]
+    fn update_keeps_the_journal_copies_rollback_can_use_and_drops_the_rest() {
+        let names: Vec<String> = [
+            "before-0.1.0-16-1790676224703",
+            "before-0.1.0-17-1790688898499",
+            "before-0.3.6-1-1792000000000",
+            "before-0.3.6-1-1792000000500",
+            "before-0.3.7-1-1793000000000",
+            "before-0.3.8-1-1794000000000",
+            "before-none-1794100000000",
+            "release031-final",
+            "fleet-20261114-20261114-213456",
+            "before-",
+            "before-0.3.5-1-notatime",
+        ]
+        .map(String::from)
+        .to_vec();
+        let kept = ["0.3.8-1", "0.3.7-1", "0.3.6-1"].map(String::from);
+        let mut stale = stale_backups(&names, &kept);
+        stale.sort();
+        assert_eq!(stale, ["before-0.1.0-16-1790676224703", "before-0.1.0-17-1790688898499", "before-0.3.6-1-1792000000000"]);
+        // The copy just made stays even when its version is not kept.
+        let mut stale = stale_backups(&names, &["0.3.8-1".to_string()]);
+        stale.sort();
+        assert!(!stale.contains(&"before-none-1794100000000".to_string()));
+        assert!(!stale.contains(&"before-0.3.8-1-1794000000000".to_string()));
+        assert!(stale.contains(&"before-0.3.7-1-1793000000000".to_string()));
+        // A version that is a prefix of another keeps only its own copy.
+        let names = ["before-0.3.1-1-100", "before-0.3.1-10-200", "before-0.3.1-10-300"].map(String::from).to_vec();
+        assert_eq!(stale_backups(&names, &["0.3.1-1".to_string()]), ["before-0.3.1-10-200"]);
+        // No kept release could be read (an unreadable cache, a failed check): nothing goes.
+        assert!(stale_backups(&names, &[]).is_empty());
     }
 
     #[test]

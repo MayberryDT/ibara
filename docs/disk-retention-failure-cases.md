@@ -45,3 +45,10 @@ removed, and 0.8 GB was 21 journal copies made before updates, of which
     workspace is retried on every pass.
 17. The kept releases cannot be read (an unreadable package cache, a failed
     signature check), so every journal copy but the newest is removed.
+18. On a real journal a long task's receipts take about 10 ms to read, so a
+    100 ms pass looks at about ten folders. Every pass starting again from the
+    first folder spends its time on the same kept ones and never reaches the
+    rest; and with passes only on status reads and admissions, an idle
+    computer clears a backlog of thousands over days (found on the first
+    computer to run 0.3.9).
+

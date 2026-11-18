@@ -301,6 +301,22 @@ impl Controller {
         let result = self.terminate_leftover_windows(&before).await;
         self.mark_effect(None);
         let terminated = result?;
+        // This call's first pass failed outright when it cancelled its token
+        // (release_lease starts each reset with a fresh one). A second pass
+        // would stop at once and leave the receipt `resetting`, which reconcile
+        // then retried every tick (seen 17 November 2026). Keep the first
+        // failure as the blocker; the watchdog retries a retry-safe one.
+        if terminated && self.journal.browser_retirement_pending()? && self.abort_handles().0.is_cancelled() {
+            let mut receipt = self.journal.desktop_reset()?;
+            for key in ["reason", "failed", "retry_safe"] {
+                receipt[key] = graceful[key].clone();
+            }
+            receipt["cleanup"]["left"] = graceful["cleanup"]["left"].clone();
+            receipt["state"] = json!("blocked");
+            receipt["blocked_inventory"] = reset_inventory(self.desktop.all_windows().await.ok().as_deref());
+            self.journal.put_desktop_reset(&receipt)?;
+            return Ok(false);
+        }
         if terminated && self.journal.browser_retirement_pending()? {
             // Process exit is not browser-session retirement. Reconcile the
             // retained restore state natively before another task is admitted.
@@ -414,6 +430,8 @@ impl Controller {
         receipt["state"] = json!(if verified && self.journal.browser_retirement_pending()? { "unsettled" }
             else if verified { "verified" } else { "blocked" });
         receipt["reason"] = if verified { Value::Null } else { json!("windows survived termination") };
+        // Windows that outlived signals are never retried automatically.
+        if !verified { receipt["retry_safe"] = json!(false); }
         receipt["remaining"] = json!(remaining);
         receipt["terminated"] = json!(terminated);
         receipt["browser_retirement_pending"] = json!(self.journal.browser_retirement_pending()?);
@@ -437,7 +455,9 @@ impl Controller {
         // here. Do not replay uncertain native effects against unchanged clients.
         // A changed client inventory or explicit operator handback permits a new try.
         let previous = self.journal.desktop_reset()?;
-        if previous["state"] == "blocked" {
+        // Reconcile never repeats a blocker it already saw (see `reconcile`);
+        // only the watchdog's backoff or a person's retry reaches a retry-safe one here.
+        if previous["state"] == "blocked" && previous["retry_safe"] != true {
             let inventory = self.desktop.all_windows().await.ok();
             if previous["blocked_inventory"] == reset_inventory(inventory.as_deref()) {
                 return Ok(false);
@@ -466,12 +486,17 @@ impl Controller {
                 self.desktop.set_agent(None);
                 // Dropping an effect future does not stop supervised helpers: explicitly cancel and drain.
                 let input = self.desktop.release_input().await;
+                // A step refused before it started (a launch the session's
+                // service manager rejected) changed nothing, so the watchdog may
+                // try it again on its backoff. Unknown outcomes and timeouts never.
+                let not_started = matches!(&other, Ok(Err(e)) if e.details.get("execution_not_started") == Some(&Value::Bool(true)));
                 let reason = match other {
                     Ok(Err(e)) => format!("window reset failed: {}: {}", e.code, e.message),
                     Err(_) => "window reset exceeded its 60 second deadline".into(),
                     _ => unreachable!(),
                 };
-                self.journal.put_desktop_reset(&json!({"state":"blocked","reason":reason,
+                self.journal.put_desktop_reset(&json!({"state":"blocked","reason":reason,"failed":true,
+                    "retry_safe":not_started && input.is_ok(),
                     "remaining":Value::Null,"at":self.now_iso(),"input_settled":input.is_ok(),
                     "cleanup":{"closed":[],"left":[{"surface":"desktop","reason":reason}]}}))?;
                 Ok(false)

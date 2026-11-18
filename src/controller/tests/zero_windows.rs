@@ -155,3 +155,63 @@ fn repair_cleanup_retries_once_and_preserves_person_control() {
         assert_eq!(c.journal.get_control().unwrap().pause_origin,Some(crate::store::PauseOrigin::Person));
     });
 }
+
+// docs/runtime-dir-failure-cases.md 1-4: a refused relaunch (a full runtime
+// directory) was retried every reconcile tick; it must block, stay blocked
+// for reconcile, and be retried only by the watchdog.
+#[test]
+fn refused_session_relaunch_blocks_reconcile_and_the_watchdog_retries_it() {
+    run(async {
+        let mut rig = rig(false);
+        disposable(&mut rig);
+        let c = &rig.controller;
+        // The incident's state: no windows, a browser session left to retire.
+        rig.desktop.windows.borrow_mut().clear();
+        c.journal.set_browser_retirement_pending(true).unwrap();
+        let refused = || IbaraError::new("CAPABILITY_UNAVAILABLE", "The session's service manager did not start /usr/bin/omarchy (exit status: 1).", true)
+            .with("execution_not_started", true);
+        let launches = || rig.desktop.acts.borrow().iter().filter(|a| a.contains("Launch")).count();
+        rig.desktop.fail_on.replace(Some(("Launch".into(), refused())));
+        c.reconcile().await.unwrap();
+        assert!(c.journal.get_control().unwrap().unsettled);
+        assert_eq!(launches(), 1);
+        let reset = c.journal.desktop_reset().unwrap();
+        assert_eq!(reset["state"], "blocked", "{reset}");
+        assert_eq!(reset["retry_safe"], true, "{reset}");
+        assert!(reset.pointer("/cleanup/left/0/reason").and_then(Value::as_str).unwrap().contains("did not start"), "{reset}");
+        for _ in 0..5 {
+            c.reconcile().await.unwrap();
+        }
+        assert_eq!(launches(), 1, "reconcile repeated a refused launch");
+        // The watchdog retries after its grace, without a person.
+        rig.desktop.fail_on.replace(Some(("Launch".into(), refused())));
+        c.watchdog_tick().await;
+        assert_eq!(launches(), 1, "retried inside the grace period");
+        rig.clock.fetch_add(31_000, Ordering::SeqCst);
+        c.watchdog_tick().await;
+        assert_eq!(launches(), 2, "watchdog did not retry a retry-safe blocker");
+        assert_eq!(c.journal.desktop_reset().unwrap()["state"], "blocked");
+        // Its backoff holds the next try back.
+        c.watchdog_tick().await;
+        assert_eq!(launches(), 2, "watchdog ignored its backoff");
+    });
+}
+
+// Case 3: a launch whose outcome is unknown is never retried automatically.
+#[test]
+fn unknown_relaunch_outcome_is_not_retry_safe() {
+    run(async {
+        let mut rig = rig(false);
+        disposable(&mut rig);
+        let c = &rig.controller;
+        // The incident's state: no windows, a browser session left to retire.
+        rig.desktop.windows.borrow_mut().clear();
+        c.journal.set_browser_retirement_pending(true).unwrap();
+        rig.desktop.fail_on.replace(Some(("Launch".into(),
+            IbaraError::new("OUTCOME_UNKNOWN", "/usr/bin/omarchy did not start within 10 s; it may still open.", false))));
+        c.reconcile().await.unwrap();
+        let reset = c.journal.desktop_reset().unwrap();
+        assert_eq!(reset["state"], "blocked", "{reset}");
+        assert_eq!(reset["retry_safe"], false, "{reset}");
+    });
+}

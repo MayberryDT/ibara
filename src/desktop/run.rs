@@ -426,7 +426,13 @@ async fn in_scope(child: &mut Child, pid: u32, systemd_run: &Path, unit: &str, w
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", format!("The session's service manager did not start {label} ({status})."), true)
+                // A full runtime directory is the usual cause: the manager cannot write the unit.
+                let full = super::runtime_dir::session_dir().and_then(|dir| super::runtime_dir::space(&dir).filter(|s| s.full()).map(|_| dir));
+                let message = match full {
+                    Some(dir) => format!("The session's runtime directory {} is full, so its service manager did not start {label} ({status}). Free space there.", dir.display()),
+                    None => format!("The session's service manager did not start {label} ({status})."),
+                };
+                return Err(IbaraError::new("CAPABILITY_UNAVAILABLE", message, true)
                     .with("command", label)
                     .with("execution_not_started", true));
             }

@@ -1,3 +1,8 @@
+# Unreleased
+
+- Stop repeating a cleanup step the session refused before it started. When the desktop reset could not reopen the browser to retire its saved session, ibara relaunched it every few seconds without end; it now waits as a blocked cleanup, the watchdog tries again on its backoff, and the computer comes back on its own once the step can run.
+- Report the session's runtime directory as `storage.runtime`, degraded below a tenth free; name it when a full one stops an app from starting; and, while it is low, remove the logs of shells that have exited, which otherwise stay there until logout.
+
 # 0.3.8
 
 - Keep computers answering while the journal retention pass runs. Old task evidence is found through indexes, built once on an existing journal when ibarad starts; on a disk without room for them, ibarad still starts and builds them once there is room. A task whose evidence is gone is not read again, and each pass stops after 100 ms or 1,000 deleted rows outside metadata pressure, so its cost no longer grows with history.

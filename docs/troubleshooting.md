@@ -84,6 +84,10 @@ ibara says unknown when it cannot prove that a step worked, for example when iba
 
 If earlier work did not finish stopping, the computer's page says "agents are held back" and offers Fix It, which restarts ibara on that computer. Apps agents opened keep running through the restart.
 
+## Apps will not start and cleanup stays blocked
+
+If status shows `storage.runtime: degraded`, or a refusal says the session's runtime directory is full, the small in-memory folder each session has (`/run/user/<your id>`) is out of space, and the desktop cannot start any app. ibara removes the logs of shells that have exited; the rest belongs to running programs. Find what is large with `du -sh /run/user/$(id -u)/* | sort -h`, and stop the program that keeps writing there. Cleanup finishes by itself within about a minute of space returning.
+
 ## Updates
 
 - `ibara update --check` says whether there is a newer release.

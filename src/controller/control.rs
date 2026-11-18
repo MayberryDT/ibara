@@ -621,6 +621,9 @@ impl Controller {
     pub(crate) async fn refresh_capabilities(&self) -> Result<Vec<Value>> {
         let mut rows = self.desktop.capabilities().await;
         rows.push(self.browser_row());
+        if let Some(dir) = crate::desktop::runtime_dir::session_dir() {
+            rows.push(crate::desktop::runtime_dir::capability(&dir, &self.now_iso()));
+        }
         match self.storage.capabilities() {
             Ok(storage) => rows.extend(storage),
             Err(e) => rows.push(json!({ "name": "storage", "status": "unavailable", "backend": "storage", "reason": super::clip(&e.message, 1000) })),

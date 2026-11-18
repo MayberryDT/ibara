@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.9
 
 - Stop repeating a cleanup step the session refused before it started. When the desktop reset could not reopen the browser to retire its saved session, ibara relaunched it every few seconds without end; it now waits as a blocked cleanup, the watchdog tries again on its backoff, and the computer comes back on its own once the step can run.
 - Report the session's runtime directory as `storage.runtime`, degraded below a tenth free; name it when a full one stops an app from starting; and, while it is low, remove the logs of shells that have exited, which otherwise stay there until logout.

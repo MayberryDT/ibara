@@ -143,6 +143,11 @@ impl Controller {
             return;
         }
         self.apply_display_setting().await;
+        // Ended tasks' workspaces: a bounded pass while no agent holds the
+        // computer, so an idle one clears a backlog without status reads.
+        if matches!(self.journal.get_active_lease(), Ok(None)) {
+            self.storage.retain_workspaces();
+        }
         let settings = crate::settings::current();
         if settings.bool("self_repair") {
             if let Err(e) = self.repair_display().await {

@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.10
 
 - Clear an existing backlog of ended tasks' workspaces while the computer is idle. In 0.3.9 a pass ran only at status reads and admissions and always started from the first folder, so on a real journal, where each check of a long task takes about 10 ms, a pass removed about ten folders and could spend all its time on the same kept ones. The watchdog now runs a pass every five seconds while no agent holds the computer, and each pass continues where the last one stopped.
 

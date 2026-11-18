@@ -323,6 +323,8 @@ struct Inner {
     closed: AtomicBool,
     /// When the last complete workspace pass finished (storage clock, ms).
     workspace_pass_ms: AtomicI64,
+    /// The last folder an unfinished pass looked at; the next starts after it.
+    workspace_cursor: Mutex<Option<String>>,
 }
 
 fn absolute(p: &Path) -> PathBuf {
@@ -394,6 +396,7 @@ impl StorageService {
                 journal: RwLock::new(None),
                 closed: AtomicBool::new(false),
                 workspace_pass_ms: AtomicI64::new(0),
+                workspace_cursor: Mutex::new(None),
             }),
         };
         let conn = Connection::open(service.inner.opts.state_dir.join("storage.sqlite"))?;
@@ -477,8 +480,10 @@ impl StorageService {
     /// ago, or a day ago while free disk is below the warning, and that have no
     /// live or unconfirmed job and no unsettled or unresolved operation.
     /// Published artifacts are separate copies and stay. A complete pass runs
-    /// at most every ten minutes and a pass stops after 100 ms, so a backlog
-    /// is worked through over several status reads without stalling them. A
+    /// at most every ten minutes and a pass stops after 100 ms; the next
+    /// continues after the last folder it looked at, in name order, so a
+    /// backlog is worked through over several passes without stalling status.
+    /// The watchdog runs one each tick while no agent holds the computer. A
     /// workspace is renamed out of the way at once and deleted on its own
     /// thread, so one with many files does not hold up this one. Without the
     /// journal, on a journal error, or for a folder the journal has no task
@@ -498,12 +503,20 @@ impl StorageService {
         let started = std::time::Instant::now();
         let root = self.workspace_root();
         let Ok(entries) = std::fs::read_dir(&root) else { return Ok(()) };
+        let mut entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        let after = self.inner.workspace_cursor.lock().take();
         let mut doomed = Vec::new();
-        for entry in entries.flatten() {
+        let mut stopped_at = None;
+        for entry in entries {
+            let name = entry.file_name();
+            if after.as_deref().is_some_and(|a| name.to_str().is_some_and(|n| n <= a)) {
+                continue;
+            }
             if started.elapsed() > BUDGET {
                 break;
             }
-            let name = entry.file_name();
+            stopped_at = name.to_str().map(String::from);
             // Left by a removal an earlier ibarad did not finish.
             if name.to_str().is_some_and(|n| n.starts_with(".removed-")) && entry.file_type().is_ok_and(|t| t.is_dir()) {
                 doomed.push(entry.path());
@@ -540,6 +553,9 @@ impl StorageService {
             }
         }
         let complete = started.elapsed() <= BUDGET;
+        if !complete {
+            *self.inner.workspace_cursor.lock() = stopped_at;
+        }
         if !doomed.is_empty() {
             std::thread::spawn(move || doomed.iter().for_each(|dir| remove_tree(dir)));
         }
@@ -547,6 +563,11 @@ impl StorageService {
             self.inner.workspace_pass_ms.store(now, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    /// One bounded workspace pass, for the watchdog (see [`Self::prune_ended_workspaces`]).
+    pub fn retain_workspaces(&self) {
+        let _ = self.prune_ended_workspaces();
     }
 
     /// storage.ts:1475-1478 `freeBytes`.

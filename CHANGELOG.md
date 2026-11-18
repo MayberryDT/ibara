@@ -1,3 +1,7 @@
+# Unreleased
+
+- Clear an existing backlog of ended tasks' workspaces while the computer is idle. In 0.3.9 a pass ran only at status reads and admissions and always started from the first folder, so on a real journal, where each check of a long task takes about 10 ms, a pass removed about ten folders and could spend all its time on the same kept ones. The watchdog now runs a pass every five seconds while no agent holds the computer, and each pass continues where the last one stopped.
+
 # 0.3.9
 
 - Stop repeating a cleanup step the session refused before it started. When the desktop reset could not reopen the browser to retire its saved session, ibara relaunched it every few seconds without end; it now waits as a blocked cleanup, the watchdog tries again on its backoff, and the computer comes back on its own once the step can run.

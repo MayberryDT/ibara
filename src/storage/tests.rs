@@ -45,6 +45,7 @@
 //! - a_job_left_unknown_by_an_earlier_ibarad_keeps_its_workspace
 //! - an_unresolved_receipt_keeps_its_workspace
 //! - read_only_folders_inside_a_workspace_do_not_keep_it_forever
+//! - a_backlog_clears_even_when_slow_kept_folders_come_first
 //! - low_disk_shortens_the_wait_to_a_day
 //! - workspace_passes_repeat_while_ibarad_runs_but_not_on_every_status_read
 
@@ -116,6 +117,8 @@ struct FakeJournal {
     updated: Mutex<HashMap<String, String>>,
     /// What `has_unsettled` reports; `unresolved` is what `has_unresolved` does.
     unsettled: Mutex<HashSet<String>>,
+    /// Tasks whose receipts take 30 ms to read, as a long task's do on a real journal.
+    slow: Mutex<HashSet<String>>,
 }
 
 impl FakeJournal {
@@ -144,6 +147,9 @@ impl JournalView for FakeJournal {
             }))
     }
     fn has_unresolved(&self, task_ref: &str) -> Result<bool> {
+        if self.slow.lock().contains(task_ref) {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
         if *self.broken.lock() {
             return Err(fail("INTERNAL_ERROR", "journal unreadable", false));
         }
@@ -1086,6 +1092,37 @@ fn read_only_folders_inside_a_workspace_do_not_keep_it_forever() {
     while std::fs::read_dir(&root).unwrap().next().is_some() {
         assert!(std::time::Instant::now() < deadline, "still there: {:?}", std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect::<Vec<_>>());
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// docs/disk-retention-failure-cases.md 18: a pass that always starts from the
+/// first folder spends its 100 ms on the same kept folders and never reaches
+/// the rest.
+#[test]
+fn a_backlog_clears_even_when_slow_kept_folders_come_first() {
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    let journal = Arc::new(FakeJournal::default());
+    for i in 1..=6 {
+        let task = format!("task_a{i}");
+        journal.task(&task, "completed", vec![]);
+        journal.unresolved.lock().insert(task.clone());
+        journal.slow.lock().insert(task.clone());
+        workspace_with_file(&s, &task);
+    }
+    journal.task("task_z_old", "completed", vec![]);
+    workspace_with_file(&s, "task_z_old");
+    s.set_authority_policy(journal);
+    let root = t.0.join("data/workspaces");
+    for _ in 0..8 {
+        if !root.join("task_z_old").exists() {
+            break;
+        }
+        s.capabilities().unwrap();
+    }
+    assert!(!root.join("task_z_old").exists(), "later passes continue where the last one stopped");
+    for i in 1..=6 {
+        assert!(root.join(format!("task_a{i}")).is_dir());
     }
 }
 

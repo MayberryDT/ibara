@@ -655,6 +655,10 @@ pub fn system_update(desktop: &Account, pairs: &[&str]) -> Result<(), String> {
 /// with its prefix, as [`restore_journals_if_newer`] picks). Other names are
 /// never returned.
 fn stale_backups(names: &[String], kept: &[String]) -> Vec<String> {
+    // No kept release could be read: rollback may still need any copy.
+    if kept.is_empty() {
+        return Vec::new();
+    }
     let made = |n: &String| n.strip_prefix("before-").and_then(|r| r.rsplit_once('-')).and_then(|(v, ms)| (!v.is_empty()).then_some(ms)).and_then(|ms| ms.parse::<u64>().ok());
     let copies: Vec<&String> = names.iter().filter(|n| made(n).is_some()).collect();
     let mut keep: Vec<&String> = copies.iter().copied().max_by_key(|n| made(n)).into_iter().collect();
@@ -666,7 +670,8 @@ fn stale_backups(names: &[String], kept: &[String]) -> Vec<String> {
 }
 
 /// Remove journal copies no kept release can go back to, as the person who
-/// owns them. Best effort: a failure here never fails the update.
+/// owns them, only when the kept releases could be read. Best effort: a
+/// failure here never fails the update.
 fn prune_journal_backups(desktop: &Account) {
     let backups = desktop.home.join(".local/state/ibara/backups");
     if !std::fs::symlink_metadata(&backups).is_ok_and(|m| m.is_dir()) {

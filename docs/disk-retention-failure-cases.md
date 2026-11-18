@@ -36,3 +36,12 @@ removed, and 0.8 GB was 21 journal copies made before updates, of which
 14. Pruning follows a symlink, or removes something that is not a `before-`
     copy.
 15. A pruning failure fails the update.
+
+## Found by review
+
+16. One workspace with many files (a `node_modules`, a build folder) is deleted
+    on ibarad's only thread, so status and admission wait seconds for it; or a
+    read-only folder inside it (a Go module cache) makes removal fail and the
+    workspace is retried on every pass.
+17. The kept releases cannot be read (an unreadable package cache, a failed
+    signature check), so every journal copy but the newest is removed.

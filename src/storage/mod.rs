@@ -475,31 +475,40 @@ impl StorageService {
 
     /// Remove the workspaces of tasks that ended over `workspace_retention_ms`
     /// ago, or a day ago while free disk is below the warning, and that have no
-    /// live or unconfirmed job and no unsettled operation. Published artifacts
-    /// are separate copies and stay. A complete pass runs at most every ten
-    /// minutes and a pass stops after 100 ms, so a backlog is worked through
-    /// over several status reads without stalling them. Without the journal,
-    /// on a journal error, or for a folder the journal has no task for,
-    /// nothing is removed. Symlinks are never followed.
+    /// live or unconfirmed job and no unsettled or unresolved operation.
+    /// Published artifacts are separate copies and stay. A complete pass runs
+    /// at most every ten minutes and a pass stops after 100 ms, so a backlog
+    /// is worked through over several status reads without stalling them. A
+    /// workspace is renamed out of the way at once and deleted on its own
+    /// thread, so one with many files does not hold up this one. Without the
+    /// journal, on a journal error, or for a folder the journal has no task
+    /// for, nothing is removed. Symlinks are never followed.
     fn prune_ended_workspaces(&self) -> Result<()> {
         const EVERY_MS: i64 = 10 * 60 * 1000;
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
         let Some(view) = self.journal() else { return Ok(()) };
         let now = self.clock();
         let last = self.inner.workspace_pass_ms.load(Ordering::SeqCst);
-        if last != 0 && now - last < EVERY_MS {
+        if last != 0 && (now - last).abs() < EVERY_MS {
             return Ok(());
         }
         let (keep_ms, warn) = (self.inner.opts.workspace_retention_ms, self.inner.opts.warn_free_bytes);
         let low = warn > 0 && self.free_bytes().is_ok_and(|free| free < warn);
         let cutoff = crate::ids::iso_from_millis(now - if low { keep_ms.min(DAY_MS) } else { keep_ms });
         let started = std::time::Instant::now();
-        let Ok(entries) = std::fs::read_dir(self.workspace_root()) else { return Ok(()) };
+        let root = self.workspace_root();
+        let Ok(entries) = std::fs::read_dir(&root) else { return Ok(()) };
+        let mut doomed = Vec::new();
         for entry in entries.flatten() {
             if started.elapsed() > BUDGET {
-                return Ok(());
+                break;
             }
             let name = entry.file_name();
+            // Left by a removal an earlier ibarad did not finish.
+            if name.to_str().is_some_and(|n| n.starts_with(".removed-")) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                doomed.push(entry.path());
+                continue;
+            }
             let Some(task_ref) = name.to_str().filter(|n| fsx::assert_id(n, "task_ref").is_ok()) else { continue };
             // `file_type` does not follow a symlink.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -508,12 +517,12 @@ impl StorageService {
             match view.task_state(task_ref) {
                 Ok(Some(task)) if is_journal_terminal_state(&task.state) && task.updated_at.as_str() <= cutoff.as_str() => {}
                 Ok(_) => continue,
-                Err(_) => return Ok(()),
+                Err(_) => break,
             }
-            match view.has_unsettled(task_ref) {
-                Ok(false) => {}
-                Ok(true) => continue,
-                Err(_) => return Ok(()),
+            match (view.has_unsettled(task_ref), view.has_unresolved(task_ref)) {
+                (Ok(false), Ok(false)) => {}
+                (Ok(_), Ok(_)) => continue,
+                _ => break,
             }
             let unconfirmed: bool = self.with_db(|db| {
                 Ok(db.query_row(
@@ -525,10 +534,18 @@ impl StorageService {
             if unconfirmed || self.has_active_jobs(Some(task_ref)) {
                 continue;
             }
-            // std's remove_dir_all removes a symlink inside, never its target.
-            let _ = std::fs::remove_dir_all(entry.path());
+            let aside = root.join(format!(".removed-{task_ref}-{}", crate::ids::now_millis()));
+            if std::fs::rename(entry.path(), &aside).is_ok() {
+                doomed.push(aside);
+            }
         }
-        self.inner.workspace_pass_ms.store(now, Ordering::SeqCst);
+        let complete = started.elapsed() <= BUDGET;
+        if !doomed.is_empty() {
+            std::thread::spawn(move || doomed.iter().for_each(|dir| remove_tree(dir)));
+        }
+        if complete {
+            self.inner.workspace_pass_ms.store(now, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -582,6 +599,30 @@ impl StorageService {
         self.kill_running_jobs_now();
         self.inner.db.lock().take();
     }
+}
+
+/// Remove a folder tree without following symlinks (std's remove_dir_all
+/// removes a symlink, never its target), first making its own folders
+/// writable when a read-only one, as a Go module cache leaves, stops it.
+fn remove_tree(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+        return;
+    }
+    fn writable(dir: &Path) {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
+        if !meta.is_dir() {
+            return;
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.permissions().mode() | 0o700));
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                writable(&entry.path());
+            }
+        }
+    }
+    writable(dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn closed_error() -> IbaraError {

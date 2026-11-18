@@ -114,7 +114,7 @@ struct FakeJournal {
     broken: Mutex<bool>,
     /// `updated_at` per task; tasks not listed ended in 2000.
     updated: Mutex<HashMap<String, String>>,
-    /// Unsettled only (`has_unresolved` stays false for these).
+    /// What `has_unsettled` reports; `unresolved` is what `has_unresolved` does.
     unsettled: Mutex<HashSet<String>>,
 }
 
@@ -153,7 +153,7 @@ impl JournalView for FakeJournal {
         if *self.broken.lock() {
             return Err(fail("INTERNAL_ERROR", "journal unreadable", false));
         }
-        Ok(self.unsettled.lock().contains(task_ref) || self.unresolved.lock().contains(task_ref))
+        Ok(self.unsettled.lock().contains(task_ref))
     }
 }
 

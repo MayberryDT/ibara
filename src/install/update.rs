@@ -1094,6 +1094,8 @@ mod tests {
         // A version that is a prefix of another keeps only its own copy.
         let names = ["before-0.3.1-1-100", "before-0.3.1-10-200", "before-0.3.1-10-300"].map(String::from).to_vec();
         assert_eq!(stale_backups(&names, &["0.3.1-1".to_string()]), ["before-0.3.1-10-200"]);
+        // No kept release could be read (an unreadable cache, a failed check): nothing goes.
+        assert!(stale_backups(&names, &[]).is_empty());
     }
 
     #[test]

@@ -42,6 +42,9 @@
 //! - workspaces_of_tasks_ended_long_ago_go_and_nothing_else_does
 //! - a_journal_error_or_no_journal_keeps_every_workspace
 //! - a_running_job_keeps_its_workspace
+//! - a_job_left_unknown_by_an_earlier_ibarad_keeps_its_workspace
+//! - an_unresolved_receipt_keeps_its_workspace
+//! - read_only_folders_inside_a_workspace_do_not_keep_it_forever
 //! - low_disk_shortens_the_wait_to_a_day
 //! - workspace_passes_repeat_while_ibarad_runs_but_not_on_every_status_read
 
@@ -111,6 +114,8 @@ struct FakeJournal {
     broken: Mutex<bool>,
     /// `updated_at` per task; tasks not listed ended in 2000.
     updated: Mutex<HashMap<String, String>>,
+    /// Unsettled only (`has_unresolved` stays false for these).
+    unsettled: Mutex<HashSet<String>>,
 }
 
 impl FakeJournal {
@@ -127,6 +132,9 @@ impl JournalView for FakeJournal {
         self.collectors.lock().get(principal).cloned()
     }
     fn task_state(&self, task_ref: &str) -> Result<Option<TaskState>> {
+        if *self.broken.lock() {
+            return Err(fail("INTERNAL_ERROR", "journal unreadable", false));
+        }
         Ok(self
             .tasks.lock()
             .get(task_ref)
@@ -142,7 +150,10 @@ impl JournalView for FakeJournal {
         Ok(self.unresolved.lock().contains(task_ref))
     }
     fn has_unsettled(&self, task_ref: &str) -> Result<bool> {
-        self.has_unresolved(task_ref)
+        if *self.broken.lock() {
+            return Err(fail("INTERNAL_ERROR", "journal unreadable", false));
+        }
+        Ok(self.unsettled.lock().contains(task_ref) || self.unresolved.lock().contains(task_ref))
     }
 }
 
@@ -924,7 +935,7 @@ fn workspaces_of_tasks_ended_long_ago_go_and_nothing_else_does() {
     }
     // Ended long ago but an operation is unsettled: stays.
     journal.task("task_unsettled", "completed", vec![]);
-    journal.unresolved.lock().insert("task_unsettled".into());
+    journal.unsettled.lock().insert("task_unsettled".into());
     workspace_with_file(&s, "task_unsettled");
     // Unknown to the journal, not a task folder, or a symlink: stays.
     workspace_with_file(&s, "task_unknown");
@@ -1020,5 +1031,61 @@ fn workspace_passes_repeat_while_ibarad_runs_but_not_on_every_status_read() {
     clock.fetch_add(11 * MINUTE_MS, std::sync::atomic::Ordering::SeqCst);
     s.capabilities().unwrap();
     assert!(!root.join("task_later").exists(), "a later pass removes it without a restart");
+}
+
+#[test]
+fn a_job_left_unknown_by_an_earlier_ibarad_keeps_its_workspace() {
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    workspace_with_file(&s, "task_old");
+    // No live handle: only the job's row says its outcome is unknown.
+    s.with_db(|db| {
+        db.execute(
+            "INSERT INTO jobs (job_ref, task_ref, request_id, state, termination_confirmed, record, updated_at) VALUES ('job_1', 'task_old', 'r1', 'completed', 0, '{}', '2000-01-01T00:00:00.000Z')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let journal = Arc::new(FakeJournal::default());
+    journal.task("task_old", "completed", vec![]);
+    s.set_authority_policy(journal);
+    assert!(t.0.join("data/workspaces/task_old").is_dir());
+}
+
+#[test]
+fn an_unresolved_receipt_keeps_its_workspace() {
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    workspace_with_file(&s, "task_old");
+    let journal = Arc::new(FakeJournal::default());
+    journal.task("task_old", "completed", vec![]);
+    journal.unresolved.lock().insert("task_old".into());
+    s.set_authority_policy(journal);
+    assert!(t.0.join("data/workspaces/task_old").is_dir());
+}
+
+#[test]
+fn read_only_folders_inside_a_workspace_do_not_keep_it_forever() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    let ws = workspace_with_file(&s, "task_old");
+    // As `go mod download` leaves its module cache.
+    std::fs::create_dir_all(ws.join("mod/pkg")).unwrap();
+    std::fs::write(ws.join("mod/pkg/a.go"), "package a").unwrap();
+    for d in ["mod/pkg", "mod"] {
+        std::fs::set_permissions(ws.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let journal = Arc::new(FakeJournal::default());
+    journal.task("task_old", "completed", vec![]);
+    s.set_authority_policy(journal);
+    let root = t.0.join("data/workspaces");
+    assert!(!root.join("task_old").exists(), "taken out of the workspaces at once");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_dir(&root).unwrap().next().is_some() {
+        assert!(std::time::Instant::now() < deadline, "still there: {:?}", std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect::<Vec<_>>());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 

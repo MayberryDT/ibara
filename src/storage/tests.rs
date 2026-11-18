@@ -37,6 +37,13 @@
 //!
 //! Migration
 //! - real_storage_databases_open_and_keep_their_rows
+//!
+//! Workspace retention (docs/disk-retention-failure-cases.md)
+//! - workspaces_of_tasks_ended_long_ago_go_and_nothing_else_does
+//! - a_journal_error_or_no_journal_keeps_every_workspace
+//! - a_running_job_keeps_its_workspace
+//! - low_disk_shortens_the_wait_to_a_day
+//! - workspace_passes_repeat_while_ibarad_runs_but_not_on_every_status_read
 
 use super::*;
 use serde_json::{Value, json};
@@ -102,6 +109,8 @@ struct FakeJournal {
     collectors: Mutex<HashMap<String, String>>,
     unresolved: Mutex<HashSet<String>>,
     broken: Mutex<bool>,
+    /// `updated_at` per task; tasks not listed ended in 2000.
+    updated: Mutex<HashMap<String, String>>,
 }
 
 impl FakeJournal {
@@ -121,7 +130,10 @@ impl JournalView for FakeJournal {
         Ok(self
             .tasks.lock()
             .get(task_ref)
-            .map(|t| TaskState { state: t.state.clone(), updated_at: "2000-01-01T00:00:00.000Z".into() }))
+            .map(|t| TaskState {
+                state: t.state.clone(),
+                updated_at: self.updated.lock().get(task_ref).cloned().unwrap_or_else(|| "2000-01-01T00:00:00.000Z".into()),
+            }))
     }
     fn has_unresolved(&self, task_ref: &str) -> Result<bool> {
         if *self.broken.lock() {
@@ -865,3 +877,148 @@ fn real_storage_databases_open_and_keep_their_rows() {
     }
     eprintln!("opened {opened} real storage databases");
 }
+
+// ---------------------------------------------------------------- workspace retention
+
+const MINUTE_MS: i64 = 60 * 1000;
+
+fn ended_at(journal: &FakeJournal, task_ref: &str, state: &str, at_ms: i64) {
+    journal.task(task_ref, state, vec![]);
+    journal.updated.lock().insert(task_ref.into(), crate::ids::iso_from_millis(at_ms));
+}
+
+fn workspace_with_file(s: &StorageService, task_ref: &str) -> PathBuf {
+    let ws = s.workspace(task_ref, true).unwrap();
+    std::fs::create_dir_all(ws.join("shots")).unwrap();
+    std::fs::write(ws.join("shots/a.png"), "png").unwrap();
+    ws
+}
+
+#[test]
+fn workspaces_of_tasks_ended_long_ago_go_and_nothing_else_does() {
+    let t = TempDir::new();
+    let (s, clock) = aged_service(&t);
+    let now = clock.load(std::sync::atomic::Ordering::SeqCst);
+    let journal = Arc::new(FakeJournal::default());
+    let outside = t.0.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+
+    // Ended eight days ago and settled: goes, without following its symlink.
+    journal.task("task_old", "completed", vec![]);
+    let old = workspace_with_file(&s, "task_old");
+    std::os::unix::fs::symlink(&outside, old.join("link")).unwrap();
+    let artifact = publish(&s, &ctx("task_old", "hazel"), "out.txt", "result");
+    ended_at(&journal, "task_old", "completed", now - 8 * 24 * 60 * MINUTE_MS);
+    for state in ["cancelled", "partial"] {
+        ended_at(&journal, &format!("task_{state}"), state, now - 8 * 24 * 60 * MINUTE_MS);
+        workspace_with_file(&s, &format!("task_{state}"));
+    }
+    // Ended two days ago: stays.
+    ended_at(&journal, "task_recent", "completed", now - 2 * 24 * 60 * MINUTE_MS);
+    workspace_with_file(&s, "task_recent");
+    // Not ended, however old: stays.
+    for state in ["active", "blocked"] {
+        journal.task(&format!("task_{state}"), state, vec![]);
+        workspace_with_file(&s, &format!("task_{state}"));
+    }
+    // Ended long ago but an operation is unsettled: stays.
+    journal.task("task_unsettled", "completed", vec![]);
+    journal.unresolved.lock().insert("task_unsettled".into());
+    workspace_with_file(&s, "task_unsettled");
+    // Unknown to the journal, not a task folder, or a symlink: stays.
+    workspace_with_file(&s, "task_unknown");
+    let root = t.0.join("data/workspaces");
+    std::fs::create_dir(root.join("Not A Task")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("task_link")).unwrap();
+    journal.task("task_link", "completed", vec![]);
+
+    s.set_authority_policy(journal.clone());
+
+    for gone in ["task_old", "task_cancelled", "task_partial"] {
+        assert!(!root.join(gone).exists(), "{gone} should be removed");
+    }
+    for kept in ["task_recent", "task_active", "task_blocked", "task_unsettled", "task_unknown", "Not A Task"] {
+        assert!(root.join(kept).is_dir(), "{kept} should stay");
+    }
+    assert!(std::fs::symlink_metadata(root.join("task_link")).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "keep");
+    assert!(bytes_present(&t, &artifact), "a published artifact keeps its bytes");
+}
+
+#[test]
+fn a_journal_error_or_no_journal_keeps_every_workspace() {
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    workspace_with_file(&s, "task_old");
+    s.capabilities().unwrap();
+    assert!(t.0.join("data/workspaces/task_old").is_dir(), "no journal view");
+    let journal = Arc::new(FakeJournal::default());
+    journal.task("task_old", "completed", vec![]);
+    *journal.broken.lock() = true;
+    s.set_authority_policy(journal);
+    assert!(t.0.join("data/workspaces/task_old").is_dir(), "journal error");
+}
+
+#[tokio::test]
+async fn a_running_job_keeps_its_workspace() {
+    let t = TempDir::new();
+    let (s, _clock) = aged_service(&t);
+    let c = ctx("task_old", "hazel");
+    s.workspace("task_old", true).unwrap();
+    let out = s.exec(&json!({ "program": "sh", "args": ["-c", "sleep 30"], "timeout_ms": 10000, "background": true }), &c).await.unwrap();
+    assert_eq!(out.records[0]["state"], "running");
+    let journal = Arc::new(FakeJournal::default());
+    journal.task("task_old", "completed", vec![]);
+    s.set_authority_policy(journal);
+    assert!(t.0.join("data/workspaces/task_old").is_dir());
+    assert!(s.cancel_jobs(Some("task_old")).await.unwrap());
+}
+
+#[test]
+fn low_disk_shortens_the_wait_to_a_day() {
+    let t = TempDir::new();
+    let clock = Arc::new(AtomicI64::new(crate::ids::now_millis()));
+    let free = Arc::new(AtomicI64::new(100 * 1024 * 1024 * 1024));
+    let mut o = options(&t.0);
+    o.warn_free_bytes = 15 * 1024 * 1024 * 1024;
+    let c2 = clock.clone();
+    o.clock = Some(Arc::new(move || c2.load(std::sync::atomic::Ordering::SeqCst)));
+    let f2 = free.clone();
+    o.statfs = Some(Arc::new(move |_| Ok(f2.load(std::sync::atomic::Ordering::SeqCst) as u64)));
+    let s = StorageService::open(o).unwrap();
+    let now = clock.load(std::sync::atomic::Ordering::SeqCst);
+    let journal = Arc::new(FakeJournal::default());
+    ended_at(&journal, "task_twodays", "completed", now - 2 * 24 * 60 * MINUTE_MS);
+    ended_at(&journal, "task_hour", "completed", now - 60 * MINUTE_MS);
+    workspace_with_file(&s, "task_twodays");
+    workspace_with_file(&s, "task_hour");
+    let root = t.0.join("data/workspaces");
+
+    s.set_authority_policy(journal.clone());
+    assert!(root.join("task_twodays").is_dir(), "plenty of disk: the week applies");
+
+    free.store(10 * 1024 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+    clock.fetch_add(11 * MINUTE_MS, std::sync::atomic::Ordering::SeqCst);
+    s.capabilities().unwrap();
+    assert!(!root.join("task_twodays").exists(), "below the warning: a day applies");
+    assert!(root.join("task_hour").is_dir(), "ended an hour ago: stays even on a low disk");
+}
+
+#[test]
+fn workspace_passes_repeat_while_ibarad_runs_but_not_on_every_status_read() {
+    let t = TempDir::new();
+    let (s, clock) = aged_service(&t);
+    let journal = Arc::new(FakeJournal::default());
+    s.set_authority_policy(journal.clone());
+    // A task that ends after the first pass.
+    journal.task("task_later", "completed", vec![]);
+    workspace_with_file(&s, "task_later");
+    let root = t.0.join("data/workspaces");
+    s.capabilities().unwrap();
+    assert!(root.join("task_later").is_dir(), "a pass a moment ago: no new scan yet");
+    clock.fetch_add(11 * MINUTE_MS, std::sync::atomic::Ordering::SeqCst);
+    s.capabilities().unwrap();
+    assert!(!root.join("task_later").exists(), "a later pass removes it without a restart");
+}
+

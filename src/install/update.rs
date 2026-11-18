@@ -963,9 +963,14 @@ pub fn whats_new_seen() -> Result<Value, String> {
 /// 8. A permission removed or narrowed since the update is back as it was.
 /// 9. Going back widens or adds anything, or leaves approvals asked for under
 ///    the older access revision valid.
+/// Not yet written: keeps every copy, as before.
+fn stale_backups(_names: &[String], _kept: &[String]) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PACKAGES, narrow_access, package_version, verify};
+    use super::{PACKAGES, narrow_access, package_version, stale_backups, verify};
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1023,6 +1028,41 @@ mod tests {
             "packages": packages, "notes": ["Updates install themselves."],
         }))
         .unwrap()
+    }
+
+    /// docs/disk-retention-failure-cases.md 11 to 14: each kept release keeps
+    /// the copy `ibara rollback` would restore for it, the newest copy stays,
+    /// and nothing but a `before-` copy is ever named.
+    #[test]
+    fn update_keeps_the_journal_copies_rollback_can_use_and_drops_the_rest() {
+        let names: Vec<String> = [
+            "before-0.1.0-16-1790676224703",
+            "before-0.1.0-17-1790688898499",
+            "before-0.3.6-1-1792000000000",
+            "before-0.3.6-1-1792000000500",
+            "before-0.3.7-1-1793000000000",
+            "before-0.3.8-1-1794000000000",
+            "before-none-1794100000000",
+            "release031-final",
+            "fleet-20261114-20261114-213456",
+            "before-",
+            "before-0.3.5-1-notatime",
+        ]
+        .map(String::from)
+        .to_vec();
+        let kept = ["0.3.8-1", "0.3.7-1", "0.3.6-1"].map(String::from);
+        let mut stale = stale_backups(&names, &kept);
+        stale.sort();
+        assert_eq!(stale, ["before-0.1.0-16-1790676224703", "before-0.1.0-17-1790688898499", "before-0.3.6-1-1792000000000"]);
+        // The copy just made stays even when its version is not kept.
+        let mut stale = stale_backups(&names, &["0.3.8-1".to_string()]);
+        stale.sort();
+        assert!(!stale.contains(&"before-none-1794100000000".to_string()));
+        assert!(!stale.contains(&"before-0.3.8-1-1794000000000".to_string()));
+        assert!(stale.contains(&"before-0.3.7-1-1793000000000".to_string()));
+        // A version that is a prefix of another keeps only its own copy.
+        let names = ["before-0.3.1-1-100", "before-0.3.1-10-200", "before-0.3.1-10-300"].map(String::from).to_vec();
+        assert_eq!(stale_backups(&names, &["0.3.1-1".to_string()]), ["before-0.3.1-10-200"]);
     }
 
     #[test]

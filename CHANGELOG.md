@@ -2,6 +2,8 @@
 
 - Stop repeating a cleanup step the session refused before it started. When the desktop reset could not reopen the browser to retire its saved session, ibara relaunched it every few seconds without end; it now waits as a blocked cleanup, the watchdog tries again on its backoff, and the computer comes back on its own once the step can run.
 - Report the session's runtime directory as `storage.runtime`, degraded below a tenth free; name it when a full one stops an app from starting; and, while it is low, remove the logs of shells that have exited, which otherwise stay there until logout.
+- Remove a task's workspace seven days after the task ended, or one day after while free disk is below the warning, once none of its jobs is running or unconfirmed and none of its operations is unsettled. Workspaces were never removed: one computer kept 2,349 of them, 13 GB. Published artifacts are separate copies and stay. Each pass stops after 100 ms and a complete pass runs at most every ten minutes, so a backlog clears over several status reads. Policy key `workspace_retention_ms` changes the seven days.
+- Keep only the journal copies `ibara rollback` can still use when `ibara update` runs: the one for each kept release and the newest. Every update added a copy and none was removed.
 
 # 0.3.8
 

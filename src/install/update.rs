@@ -646,7 +646,43 @@ pub fn system_update(desktop: &Account, pairs: &[&str]) -> Result<(), String> {
         output(Command::new(Path::new(LIB).join("bin/ibara")).args(["system","refresh"]))?;
     }
     prune_cache();
+    prune_journal_backups(desktop);
     Ok(())
+}
+
+/// The `before-` journal copies to remove: all but the newest, and for each
+/// kept release the copy `ibara rollback` restores for it (the greatest name
+/// with its prefix, as [`restore_journals_if_newer`] picks). Other names are
+/// never returned.
+fn stale_backups(names: &[String], kept: &[String]) -> Vec<String> {
+    let made = |n: &String| n.strip_prefix("before-").and_then(|r| r.rsplit_once('-')).and_then(|(v, ms)| (!v.is_empty()).then_some(ms)).and_then(|ms| ms.parse::<u64>().ok());
+    let copies: Vec<&String> = names.iter().filter(|n| made(n).is_some()).collect();
+    let mut keep: Vec<&String> = copies.iter().copied().max_by_key(|n| made(n)).into_iter().collect();
+    for version in kept {
+        let prefix = format!("before-{}-", safe(version));
+        keep.extend(copies.iter().copied().filter(|n| n.starts_with(&prefix) && n[prefix.len()..].parse::<u64>().is_ok()).max());
+    }
+    copies.into_iter().filter(|n| !keep.contains(n)).cloned().collect()
+}
+
+/// Remove journal copies no kept release can go back to, as the person who
+/// owns them. Best effort: a failure here never fails the update.
+fn prune_journal_backups(desktop: &Account) {
+    let backups = desktop.home.join(".local/state/ibara/backups");
+    if !std::fs::symlink_metadata(&backups).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let names: Vec<String> = std::fs::read_dir(&backups).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+    let mut kept: Vec<String> = Vec::new();
+    for (version, _) in cached() {
+        if !kept.contains(&version) {
+            kept.push(version);
+        }
+    }
+    for name in stale_backups(&names, &kept) {
+        // rm never follows a symlink it is given or finds inside.
+        let _ = output(Command::new("runuser").args(["-u", &desktop.name, "--", "/usr/bin/rm", "-rf", "--one-file-system", "--"]).arg(backups.join(name)));
+    }
 }
 
 /// A copy of the controller's journals, made by the desktop account itself
@@ -963,11 +999,6 @@ pub fn whats_new_seen() -> Result<Value, String> {
 /// 8. A permission removed or narrowed since the update is back as it was.
 /// 9. Going back widens or adds anything, or leaves approvals asked for under
 ///    the older access revision valid.
-/// Not yet written: keeps every copy, as before.
-fn stale_backups(_names: &[String], _kept: &[String]) -> Vec<String> {
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{PACKAGES, narrow_access, package_version, stale_backups, verify};

@@ -151,6 +151,8 @@ impl Controller {
             if let Err(e) = self.repair_viewer().await {
                 log_event("watchdog_failed", &e.to_string());
             }
+            self.reclaim_runtime_dir();
+            self.refresh_runtime_capability().await;
             if let Err(e) = self.repair_unsettled().await {
                 log_event("watchdog_failed", &e.to_string());
             }
@@ -327,7 +329,10 @@ impl Controller {
         // Do not claim another repair when the reset intentionally refuses
         // unchanged clients. Recheck at the capped interval for actual changes.
         let reset = self.journal.desktop_reset()?;
-        if reset["state"] == "blocked" && self.watchdog.borrow().attempts[Problem::Unsettled.index()].failures >= NEEDS_PERSON_AFTER {
+        // A retry-safe blocker (nothing started) is retried on the normal backoff.
+        if reset["state"] == "blocked" && reset["retry_safe"] != true
+            && self.watchdog.borrow().attempts[Problem::Unsettled.index()].failures >= NEEDS_PERSON_AFTER
+        {
             let inventory = self.desktop.all_windows().await.ok();
             if reset["blocked_inventory"] == super::windows::reset_inventory(inventory.as_deref()) {
                 self.watchdog.borrow_mut().attempts[Problem::Unsettled.index()].next_at_ms = now + BACKOFF_MAX_MS;
@@ -343,6 +348,41 @@ impl Controller {
             self.repaired(Problem::Unsettled);
         }
         Ok(())
+    }
+
+    /// A nearly full session runtime directory stops every app launch, cleanup
+    /// included. Remove what exited shells left there and say what went.
+    fn reclaim_runtime_dir(&self) {
+        use crate::desktop::runtime_dir;
+        let Some(dir) = runtime_dir::session_dir() else { return };
+        if !runtime_dir::space(&dir).is_some_and(|s| s.low()) {
+            return;
+        }
+        let reclaimed = runtime_dir::reclaim_closed_shells(&dir);
+        if reclaimed.instances.is_empty() {
+            return;
+        }
+        let summary = format!("Removed the logs of {} closed shell(s) ({} MiB) because the session runtime directory was nearly full.",
+            reclaimed.instances.len(), reclaimed.bytes / (1024 * 1024));
+        log_event("runtime_dir_reclaimed", &summary);
+        let at = self.record(REPAIR, &summary, json!({ "problem": "runtime_dir_low", "directory": dir, "instances": reclaimed.instances.iter().take(20).collect::<Vec<_>>(), "instance_count": reclaimed.instances.len(),
+            "bytes": reclaimed.bytes, "free_after": runtime_dir::space(&dir).map(|s| s.free) }));
+        self.watchdog.borrow_mut().last = Some((at, summary));
+    }
+
+    /// Capabilities are otherwise refreshed at admission and operator status;
+    /// refresh them when the runtime directory's status changes, so fleet
+    /// status shows a nearly full one before launches fail.
+    async fn refresh_runtime_capability(&self) {
+        use crate::desktop::runtime_dir;
+        let Some(dir) = runtime_dir::session_dir() else { return };
+        let now = runtime_dir::capability(&dir, "")["status"].clone();
+        let changed = self.capabilities.borrow().iter()
+            .find(|c| c["name"] == "storage.runtime")
+            .is_some_and(|c| c["status"] != now);
+        if changed && let Err(e) = self.refresh_capabilities().await {
+            log_event("watchdog_failed", &e.to_string());
+        }
     }
 
     /// Resume when only the system paused and the computer is healthy.

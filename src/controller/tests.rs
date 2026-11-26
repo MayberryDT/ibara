@@ -316,7 +316,11 @@ impl DesktopPort for FakeDesktop {
                 });
             }
             if op == "caret" && field.present {
-                // Like the page reader: whether a page field has the keyboard, and how much it holds, never what.
+                // Like the page reader: it answers for the tab it is asked about, and refuses without one.
+                if args.get("tabId").and_then(Value::as_i64).is_none() {
+                    return Err(crate::error::unavailable("the page reader was asked about no tab"));
+                }
+                // Whether a page field has the keyboard, and how much it holds, never what.
                 return Ok(json!({ "editable": field.focused, "length": field.value.chars().count() }));
             }
             self.extension.borrow().get(op).cloned().ok_or_else(|| crate::error::unavailable("no extension"))

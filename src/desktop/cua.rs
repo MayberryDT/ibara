@@ -818,7 +818,7 @@ impl Cua {
     }
 
     /// Wheel notches into the window's focused region.
-    pub async fn scroll(&self, pid: i64, window: u64, dx: i32, dy: i32) -> Result<()> {
+    pub async fn scroll(&self, pid: i64, window: u64, _at: Option<(f64, f64)>, dx: i32, dy: i32, _cancel: Option<&Cancel>) -> Result<()> {
         // Wheel input may bring the real pointer into the window first.
         let _moving = self.inner.motion.begin();
         let mut sent = false;
@@ -1977,7 +1977,7 @@ esac
         assert!(rejected.message.contains("unknown field"), "Cua's reason is kept: {}", rejected.message);
         assert!(cua.running().await, "a rejection is an answer, not a dead worker");
 
-        let unknown = cua.scroll(1, 1, 0, 3).await.unwrap_err();
+        let unknown = cua.scroll(1, 1, None, 0, 3, None).await.unwrap_err();
         assert_eq!(unknown.code, "OUTCOME_UNKNOWN", "an error that can follow a tool that ran is not a refusal");
 
         cua.tree(1, 1).await.unwrap();
@@ -2091,6 +2091,63 @@ esac
         let calls = lines(dir.join("calls.log"));
         assert_eq!(calls.iter().filter(|c| *c == "get_window_state").count(), 1, "no picture is taken: {calls:?}");
         assert_eq!(calls.iter().filter(|c| matches!(c.as_str(), "click" | "drag")).count(), 2);
+
+        cua.stop().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A wheel scroll at a place (agent feedback, November 2026). Failure
+    // cases, written first (docs/agent-feedback-failure-cases.md 17, 18, 21):
+    // - a scroll aimed at a point still gives Cua no place, so Cua scrolls at
+    //   the window's centre: the page scrolls and the list under the point
+    //   does not;
+    // - a scroll with no point starts naming one, and no longer scrolls the
+    //   focused window as before;
+    // - on a Cua that wants a picture before pixels, a scroll at a point is
+    //   refused instead of taking the picture and trying once more.
+
+    /// The arguments of each `scroll` call the stand-in received.
+    fn scrolls(dir: &Path) -> Vec<Value> {
+        lines(dir.join("scrolls.log"))
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["params"]["arguments"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_wheel_scroll_at_a_window_point_gives_cua_the_point() {
+        let dir = temp_dir();
+        let cua = cua(&dir, fake_cua(&dir, true, r#"      scroll) printf '%s\n' "$line" >>"$dir/scrolls.log";;"#));
+
+        cua.scroll(1, 1, Some((236.0, 470.0)), 0, 3, None).await.unwrap();
+        cua.scroll(1, 1, None, -2, 0, None).await.unwrap();
+
+        let sent = scrolls(&dir);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!((&sent[0]["x"], &sent[0]["y"]), (&json!(236.0), &json!(470.0)), "the point, in window pixels: {sent:?}");
+        assert_eq!((&sent[0]["direction"], &sent[0]["amount"]), (&json!("down"), &json!(3)), "{sent:?}");
+        assert!(sent[1].get("x").is_none() && sent[1].get("y").is_none(), "no point, no place: the focused window scrolls as before: {sent:?}");
+        assert_eq!((&sent[1]["direction"], &sent[1]["amount"]), (&json!("left"), &json!(2)), "{sent:?}");
+
+        cua.stop().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wheel_scroll_at_a_point_takes_the_picture_cua_asks_for_and_tries_once_more() {
+        let dir = temp_dir();
+        // Cua 0.29's rule for pixels (CUA_029_POINTER), taken to hold for a
+        // scroll at a point as it does for a click: not probed on a computer.
+        let replies = CUA_029_POINTER.replace("click|drag)", "click|drag|scroll)");
+        let cua = cua(&dir, fake_cua(&dir, true, &replies));
+        cua.set_agent(Some("codex@test".into()));
+        cua.show_cursor(0.0, 0.0).await.unwrap();
+
+        cua.tree(1, 1).await.unwrap();
+        cua.scroll(1, 1, Some((40.0, 40.0)), 0, 3, None).await.unwrap();
+        assert_eq!(lines(dir.join("landed.log")), ["scroll native"], "sent once, at the window point asked for");
+        let calls = lines(dir.join("calls.log"));
+        assert_eq!(calls.iter().filter(|c| *c == "scroll").count(), 2, "refused once, then sent: {calls:?}");
 
         cua.stop().await;
         std::fs::remove_dir_all(dir).unwrap();

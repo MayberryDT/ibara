@@ -1014,7 +1014,7 @@ impl Desktop {
                 let at = at.map(|p| (p.x,p.y)).unwrap_or((window.at[0] as f64 + window.size[0] as f64/2.0, window.at[1] as f64 + window.size[1] as f64/2.0));
                 return self.compositor_input.scroll(&window,at,&self.screens().await,dx,dy,cancel).await;
             }
-            self.cua.scroll(window.pid, cua::window_id(&window.address)?, dx, dy).await
+            self.cua.scroll(window.pid, cua::window_id(&window.address)?, None, dx, dy, cancel).await
         })
         .await
     }

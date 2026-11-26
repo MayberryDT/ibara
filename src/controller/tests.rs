@@ -34,6 +34,7 @@ mod interaction3;
 mod interaction4;
 mod interaction5;
 mod friction;
+mod agent_feedback;
 
 /// The viewer certificate `vesper` registered.
 const CERT: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
@@ -313,6 +314,10 @@ impl DesktopPort for FakeDesktop {
                     Some(expected) => json!({ "focused": field.focused, "matches": field.value == expected }),
                     None => json!({ "focused": field.focused }),
                 });
+            }
+            if op == "caret" && field.present {
+                // Like the page reader: whether a page field has the keyboard, and how much it holds, never what.
+                return Ok(json!({ "editable": field.focused, "length": field.value.chars().count() }));
             }
             self.extension.borrow().get(op).cloned().ok_or_else(|| crate::error::unavailable("no extension"))
         })

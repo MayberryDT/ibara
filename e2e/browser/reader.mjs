@@ -33,6 +33,20 @@
 //    frame's host.
 // 10. The tab the element was observed in has closed, and the refusal does
 //    not say so.
+//
+// Agent feedback of November 2026 (docs/agent-feedback-failure-cases.md):
+// 11. An option inside the window but outside the part of its own scrolling
+//    list that shows is refused as covered, or is located at a point a press
+//    does not reach it at.
+// 12. Scrolling that option into its list also moves the page, or moves a
+//    list the option is not in.
+// 13. An element truly covered inside a scrolling box is no longer refused.
+// 14. Reveal gives no place for an element a wheel could be sent over, or
+//    gives one for an element that is covered (the wheel would go to its
+//    cover), or fails for it where it answered before.
+// 15. Caret says a page field has the keyboard when none has (a button, the
+//    page itself), or gives the field's text rather than only how much it
+//    holds; or says none has it when a field or an editable region does.
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -77,6 +91,18 @@ const pages = {
   '/gameframe': `<title>Arena with a frame</title><style>body{margin:0}canvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:0}iframe{position:fixed;right:20px;top:20px;width:300px;height:150px;z-index:1}</style>
     <canvas aria-label="Arena"></canvas><iframe src="/inner"></iframe>
     <script>const c=document.querySelector('canvas');c.addEventListener('pointerdown',()=>{if(!document.pointerLockElement)c.requestPointerLock()});</script>`,
+  // A time picker as a video site's scheduler has it: two scrolling lists
+  // that show seven rows each, in a page taller than the window. A pressed
+  // option is noted in the title.
+  '/picker': `<title>Picker</title><style>body{margin:20px;height:3000px}.list{height:168px;width:76px;overflow-y:auto;display:inline-block;border:1px solid #888}.list div{height:24px;line-height:24px}</style>
+    <div role=combobox aria-label="Select time"><div class=list id=hours role=listbox aria-label="Hours"></div><div class=list id=minutes role=listbox aria-label="Minutes"></div></div>
+    <script>for(const [id,count,word] of [['hours',24,'Hours'],['minutes',60,'Minutes']])for(let i=0;i<count;i++){const row=document.createElement('div');row.setAttribute('role','option');row.setAttribute('aria-label',word+' '+String(i).padStart(2,'0'));row.textContent=String(i).padStart(2,'0');row.addEventListener('click',()=>{document.title='pressed '+row.getAttribute('aria-label')});document.getElementById(id).appendChild(row);}</script>`,
+  // A list whose bottom rows a fixed banner covers, however the list scrolls.
+  '/coveredlist': `<title>Covered list</title><style>body{margin:20px}.list{height:168px;width:200px;overflow-y:auto;border:1px solid #888}.list div{height:24px;line-height:24px}#banner{position:fixed;left:0;top:0;width:100vw;height:100vh;background:#fffe}</style>
+    <div class=list role=listbox aria-label="Rows"></div><div id=banner role=dialog aria-label="Offer"><p>An offer.</p></div>
+    <script>for(let i=0;i<30;i++){const row=document.createElement('div');row.setAttribute('role','option');row.setAttribute('aria-label','Row '+i);row.textContent='Row '+i;document.querySelector('.list').appendChild(row);}</script>`,
+  // Fields that take text, and a button that does not.
+  '/fields': `<title>Fields</title><input aria-label="Name" value="Dana"><div contenteditable=true role=textbox aria-label="Caption">Mid lane</div><button>Send</button>`,
   // A cookie banner over the whole page, not modal, so Buy stays listed.
   '/covered': `<title>Shop</title><button style="position:fixed;left:20px;top:20px">Buy</button>
     <div role=dialog aria-label="Cookie choices" style="position:fixed;inset:0;background:#fffe"><p>We use cookies.</p><button>Accept</button></div>`,
@@ -313,6 +339,61 @@ await scenario('a pointer the page locked refuses a click in a frame', async che
   check('wanted', 'not located', !located(answer), plain(answer));
   check('wanted', 'names the element holding the pointer', answer?.locked === 'canvas "Arena"', plain(answer));
   await evaluate(`document.exitPointerLock(); true`);
+});
+
+await scenario('an option its own scrolling list hides is scrolled into the list and located', async check => {
+  await open('/picker');
+  const seen = await observe();
+  const scrollTops = () => evaluate(`[document.getElementById('hours').scrollTop, document.getElementById('minutes').scrollTop, scrollY]`);
+  const before = await scrollTops();
+  // Hours 15 is 360 pixels down its list, inside the window and outside the 168 the list shows.
+  const inWindow = await evaluate(`(() => { const r = document.querySelector('[aria-label="Hours 15"]').getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; })()`);
+  check('setup', 'the option is inside the window', inWindow, before);
+  const answer = await locate(target(seen, 'Hours 15'));
+  check('wanted', 'located', located(answer), plain(answer));
+  const after = await scrollTops();
+  check('wanted', 'its own list scrolled', after[0] > before[0], { before, after });
+  check('safe', 'the other list and the page did not move', after[1] === before[1] && after[2] === before[2], { before, after });
+  if (located(answer)) {
+    await press(answer.x, answer.y);
+    check('safe', 'a press at the point reaches that option', await until(() => evaluate(`document.title === 'pressed Hours 15'`), 2000, 'the press').catch(() => false), await evaluate('document.title'));
+    const hit = (await ask('verify', { ...target(seen, 'Hours 15'), navigation: false })).result;
+    check('safe', 'and the reader saw it as a hit', hit?.observed === true && hit.hit === true, hit);
+  }
+});
+
+await scenario('an option a banner covers stays refused inside its scrolling list', async check => {
+  await open('/coveredlist');
+  const answer = await locate(target(await observe(), 'Row 20'));
+  check('safe', 'not located', !located(answer), plain(answer));
+  check('wanted', 'names the cover', answer?.covered === true && answer.cover === 'dialog "Offer"', plain(answer));
+});
+
+await scenario('reveal says where a wheel reaches the element, and nothing for a covered one', async check => {
+  await open('/picker');
+  const seen = await observe();
+  const answer = (await ask('reveal', target(seen, 'Minutes'))).result;
+  const box = await evaluate(`(() => { const r = document.getElementById('minutes').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]; })()`);
+  check('wanted', 'revealed, with a place inside the list', answer?.revealed === true && answer.x > box[0] && answer.x < box[2] && answer.y > box[1] && answer.y < box[3], { answer: plain(answer), box });
+  check('wanted', 'and what maps that place to the window', Array.isArray(answer?.outer) && Array.isArray(answer?.inner) && answer?.zoom > 0, plain(answer));
+  await open('/coveredlist');
+  const covered = (await ask('reveal', target(await observe(), 'Row 20'))).result;
+  check('safe', 'a covered element is revealed with no place', covered?.revealed === true && covered.x === undefined, plain(covered));
+});
+
+await scenario('caret says whether a page field has the keyboard, and only how much it holds', async check => {
+  await open('/fields');
+  const caret = async () => (await ask('caret', { tabId: await tab() })).result;
+  check('safe', 'nothing focused: no field', (await caret())?.editable === false, await caret());
+  await evaluate(`document.querySelector('button').focus(); true`);
+  check('safe', 'a button: no field', (await caret())?.editable === false, await caret());
+  await evaluate(`document.querySelector('input').focus(); true`);
+  let answer = await caret();
+  check('wanted', 'a text input: a field holding 4 characters', answer?.editable === true && answer.length === 4, answer);
+  check('safe', 'its text is not told', !JSON.stringify(answer).includes('Dana'), answer);
+  await evaluate(`document.querySelector('[contenteditable]').focus(); true`);
+  answer = await caret();
+  check('wanted', 'an editable region: a field holding 8 characters', answer?.editable === true && answer.length === 8, answer);
 });
 
 // Last: it closes the tab the DevTools connection is on.

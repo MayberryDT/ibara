@@ -726,7 +726,7 @@ mod tests {
     //! - typing or a key moves the real pointer; a key moves the agent's
     //!   cursor; typing moves it to a field no box proves, or sends the first
     //!   key before it arrives at a field whose box is known.
-    use super::super::{ClickTarget, Desktop, DesktopConfig, ElementTarget, SurfaceId, TypingCursor};
+    use super::super::{ClickTarget, Desktop, DesktopConfig, ElementTarget, Point, SurfaceId, TypingCursor};
     use super::*;
     use crate::desktop::input::Button;
     use crate::desktop::run::Cancel;
@@ -923,7 +923,9 @@ mcp)
         # connection before the next key), `transport` when the connection
         # fails with a key in flight (that key arrives unacknowledged),
         # `grab` when a popup takes the keyboard (the plugin refuses the next
-        # key). `focus_on_stop` then takes the keyboard focus.
+        # key), `stalled` as `display` but counted even before a call's
+        # first key (0 delivered; Cua has not been seen to say this).
+        # `focus_on_stop` then takes the keyboard focus.
         at='' why=''; [ -s "$dir/stop_at" ] && read -r at why <"$dir/stop_at"
         i=0
         while [ "$i" -lt "${{#text}}" ]; do
@@ -938,7 +940,7 @@ mcp)
               grab) reason=primary_target_busy detail=foreground_grab;;
               *) reason=text_interrupted;;
             esac
-            if [ "$i" -gt 0 ]; then
+            if [ "$i" -gt 0 ] || [ "$why" = stalled ]; then
               reply='"result":{{"isError":true,"content":[{{"type":"text","text":"foreground_unavailable ('$reason'): '"$detail"'"}}],"structuredContent":{{"ok":false,"code":"foreground_unavailable","reason":"'$reason'","detail":"'"$detail"'","effect":"partial","delivery":{{"mode":"foreground","delivered_count":'$i'}},"route":"global_input","verified":false}}}}'
             else
               reply='"result":{{"isError":true,"content":[{{"type":"text","text":"foreground_unavailable: Hyprland input connection failed"}}],"structuredContent":{{"ok":false,"code":"foreground_unavailable","reason":"transport_or_protocol_error","detail":"Hyprland input connection failed","effect":"unverifiable"}}}}'
@@ -949,6 +951,10 @@ mcp)
           printf '%s' "$text" | cut -c$((i + 1)) | tr -d '\n' >>"$dir/field"
           i=$((i + 1)); log typed
         done;;
+      scroll)
+        # Where the wheel was sent: the window point Cua was given, or nowhere.
+        xy=$(printf '%s' "$line" | sed -n 's/.*"x":\([-0-9.]*\),"y":\([-0-9.]*\).*/\1 \2/p')
+        log wheel ${{xy:-nowhere}};;
       press_key|hotkey)
         case "$line" in *'"session"'*) log cue key;; esac
         if [ -f "$dir/grab" ]; then
@@ -1740,17 +1746,54 @@ mv "$dir/elements.new" "$dir/elements"
         screen.desktop.reset_input().await.unwrap();
     }
 
+    // Typing through a field that keeps taking the keyboard focus (agent
+    // feedback, November 2026): an input method sends its keymap again on
+    // every focus, and Cua's plugin ends the input connection on that as on a
+    // display change. Failure cases, written first
+    // (docs/agent-feedback-failure-cases.md 1 to 3):
+    // - typing stops after 3 interruptions although each let keys through,
+    //   so a long text into such an editor never arrives;
+    // - typing goes on forever when the connection ends before any key every
+    //   time, instead of stopping and saying exactly what arrived;
+    // - going on types a character twice or skips one.
+
     #[tokio::test]
-    async fn typing_through_a_desktop_that_keeps_changing_stops_and_says_exactly_what_arrived() {
+    async fn typing_goes_on_through_a_field_that_takes_the_focus_again_on_every_key() {
         let screen = Screen::new((500, 400)).await;
         screen.taken().await;
+        // The editor redraws, and takes the focus again, after every character.
+        let text = &SAVE_AS[..40];
+        let stops: String = (1..text.len()).map(|at| format!("{at} display\n")).collect();
+        std::fs::write(screen.dir.join("stop_at"), stops).unwrap();
+        screen.desktop.type_text(&screen.surface, text, TypingCursor::ToField, None).await.expect("typed whole");
+        assert_eq!(screen.field(), text, "every character once, in order: {:#?}", screen.log());
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typing_goes_on_while_each_interruption_lets_keys_through() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        // Five in one text: more than ibara once went on after.
         std::fs::write(screen.dir.join("stop_at"), "20 display\n30 display\n40 display\n50 display\n60 display\n").unwrap();
+        screen.desktop.type_text(&screen.surface, SAVE_AS, TypingCursor::ToField, None).await.expect("typed whole");
+        assert_eq!(screen.field(), SAVE_AS, "every character once, in order: {:#?}", screen.log());
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typing_through_a_desktop_that_lets_no_key_through_stops_and_says_exactly_what_arrived() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        // The connection ends at the same place every time: no key arrives between.
+        std::fs::write(screen.dir.join("stop_at"), "20 stalled\n".repeat(8)).unwrap();
         let stopped = screen.desktop.type_text(&screen.surface, SAVE_AS, TypingCursor::ToField, None).await.unwrap_err();
-        let typed = stopped.details["typed_chars"].as_u64().expect("typed_chars") as usize;
-        assert!(typed < SAVE_AS.len(), "{stopped:?}");
+        assert_eq!(stopped.details["typed_chars"], serde_json::json!(20), "{stopped:?}");
         assert_eq!(stopped.details["unsure_chars"], serde_json::json!(0), "{stopped:?}");
         assert_eq!(stopped.details["execution_not_started"], serde_json::json!(false), "{stopped:?}");
-        assert_eq!(screen.field(), SAVE_AS[..typed], "exactly what it says arrived");
+        assert_eq!(screen.field(), SAVE_AS[..20], "exactly what it says arrived");
+        let left = std::fs::read_to_string(screen.dir.join("stop_at")).unwrap().lines().count();
+        assert_eq!(left, 3, "after the stop that let keys through, it went on 3 times that let none through, then stopped");
         screen.desktop.reset_input().await.unwrap();
     }
 
@@ -1780,6 +1823,20 @@ mv "$dir/elements.new" "$dir/elements"
         assert_eq!(stopped.details["execution_not_started"], serde_json::json!(false), "{stopped:?}");
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(screen.field(), SAVE_AS[..57], "nothing typed past the popup");
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    // Failure cases, written first (docs/agent-feedback-failure-cases.md 17, 18):
+    // a wheel scroll aimed at a point over a list reaches Cua without the
+    // point, so the window's centre scrolls; a scroll with no point names one.
+    #[tokio::test]
+    async fn a_wheel_scroll_at_a_screen_point_goes_to_that_place_in_its_window() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        screen.desktop.scroll(Some(Point { x: 236.0, y: 470.0 }), 0, 3, None).await.unwrap();
+        assert_eq!(screen.events("wheel 236 470"), 1, "the wheel goes where the agent pointed: {:#?}", screen.log());
+        screen.desktop.scroll(None, 0, 3, None).await.unwrap();
+        assert_eq!(screen.events("wheel nowhere"), 1, "without a point, the focused window as before: {:#?}", screen.log());
         screen.desktop.reset_input().await.unwrap();
     }
 

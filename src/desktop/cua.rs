@@ -53,11 +53,20 @@ const PIECE_GAP: Duration = Duration::from_millis(40);
 const INPUT_ENDED: &str = "text_interrupted";
 /// Cua's reason when its connection failed with a key sent and unacknowledged.
 const KEY_IN_FLIGHT: &str = "transport_or_protocol_error";
-/// Typing goes on after [`INPUT_ENDED`] at most this often in one text, each
-/// time after [`RESUME_AFTER`]: a display change comes as several of
-/// Hyprland's events, and the plugin ends the input connection on each.
+/// Typing goes on after every [`INPUT_ENDED`] that let keys through, after
+/// [`RESUME_SOON`]: a field that takes the keyboard focus again makes an input
+/// method send its keymap again, Hyprland announces a layout change, and the
+/// plugin ends the input connection on that as on a display change. An
+/// editor that takes the focus again as it redraws does so over and over,
+/// each time after a key arrived. After one that let no key through, typing
+/// goes on at most this often in a row, each time after [`RESUME_AFTER`]: a
+/// display change comes as several of Hyprland's events, and the plugin ends
+/// the connection on each.
 const RESUMES: usize = 3;
 const RESUME_AFTER: Duration = Duration::from_millis(500);
+/// An input method's keymap comes as two events about 10 ms apart
+/// (fcitx5 5.1.22 on Hyprland 0.56.2, measured).
+const RESUME_SOON: Duration = Duration::from_millis(100);
 /// Starting a worker, including the MCP handshake.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// One accessibility walk.
@@ -817,8 +826,11 @@ impl Cua {
         self.call_as("get_window_state", args, Kind::Picture, READ_TIMEOUT).await.map(|_| ())
     }
 
-    /// Wheel notches into the window's focused region.
-    pub async fn scroll(&self, pid: i64, window: u64, _at: Option<(f64, f64)>, dx: i32, dy: i32, _cancel: Option<&Cancel>) -> Result<()> {
+    /// Wheel notches into the window at `at` (window-local pixels), where
+    /// what is under that place scrolls (a list inside a page); without a
+    /// place, where Cua puts them, the window's centre. `cancel` stops a
+    /// scroll at a place before a second try (see `at_point`).
+    pub async fn scroll(&self, pid: i64, window: u64, at: Option<(f64, f64)>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
         // Wheel input may bring the real pointer into the window first.
         let _moving = self.inner.motion.begin();
         let mut sent = false;
@@ -829,7 +841,15 @@ impl Cua {
             let mut args = Self::target(pid, window);
             args["direction"] = json!(direction);
             args["amount"] = json!(amount.unsigned_abs().min(50));
-            if let Err(error) = self.call("scroll", args, true, ACT_TIMEOUT).await {
+            let wheel = match at {
+                Some((x, y)) => {
+                    args["x"] = json!(x);
+                    args["y"] = json!(y);
+                    self.at_point("scroll", pid, window, args, ACT_TIMEOUT, cancel).await
+                }
+                None => self.call("scroll", args, true, ACT_TIMEOUT).await.map(drop),
+            };
+            if let Err(error) = wheel {
                 // The other direction's notches went through.
                 return Err(if sent { error.with("execution_not_started", false) } else { error });
             }
@@ -869,15 +889,17 @@ impl Cua {
     /// effect between pieces. `focused` is asked between pieces too, so a
     /// window that took the keyboard focus meanwhile gets none of the rest.
     /// When Cua stops a piece before its next key ([`INPUT_ENDED`], as on a
-    /// display change), exactly the keys it counts arrived, and the rest goes
-    /// on from there past the same checks, a few times at most.
+    /// display change or a field taking the keyboard focus again), exactly
+    /// the keys it counts arrived, and the rest goes on from there past the
+    /// same checks: every time keys arrived, a few times in a row at most
+    /// when none did.
     /// A failure says how many characters were typed for sure
     /// (`typed_chars`) and how many more may have been (`unsure_chars`: the
     /// piece in flight once it went out, or only its key in flight when Cua
     /// counts the keys before it).
     pub async fn type_ascii(&self, pid: i64, window: u64, text: &str, cancel: Option<&Cancel>, focused: impl AsyncFn() -> Result<()>) -> Result<()> {
         debug_assert!(text.is_ascii(), "one byte a character");
-        let (mut typed, mut resumes, mut pause) = (0usize, 0usize, PIECE_GAP);
+        let (mut typed, mut stalled, mut pause) = (0usize, 0usize, PIECE_GAP);
         while typed < text.len() {
             let piece = &text[typed..text.len().min(typed + TYPE_PIECE)];
             let stopped = |error: IbaraError| {
@@ -902,12 +924,15 @@ impl Cua {
                 continue;
             };
             if let Some(delivered) = error.details.get("delivered").and_then(Value::as_u64) {
-                typed += piece.len().min(delivered as usize);
+                let arrived = piece.len().min(delivered as usize);
+                typed += arrived;
                 let reason = error.details.get("reason").and_then(Value::as_str);
-                if reason == Some(INPUT_ENDED) && resumes < RESUMES {
-                    resumes += 1;
-                    pause = RESUME_AFTER;
-                    continue;
+                if reason == Some(INPUT_ENDED) {
+                    stalled = if arrived > 0 { 0 } else { stalled + 1 };
+                    if stalled <= RESUMES {
+                        pause = if arrived > 0 { RESUME_SOON } else { RESUME_AFTER };
+                        continue;
+                    }
                 }
                 let unsure = usize::from(reason == Some(KEY_IN_FLIGHT));
                 return Err(error.with("typed_chars", typed).with("unsure_chars", unsure));
@@ -1589,7 +1614,9 @@ fn refusal(tool: &str, outcome: &Value, mutates: bool) -> IbaraError {
 /// Cua's text stopped part way (`effect: partial`), with `delivered` the
 /// keys that went out before it stopped. [`INPUT_ENDED`]: Cua stopped
 /// before sending the next key, so exactly those arrived; Hyprland's plugin
-/// ends every input connection when a display is added or removed.
+/// ends every input connection when a display is added or removed, and when
+/// a keyboard's keymap is sent again (an input method, each time a field
+/// takes the keyboard focus).
 /// [`KEY_IN_FLIGHT`]: the connection failed with the next key sent, which
 /// may have arrived too. Otherwise the plugin refused the next key, for a
 /// cause as before any input. Other input (a drag) keeps "failed after
@@ -1600,7 +1627,7 @@ fn partial(tool: &str, sc: &Value, text: &str) -> Option<IbaraError> {
     }
     let delivered = sc["delivery"]["delivered_count"].as_u64()?;
     let error = match sc["reason"].as_str() {
-        Some(INPUT_ENDED) => unavailable("Cua's connection to the desktop ended part way, as it does when a display is added or removed.")
+        Some(INPUT_ENDED) => unavailable("Cua's input connection ended part way, as it does when a display changes or the field takes the keyboard focus again.")
             .with("reason", INPUT_ENDED),
         Some(KEY_IN_FLIGHT) => IbaraError::new("OUTCOME_UNKNOWN", format!("Cua {tool} failed after dispatch."), false)
             .requires_reconciliation()

@@ -8,10 +8,12 @@ use serde_json::{Map, Value};
 
 // ---- shared pieces ----
 
-// A host and path, used for delivery obligations and `send`.
+// A host and path, used for delivery obligations and `send`. Without a
+// host, the computer the agent works from: the only one a send can reach.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Destination {
+    #[serde(default)]
     pub host: String,
     pub path: String,
 }

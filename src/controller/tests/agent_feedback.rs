@@ -79,7 +79,7 @@ fn text_beyond_ascii_typed_without_a_target_is_added_where_the_caret_is() {
         assert!(!acts.iter().any(|a| a.contains("ctrl+a")), "nothing is selected, so nothing is replaced: {acts:?}");
         assert!(!acts.iter().any(|a| a.starts_with("ClickPoint")), "no click: the caret stays where it is: {acts:?}");
         assert!(acts.iter().all(|a| !a.starts_with("Type") || a.is_ascii()), "Cua is asked to type ASCII only: {acts:?}");
-        assert_eq!(acts.iter().filter(|a| a.contains("ctrl+v")).count(), 2, "one paste per run beyond ASCII: {acts:?}");
+        assert_eq!(acts.iter().filter(|a| a.contains("ctrl+v")).count(), 3, "one paste per run beyond ASCII (ë, Å, ö): {acts:?}");
         let pieces = ["Zoë", "Ångström"];
         assert!(!pieces.iter().any(|p| env.to_string().contains(p)), "{env}");
         assert_eq!(stored_anywhere(&rig.dir, &pieces), Vec::<String>::new(), "typed text is stored nowhere");
@@ -138,7 +138,7 @@ fn text_beyond_ascii_into_the_browser_window_says_what_each_route_does() {
         assert_eq!(code(&env), "WRONG_TOOL", "{env}");
         let said = format!("{} {}", env["error"]["message"].as_str().unwrap(), env["error"]["next"].as_str().unwrap_or_default());
         assert!(said.contains("replaces"), "a field's type replaces its text: {said}");
-        assert!(said.contains("without a target") && said.contains("caret"), "browser_act type without a target adds at the caret: {said}");
+        assert!(said.contains("Without a target") && said.contains("caret"), "browser_act type without a target adds at the caret: {said}");
         assert_eq!(rig.desktop.acts(), 0);
     });
 }

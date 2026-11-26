@@ -5,7 +5,7 @@
 // request adds `receive` (agent computers) or `share` (the sharing computer).
 import { documentOperation } from './document.js';
 const HOST='io.ibara.chrome';
-const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys'];
+const PAGE_OPS=['observe','check','locate','verify','selected','reveal','field','keys','caret'];
 // Operations that change the page (a refusal after they start is not "not started").
 const EFFECTS=['navigate','reveal','cookies_write','cookies_remove','login_reload'];
 // What each job lets ibara ask for. Anything else is refused unstarted.
@@ -377,7 +377,7 @@ async function handle(m,jobs) {
     const rootId=inventory?.find(f=>f.frameId===0)?.documentId;
     if(!rootId)return refused();
     if(m.op==='observe')return await observeFrames(m,tab,rootId);
-    if(['check','keys'].includes(m.op)){
+    if(['check','keys','caret'].includes(m.op)){
       const epoch=frameEpoch.get(tab.id)||0;
       if(pendingFrames.has(tab.id))return {result:{refused:true}};
       const replies=await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},world:'ISOLATED',func:documentOperation,args:[m]});
@@ -387,6 +387,11 @@ async function handle(m,jobs) {
         if(path&&(await mapPoint(tab.id,path,null)).ready)results.push(reply);
       }
       if(pendingFrames.has(tab.id)||(frameEpoch.get(tab.id)||0)!==epoch)return {result:{refused:true}};
+      if(m.op==='caret'){
+        // The frame whose field has the keyboard, if any has.
+        const field=results.find(r=>r.result?.editable)?.result;
+        return {result:{editable:!!field,length:field?.length||0}};
+      }
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }
     const snapshot=captures.get(m.args.capture),route=snapshot?.routes.get(m.args.token);
@@ -398,7 +403,7 @@ async function handle(m,jobs) {
     if(!path||path.length!==route.path.length||path.some((step,i)=>step.parent.documentId!==route.path[i].parent.documentId||step.child.documentId!==route.path[i].child.documentId))return refuse('navigated');
     if(loading(tab.id,path.map(step=>step.child.frameId)))return refuse('loading');
     for(let i=0;i<path.length;i++)path[i].token=route.path[i].token;
-    const zoom=m.op==='locate'?await chrome.tabs.getZoom(tab.id):undefined;
+    const zoom=['locate','reveal'].includes(m.op)?await chrome.tabs.getZoom(tab.id):undefined;
     if(!fresh(m))return refused();
     dispatching=EFFECTS.includes(m.op);
     if(m.op==='locate'){
@@ -429,6 +434,12 @@ async function handle(m,jobs) {
       const moved=!freshPath?'navigated':loading(tab.id,[0,...freshPath.map(step=>step.child.frameId)])?'loading':'';
       answer=moved?{refused:true,why:moved}:{...answer,...await mapPoint(tab.id,freshPath,answer)};
       if(answer.refused||answer.covered)armed=null;
+    }
+    if(m.op==='reveal'&&Number.isFinite(answer.x)){
+      // The place in the tab, through the frames that hold it; none when a
+      // frame's embedding hides it, so the wheel goes to the window instead.
+      const place=await mapPoint(tab.id,path,{x:answer.x,y:answer.y,outer:answer.outer,inner:answer.inner});
+      answer=Number.isFinite(place?.x)?{revealed:true,...place}:{revealed:true};
     }
     return {result:{...answer,documentId:rootId,...(zoom!==undefined?{zoom}:{})}};
   } catch {return {error:{execution_not_started:!dispatching}};}

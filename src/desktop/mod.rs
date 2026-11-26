@@ -1005,16 +1005,20 @@ impl Desktop {
             if !(-50..=50).contains(&dx) || !(-50..=50).contains(&dy) {
                 return Err(invalid("Scroll dx/dy are wheel notches from -50 to 50, not pixels; for example dy: 3 scrolls down three notches.").with("field", "dx/dy"));
             }
-            let window = match at {
-                Some(at) => self.window_at(at.x, at.y, None).await?.0,
-                None => self.hypr.active_window().await?.ok_or_else(|| stale("No window has focus."))?,
+            // The place in its window, for Cua: what is under it scrolls.
+            let (window, place) = match at {
+                Some(at) => {
+                    let (window, lx, ly, _) = self.window_at(at.x, at.y, None).await?;
+                    (window, Some((lx, ly)))
+                }
+                None => (self.hypr.active_window().await?.ok_or_else(|| stale("No window has focus."))?, None),
             };
             if self.uses_dispatchers().await {
                 self.prepare_dispatchers().await?;
                 let at = at.map(|p| (p.x,p.y)).unwrap_or((window.at[0] as f64 + window.size[0] as f64/2.0, window.at[1] as f64 + window.size[1] as f64/2.0));
                 return self.compositor_input.scroll(&window,at,&self.screens().await,dx,dy,cancel).await;
             }
-            self.cua.scroll(window.pid, cua::window_id(&window.address)?, None, dx, dy, cancel).await
+            self.cua.scroll(window.pid, cua::window_id(&window.address)?, place, dx, dy, cancel).await
         })
         .await
     }

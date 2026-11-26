@@ -264,7 +264,7 @@ impl Controller {
     }
 
     /// The focused tab, when the page reader is connected.
-    async fn focused_tab(&self) -> Option<Tab> {
+    pub(super) async fn focused_tab(&self) -> Option<Tab> {
         if !self.desktop.browser_connected() {
             return None;
         }

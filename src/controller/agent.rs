@@ -9,7 +9,7 @@
 use super::budget;
 use super::control::{Charge, Release};
 use super::checks::{TaskPath, pause};
-use super::ports::{Button, Cancel, Done, Effect, Image, PutBack, TypingCursor, Win, WinKey};
+use super::ports::{Button, Cancel, Done, Effect, Image, PutBack, Tab, TypingCursor, Win, WinKey};
 use super::approval::{self, Ask, Place};
 use super::situation::{FrameSpec, FrameState, app_class, app_id_for, dirty_title, surface_signature};
 use crate::access::agent_label;
@@ -2508,25 +2508,28 @@ impl Controller {
     /// [`Self::browser_type`] does. Typed text reaches no message, receipt or
     /// timeline entry.
     async fn browser_insert(&self, step: &BrowserStep, text: &str, cancel: &Cancel) -> Result<Done> {
-        if self.caret().await.is_none() {
-            return Err(fail(
+        // The tab is named once: if another takes the focus meanwhile, this
+        // one's field no longer has the keyboard and the typing stops.
+        let tab = match self.focused_tab().await {
+            Some(tab) if self.caret(&tab).await.is_some() => tab,
+            _ => return Err(fail(
                 "INVALID_ARGUMENT",
                 "action.target: ibara cannot confirm that a field of the page has the keyboard, and text with characters beyond ASCII is pasted, so it could land in the address bar; nothing was sent.",
                 true,
             )
             .with("next", "Name the field as the target, which replaces the field's text. Or click into the field first, then send the text again without a target to add it at the caret.")
-            .with("execution_not_started", true));
-        }
+            .with("execution_not_started", true)),
+        };
         self.clipboard_aside(false).await?;
-        let typed = self.insert_text(step, text, cancel).await;
+        let typed = self.insert_text(step, &tab, text, cancel).await;
         self.clipboard_back(typed).await
     }
 
-    /// How much the page field that has the keyboard focus holds, when a
-    /// field of the page has it. The page reader says only that: the field's
+    /// How much the field of `tab` that has the keyboard focus holds, when a
+    /// field of its page has it. The page reader says only that: the field's
     /// text never leaves the page. None from a reader that cannot say.
-    async fn caret(&self) -> Option<u64> {
-        let caret = self.desktop.browser_call("caret", json!({}), false).await.ok()?;
+    async fn caret(&self, tab: &Tab) -> Option<u64> {
+        let caret = self.desktop.browser_call("caret", json!({ "tabId": tab.id }), false).await.ok()?;
         (caret.get("editable").and_then(Value::as_bool) == Some(true)).then(|| caret.get("length").and_then(Value::as_u64).unwrap_or(0))
     }
 
@@ -2586,7 +2589,7 @@ impl Controller {
     /// holds a different amount than it did once the typing before it had
     /// arrived; nothing more is sent until then, so the pieces arrive in
     /// order and each paste is read before the clipboard changes again.
-    async fn insert_text(&self, step: &BrowserStep, text: &str, cancel: &Cancel) -> Result<Done> {
+    async fn insert_text(&self, step: &BrowserStep, tab: &Tab, text: &str, cancel: &Cancel) -> Result<Done> {
         let total = text.chars().count();
         let stopped = |before: usize| move |e: IbaraError| typing_stopped(e, before, total, TypedInto::Window);
         let act = |effect: Effect| async move { self.send_input(&effect, cancel).await };
@@ -2604,11 +2607,11 @@ impl Controller {
             }
             // What the field holds once the keys before this paste arrived:
             // the same amount twice.
-            let mut held = self.caret().await.ok_or_else(|| stopped(typed)(lost()))?;
+            let mut held = self.caret(tab).await.ok_or_else(|| stopped(typed)(lost()))?;
             let settle = Instant::now() + PASTE_WITHIN;
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let now = self.caret().await.ok_or_else(|| stopped(typed)(lost()))?;
+                let now = self.caret(tab).await.ok_or_else(|| stopped(typed)(lost()))?;
                 if now == held || Instant::now() >= settle {
                     break;
                 }
@@ -2623,7 +2626,7 @@ impl Controller {
             act(Effect::Key { surface: step.window.clone(), combo: "ctrl+v".into() }).await.map_err(unsure)?;
             let until = Instant::now() + PASTE_WITHIN;
             loop {
-                match self.caret().await {
+                match self.caret(tab).await {
                     Some(now) if now != held => break,
                     None => return Err(unsure(lost())),
                     Some(_) if Instant::now() >= until => {

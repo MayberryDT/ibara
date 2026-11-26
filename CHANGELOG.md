@@ -1,3 +1,11 @@
+# Unreleased
+
+- Keep typing through a web editor that takes the keyboard focus again as it redraws. An input method resends its keymap at each such focus, the desktop's input connection ends, and typing went on only 3 times in one text, so a long caption stopped after a few characters ("ibara typed the first 4 of the 195 characters, then stopped"). Typing now goes on for as long as each interruption lets keys through, counts every key that arrived, and stops only after 3 interruptions in a row that let none through. A stop in a page field says how to add only the rest.
+- Add text with characters beyond ASCII where the caret is: `browser_act` `type` without a target, into the page field that has the keyboard. It was refused; the only route replaced the whole field. The page reader confirms a field of the page has the keyboard before anything is sent, so the text is never aimed at the address bar. The refusal of such text typed with `computer_act` now says what each route does.
+- Click an option that is inside the window but outside the part of its own scrolling list that shows, such as an hour further down an open time picker. It was refused as covered; the list is now scrolled to it first, without moving the page.
+- Send a wheel scroll to its point. `computer_act` `scroll` at a point and `browser_act` `scroll` with an element as its target both scrolled at the window's centre, so the page moved and a list inside it did not.
+- Name the limit in the refusal of an `exec` with too many or too long arguments (100 after the program, 4,096 characters each) and which was exceeded. Let `computer_files` `send` leave out `to.host`: a send goes to the computer the agent works from, and a host that names another computer is still refused.
+
 # 0.3.10
 
 - Clear an existing backlog of ended tasks' workspaces while the computer is idle. In 0.3.9 a pass ran only at status reads and admissions and always started from the first folder, so on a real journal, where each check of a long task takes about 10 ms, a pass removed about ten folders and could spend all its time on the same kept ones. The watchdog now runs a pass every five seconds while no agent holds the computer, and each pass continues where the last one stopped.

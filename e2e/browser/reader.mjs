@@ -101,6 +101,18 @@ const pages = {
   '/coveredlist': `<title>Covered list</title><style>body{margin:20px}.list{height:168px;width:200px;overflow-y:auto;border:1px solid #888}.list div{height:24px;line-height:24px}#banner{position:fixed;left:0;top:0;width:100vw;height:100vh;background:#fffe}</style>
     <div class=list role=listbox aria-label="Rows"></div><div id=banner role=dialog aria-label="Offer"><p>An offer.</p></div>
     <script>for(let i=0;i<30;i++){const row=document.createElement('div');row.setAttribute('role','option');row.setAttribute('aria-label','Row '+i);row.textContent='Row '+i;document.querySelector('.list').appendChild(row);}</script>`,
+  // A box that clips what is below its 120 pixels and that no one can scroll.
+  '/clipbox': `<title>Clip box</title><style>body{margin:20px}#clip{height:120px;width:300px;overflow:hidden;border:1px solid #888}#clip div{height:300px}</style>
+    <div id=clip><div></div><button>Below the fold</button></div>`,
+  // A list that scrolls down only, with rows wider than it.
+  '/sideways': `<title>Sideways</title><style>body{margin:20px}.list{height:168px;width:120px;overflow-y:auto;overflow-x:hidden;border:1px solid #888}.list div{height:24px;line-height:24px;width:400px}</style>
+    <div class=list role=listbox aria-label="Rows"></div>
+    <script>for(let i=0;i<30;i++){const row=document.createElement('div');row.setAttribute('role','option');row.setAttribute('aria-label','Row '+i);row.textContent='Row '+i;document.querySelector('.list').appendChild(row);}</script>`,
+  // A web component: the options are its children, and the list that scrolls
+  // them is inside its shadow tree, around the slot.
+  '/slotted': `<title>Slotted</title><style>body{margin:20px}x-list div{height:24px;line-height:24px}</style><x-list></x-list>
+    <script>customElements.define('x-list',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<div id=box role=listbox aria-label="Rows" style="height:168px;width:200px;overflow-y:auto;border:1px solid #888"><slot></slot></div>';}});
+    for(let i=0;i<30;i++){const row=document.createElement('div');row.setAttribute('role','option');row.setAttribute('aria-label','Row '+i);row.textContent='Row '+i;row.addEventListener('click',()=>{document.title='pressed Row '+i});document.querySelector('x-list').appendChild(row);}</script>`,
   // Fields that take text, and a button that does not.
   '/fields': `<title>Fields</title><input aria-label="Name" value="Dana"><div contenteditable=true role=textbox aria-label="Caption">Mid lane</div><button>Send</button>`,
   // A cookie banner over the whole page, not modal, so Buy stays listed.
@@ -367,6 +379,31 @@ await scenario('an option a banner covers stays refused inside its scrolling lis
   const answer = await locate(target(await observe(), 'Row 20'));
   check('safe', 'not located', !located(answer), plain(answer));
   check('wanted', 'names the cover', answer?.covered === true && answer.cover === 'dialog "Offer"', plain(answer));
+  check('safe', 'and its list is left where it was', await evaluate(`document.querySelector('.list').scrollTop`) === 0, await evaluate(`document.querySelector('.list').scrollTop`));
+});
+
+await scenario('bringing an option into view scrolls only what a person can scroll, along the way it scrolls', async check => {
+  await open('/clipbox');
+  let answer = await locate(target(await observe(), 'Below the fold'));
+  check('safe', 'a box that clips without scrolling is not scrolled', await evaluate(`document.getElementById('clip').scrollTop`) === 0, { scrollTop: await evaluate(`document.getElementById('clip').scrollTop`), answer: plain(answer) });
+  check('safe', 'and what it hides is not located', !located(answer), plain(answer));
+  await open('/sideways');
+  answer = await locate(target(await observe(), 'Row 20'));
+  const at = await evaluate(`[document.querySelector('.list').scrollLeft, document.querySelector('.list').scrollTop]`);
+  check('wanted', 'a row further down a list is located', located(answer), plain(answer));
+  check('safe', 'the list scrolled down and not sideways', at[0] === 0 && at[1] > 0, at);
+});
+
+await scenario('an option whose scrolling list is across a shadow boundary is scrolled into it', async check => {
+  await open('/slotted');
+  const seen = await observe();
+  const answer = await locate(target(seen, 'Row 20'));
+  check('wanted', 'located', located(answer), plain(answer));
+  check('wanted', 'the list inside the shadow tree scrolled', await evaluate(`document.querySelector('x-list').shadowRoot.getElementById('box').scrollTop`) > 0, await evaluate(`document.querySelector('x-list').shadowRoot.getElementById('box').scrollTop`));
+  if (located(answer)) {
+    await press(answer.x, answer.y);
+    check('safe', 'a press at the point reaches that option', await until(() => evaluate(`document.title === 'pressed Row 20'`), 2000, 'the press').catch(() => false), await evaluate('document.title'));
+  }
 });
 
 await scenario('reveal says where a wheel reaches the element, and nothing for a covered one', async check => {
@@ -391,9 +428,14 @@ await scenario('caret says whether a page field has the keyboard, and only how m
   let answer = await caret();
   check('wanted', 'a text input: a field holding 4 characters', answer?.editable === true && answer.length === 4, answer);
   check('safe', 'its text is not told', !JSON.stringify(answer).includes('Dana'), answer);
+  const ends = async expected => (await ask('caret', { tabId: await tab(), expected })).result;
+  await evaluate(`(() => { const i = document.querySelector('input'); i.setSelectionRange(2, 2); return true; })()`);
+  check('wanted', 'says whether the text before the caret ends with what is asked about', (await ends('Da'))?.ends === true && (await ends('na'))?.ends === false, [await ends('Da'), await ends('na')]);
   await evaluate(`document.querySelector('[contenteditable]').focus(); true`);
   answer = await caret();
   check('wanted', 'an editable region: a field holding 8 characters', answer?.editable === true && answer.length === 8, answer);
+  await evaluate(`(() => { const e = document.querySelector('[contenteditable]'); getSelection().collapse(e.firstChild, 3); return true; })()`);
+  check('wanted', 'and in an editable region too', (await ends('Mid'))?.ends === true && (await ends('lane'))?.ends === false, [await ends('Mid'), await ends('lane')]);
 });
 
 // Last: it closes the tab the DevTools connection is on.

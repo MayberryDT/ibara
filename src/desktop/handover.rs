@@ -1798,6 +1798,17 @@ mv "$dir/elements.new" "$dir/elements"
     }
 
     #[tokio::test]
+    async fn interruptions_that_let_no_key_through_are_counted_only_in_a_row() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        // Four of them, each before a piece's first key, with a whole piece arriving between.
+        std::fs::write(screen.dir.join("stop_at"), "16 stalled\n32 stalled\n48 stalled\n64 stalled\n").unwrap();
+        screen.desktop.type_text(&screen.surface, SAVE_AS, TypingCursor::ToField, None).await.unwrap();
+        assert_eq!(screen.field(), SAVE_AS, "every character once, in order");
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn typing_is_not_resumed_when_cuas_connection_failed_with_a_key_in_flight() {
         let screen = Screen::new((500, 400)).await;
         screen.taken().await;

@@ -50,6 +50,11 @@ Typing through a field that keeps taking the focus
 7. The stop's message still blames a display that never changed, or tells an
    agent that typed into a page field only to type the whole text again
    (which replaces the field) without saying how to add only the rest.
+7a. Interruptions that let no key through are counted together although
+    whole pieces arrived between them, so a long text stops at the fourth
+    such interruption anywhere in it.
+7b. Going on after an interruption before the text's first key skips the
+    pause and the check that the window still has the keyboard.
 
 Text beyond ASCII where the caret is
 
@@ -71,6 +76,18 @@ Text beyond ASCII where the caret is
     field has the keyboard. (Found on a real desktop on 26 November: the
     stand-in reader had answered without a tab. It now refuses as the page
     reader does.)
+12b. A paste counts as arrived because the field holds a different amount
+    for another reason (the keys typed before it landing late, a character
+    the page adds, someone else typing), so the next piece, or the person's
+    own clipboard put back, is pasted in its place. A paste has arrived when
+    the text before the caret ends with it.
+12c. A paste that replaces a selection of the same length never counts as
+    arrived, so the rest is dropped though it arrived.
+12d. The page reader cannot answer for a moment (a frame of the page is
+    loading) and that is taken for the field losing the keyboard: the type
+    is refused, or it stops and puts the clipboard back before the page read
+    the paste. Only an answer that no field has the keyboard stops at once;
+    no answer waits until the paste's time is up.
 
 An option its own list hides
 
@@ -82,6 +99,13 @@ An option its own list hides
 15. An element truly covered (a cookie banner, a dialog) is no longer refused,
     or the refusal no longer names what covers it.
 16. An element the page holds the pointer locked away from is now located.
+16a. Bringing an option into view scrolls a box a person cannot scroll back
+    (`overflow: hidden`), scrolls sideways a list that scrolls only down, or
+    scrolls a box the element does not move with (a fixed element inside it)
+    and leaves it scrolled.
+16b. An option in a web component whose list is across a shadow boundary (a
+    slotted option, a list outside the shadow tree) is still refused as
+    covered.
 
 Scrolling a list
 
@@ -95,6 +119,8 @@ Scrolling a list
     fails where it worked before: it must still scroll the window as before.
 21. A scroll at a point on Cua 0.29 is refused for want of a picture, as a
     click at a point was, instead of taking one and trying once more.
+21a. A page scroll with an element as its target sends the wheel to another
+    window that lies over the browser at that place.
 
 Refusals
 

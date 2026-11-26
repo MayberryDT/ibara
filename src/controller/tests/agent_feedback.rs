@@ -130,6 +130,64 @@ fn a_paste_at_the_caret_that_never_shows_is_unknown_and_nothing_follows_it() {
 }
 
 #[test]
+fn a_paste_at_the_caret_counts_as_arrived_only_when_the_text_before_the_caret_ends_with_it() {
+    // The page adds a character of its own when Ctrl+V arrives, and reads the
+    // paste two questions later: the field holding a different amount is not
+    // the paste. Whatever is on the clipboard when the page reads it is what
+    // lands, so a piece offered early, or the person's clipboard put back
+    // early, would show in the field.
+    run(async {
+        let rig = focused_field_rig("Dear ");
+        {
+            let mut field = rig.desktop.field.borrow_mut();
+            field.adds_on_paste_key = true;
+            field.paste_after = 2;
+        }
+        let person = SavedClipboard(vec![(PASTED.into(), b"the person's own copy".to_vec())]);
+        rig.desktop.selection.replace(person.clone());
+        let task = observe_page(&rig.controller).await;
+        let env = call(&rig.controller, "browser_act", type_at_caret(&task, "act-1", "Zoë Ångström, hello")).await;
+        assert_eq!(env["result"]["steps"][0]["outcome"], "done", "{env}");
+        assert_eq!(rig.desktop.field.borrow().value, "Dear Zo~ë ~Ångstr~öm, hello", "every piece in its place, and nothing else pasted");
+        assert_eq!(*rig.desktop.selection.borrow(), person, "the person's clipboard is back");
+    });
+}
+
+#[test]
+fn a_paste_at_the_caret_over_a_selection_of_the_same_length_counts_as_arrived() {
+    run(async {
+        let rig = focused_field_rig("x");
+        rig.desktop.field.borrow_mut().selected = true;
+        let task = observe_page(&rig.controller).await;
+        let env = call(&rig.controller, "browser_act", type_at_caret(&task, "act-1", "ë")).await;
+        assert_eq!(env["result"]["steps"][0]["outcome"], "done", "{env}");
+        assert_eq!(rig.desktop.field.borrow().value, "ë");
+    });
+}
+
+#[test]
+fn a_page_reader_that_cannot_answer_for_a_moment_is_waited_for_not_taken_for_a_lost_field() {
+    // A frame of the page is loading: the reader refuses 3 questions, before
+    // anything is sent and again after each Ctrl+V, and the paste is read late.
+    run(async {
+        let rig = focused_field_rig("Dear ");
+        {
+            let mut field = rig.desktop.field.borrow_mut();
+            field.caret_unsaid = 3;
+            field.caret_unsaid_after_paste_key = 3;
+            field.paste_after = 2;
+        }
+        let person = SavedClipboard(vec![(PASTED.into(), b"the person's own copy".to_vec())]);
+        rig.desktop.selection.replace(person.clone());
+        let task = observe_page(&rig.controller).await;
+        let env = call(&rig.controller, "browser_act", type_at_caret(&task, "act-1", "Zoë")).await;
+        assert_eq!(env["result"]["steps"][0]["outcome"], "done", "{env}");
+        assert_eq!(rig.desktop.field.borrow().value, "Dear Zoë", "the paste the page read late is the piece, not the clipboard put back early");
+        assert_eq!(*rig.desktop.selection.borrow(), person, "the person's clipboard is back");
+    });
+}
+
+#[test]
 fn text_beyond_ascii_into_the_browser_window_says_what_each_route_does() {
     run(async {
         let rig = focused_field_rig("kept");
@@ -164,6 +222,8 @@ fn a_page_scroll_with_a_target_sends_the_wheel_over_that_element() {
         assert_eq!(acts.len(), 1, "{acts:?}");
         // The page starts 87 pixels below the window's top (its toolbars).
         assert!(acts[0].starts_with("Scroll") && acts[0].contains("100.0, 137.0") && acts[0].contains("dy: 3"), "the wheel goes over the element, so its own list scrolls: {acts:?}");
+        // Named, so a window lying over the browser at that place does not take the wheel.
+        assert!(acts[0].contains("surface: Some") && acts[0].contains("0x9"), "the wheel is for the browser's window: {acts:?}");
     });
 }
 

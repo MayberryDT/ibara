@@ -137,6 +137,16 @@ struct FakeField {
     value: String,
     selected: bool,
     ignores_paste: bool,
+    /// Questions about the caret that pass before a Ctrl+V's paste is read
+    /// (0: at once). The paste reads the clipboard as it is then, as a page does.
+    paste_after: u32,
+    pending_paste: Option<u32>,
+    /// The page adds a character of its own when Ctrl+V arrives, before the paste shows.
+    adds_on_paste_key: bool,
+    /// Questions about the caret the reader cannot answer (a frame of the
+    /// page is loading), now and after each Ctrl+V.
+    caret_unsaid: u32,
+    caret_unsaid_after_paste_key: u32,
 }
 
 impl FakeDesktop {
@@ -307,6 +317,35 @@ impl DesktopPort for FakeDesktop {
             if let Some(reply) = self.reader_replies.borrow_mut().get_mut(op).and_then(|replies| replies.pop_front()) {
                 return Ok(reply);
             }
+            if op == "caret" && self.field.borrow().present {
+                // Like the page reader: it answers for the tab it is asked about, and refuses without one.
+                if args.get("tabId").and_then(Value::as_i64).is_none() {
+                    return Err(crate::error::unavailable("the page reader was asked about no tab"));
+                }
+                let mut field = self.field.borrow_mut();
+                if field.caret_unsaid > 0 {
+                    field.caret_unsaid -= 1;
+                    return Err(crate::error::unavailable("the page reader could not say"));
+                }
+                if let Some(left) = field.pending_paste {
+                    field.pending_paste = (left > 1).then(|| left - 1);
+                    if left <= 1 {
+                        let pasted = self.selection.borrow().0.iter().find(|(mime, _)| mime == PASTED).map(|(_, data)| String::from_utf8_lossy(data).into_owned());
+                        if std::mem::take(&mut field.selected) {
+                            field.value.clear();
+                        }
+                        field.value.push_str(&pasted.unwrap_or_default());
+                    }
+                }
+                // Whether a page field has the keyboard, how much it holds, and
+                // whether the text before the caret (its end, here) ends with
+                // what was asked about; never what it holds.
+                let mut answer = json!({ "editable": field.focused, "length": field.value.chars().count() });
+                if let Some(expected) = args.get("expected").and_then(Value::as_str) {
+                    answer["ends"] = json!(field.value.ends_with(expected));
+                }
+                return Ok(answer);
+            }
             let field = self.field.borrow();
             if op == "field" && field.present {
                 // Like the page reader: whether it holds the text, never its value.
@@ -314,14 +353,6 @@ impl DesktopPort for FakeDesktop {
                     Some(expected) => json!({ "focused": field.focused, "matches": field.value == expected }),
                     None => json!({ "focused": field.focused }),
                 });
-            }
-            if op == "caret" && field.present {
-                // Like the page reader: it answers for the tab it is asked about, and refuses without one.
-                if args.get("tabId").and_then(Value::as_i64).is_none() {
-                    return Err(crate::error::unavailable("the page reader was asked about no tab"));
-                }
-                // Whether a page field has the keyboard, and how much it holds, never what.
-                return Ok(json!({ "editable": field.focused, "length": field.value.chars().count() }));
             }
             self.extension.borrow().get(op).cloned().ok_or_else(|| crate::error::unavailable("no extension"))
         })
@@ -479,6 +510,13 @@ impl FakeDesktop {
         match effect {
             Effect::ClickPoint { .. } => field.focused = field.focusable,
             Effect::Key { combo, .. } if field.focused && combo == "ctrl+a" => field.selected = true,
+            Effect::Key { combo, .. } if field.focused && combo == "ctrl+v" && !field.ignores_paste && (field.paste_after > 0 || field.adds_on_paste_key || field.caret_unsaid_after_paste_key > 0) => {
+                if field.adds_on_paste_key {
+                    field.value.push('~');
+                }
+                field.caret_unsaid = field.caret_unsaid_after_paste_key;
+                field.pending_paste = Some(field.paste_after.max(1));
+            }
             Effect::Key { combo, .. } if field.focused && combo == "ctrl+v" && !field.ignores_paste => {
                 let pasted = self.selection.borrow().0.iter().find(|(mime, _)| mime == PASTED).map(|(_, data)| String::from_utf8_lossy(data).into_owned());
                 if let Some(text) = pasted {

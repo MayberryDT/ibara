@@ -66,6 +66,11 @@ Text beyond ASCII where the caret is
 12. The refusal for such text typed with `computer_act` still does not say
     that a field's `type` replaces its text, or that `browser_act` `type`
     without a target adds at the caret.
+12a. The question of whether a page field has the keyboard names no tab, so
+    the page reader refuses it and every such `type` is refused though a
+    field has the keyboard. (Found on a real desktop on 26 November: the
+    stand-in reader had answered without a tab. It now refuses as the page
+    reader does.)
 
 An option its own list hides
 

@@ -1858,9 +1858,9 @@ mv "$dir/elements.new" "$dir/elements"
     async fn a_wheel_scroll_at_a_screen_point_goes_to_that_place_in_its_window() {
         let screen = Screen::new((500, 400)).await;
         screen.taken().await;
-        screen.desktop.scroll(Some(Point { x: 236.0, y: 470.0 }), 0, 3, None).await.unwrap();
+        screen.desktop.scroll(Some(Point { x: 236.0, y: 470.0 }), None, 0, 3, None).await.unwrap();
         assert_eq!(screen.events("wheel 236 470"), 1, "the wheel goes where the agent pointed: {:#?}", screen.log());
-        screen.desktop.scroll(None, 0, 3, None).await.unwrap();
+        screen.desktop.scroll(None, None, 0, 3, None).await.unwrap();
         assert_eq!(screen.events("wheel nowhere"), 1, "without a point, the focused window as before: {:#?}", screen.log());
         screen.desktop.reset_input().await.unwrap();
     }

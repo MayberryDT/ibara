@@ -25,8 +25,9 @@
 //            page has it, not the address bar) and the text it holds
 //   keys     whether a key pressed now (args.key: enter or space) submits a
 //            form in this page
-//   caret    whether a field of this page has the keyboard focus, and how
-//            much it holds (never what)
+//   caret    whether a field of this page has the keyboard focus, how much
+//            it holds (never what) and, asked with args.expected, whether
+//            the text before its caret ends with that
 export async function documentOperation(message) {
   // Traverse only open shadow roots; closed roots remain opaque.
   const all=(selector,root=document)=>{
@@ -416,24 +417,32 @@ export async function documentOperation(message) {
   // The next rendered frame; after 100 ms without one, go on.
   const frame=()=>new Promise(done=>{requestAnimationFrame(()=>done());setTimeout(done,100);});
   const centre=el=>{const r=el.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];};
-  // Bring el into the part of each scrolling box around it that shows (an
+  // Bring el into the part of each scrolling list around it that shows (an
   // option into its list), centred there, without moving the page; whether
-  // anything moved. The page itself is scrollIntoView's.
-  const unclip=el=>{
-    let moved=false;
-    for(let p=el.parentElement;p&&p!==document.body&&p!==document.documentElement;p=p.parentElement){
-      const style=getComputedStyle(p);
-      if(style.overflowX==='visible'&&style.overflowY==='visible')continue;
+  // it now can be reached. Only a box a person can scroll, along the way it
+  // scrolls, and through slots and shadow trees. When el still cannot be
+  // reached (something covers it, or it does not move with the box),
+  // every box is put back where it was.
+  const unclip=async el=>{
+    const was=[];
+    for(let p=parent(el);p&&p!==document.body&&p!==document.documentElement;p=parent(p)){
+      const style=getComputedStyle(p),scrolls=axis=>['auto','scroll','overlay'].includes(axis);
+      const down=scrolls(style.overflowY),across=scrolls(style.overflowX);
+      if(!down&&!across)continue;
       const r=el.getBoundingClientRect(),b=p.getBoundingClientRect();
       const top=b.top+p.clientTop,left=b.left+p.clientLeft,bottom=top+p.clientHeight,right=left+p.clientWidth;
-      const dy=r.top<top||r.bottom>bottom?(r.top+r.bottom)/2-(top+bottom)/2:0;
-      const dx=r.left<left||r.right>right?(r.left+r.right)/2-(left+right)/2:0;
+      const dy=down&&(r.top<top||r.bottom>bottom)?(r.top+r.bottom)/2-(top+bottom)/2:0;
+      const dx=across&&(r.left<left||r.right>right)?(r.left+r.right)/2-(left+right)/2:0;
       if(!dx&&!dy)continue;
-      const was=[p.scrollLeft,p.scrollTop];
+      const at=[p,p.scrollLeft,p.scrollTop];
       p.scrollBy({left:dx,top:dy,behavior:'instant'});
-      moved=moved||p.scrollLeft!==was[0]||p.scrollTop!==was[1];
+      if(p.scrollLeft!==at[1]||p.scrollTop!==at[2])was.push(at);
     }
-    return moved;
+    if(!was.length)return false;
+    await frame();await frame();
+    if(el.isConnected&&reachable(el))return true;
+    for(const [p,left,top] of was)p.scrollTo({left,top,behavior:'instant'});
+    return false;
   };
   const selectSignature=el=>JSON.stringify([...el.options].map(o=>[o.value,o.text,o.matches(':disabled')]));
   if(message.op==='keys') {
@@ -448,7 +457,24 @@ export async function documentOperation(message) {
     const el=document.hasFocus()?active():null;
     const text=el instanceof HTMLTextAreaElement||(el instanceof HTMLInputElement&&['text','search','url','tel','email','password','number',''].includes(el.getAttribute('type')?.toLowerCase()??''));
     const editable=!!el&&!el.matches(':disabled,[readonly]')&&(text||el.isContentEditable);
-    return {editable,length:!editable?0:text?el.value.length:el.innerText.replace(/\n$/,'').length};
+    const answer={editable,length:!editable?0:text?el.value.length:el.innerText.replace(/\n$/,'').length};
+    // Whether the text before the caret ends with what ibara just pasted
+    // (args.expected): how a paste is known to have arrived. Only yes or no.
+    if(editable&&typeof args.expected==='string'){
+      let before;
+      if(text)before=el.value.slice(0,el.selectionStart??el.value.length);
+      else{
+        const selection=el.getRootNode().getSelection?.()||getSelection();
+        if(selection?.focusNode&&el.contains(selection.focusNode)){
+          const range=document.createRange();
+          range.selectNodeContents(el);
+          range.setEnd(selection.focusNode,selection.focusOffset);
+          before=range.toString();
+        }else before=el.innerText.replace(/\n$/,'');
+      }
+      answer.ends=before.endsWith(args.expected);
+    }
+    return answer;
   }
   if(message.op==='check') {
     // innerText excludes hidden rendered text and does not expose password values.
@@ -504,7 +530,7 @@ export async function documentOperation(message) {
     // Inside the window but outside the part of its own scrolling list that
     // shows (an hour further down an open time picker): a press at its place
     // would reach whatever is there instead.
-    else if(!reachable(el))scrolled=unclip(el);
+    else if(!reachable(el))scrolled=await unclip(el);
     if(message.op==='reveal') {
       // Where a wheel reaches it, so what holds it scrolls (a list inside the
       // page); no place when something covers it.

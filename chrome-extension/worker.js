@@ -390,7 +390,7 @@ async function handle(m,jobs) {
       if(m.op==='caret'){
         // The frame whose field has the keyboard, if any has.
         const field=results.find(r=>r.result?.editable)?.result;
-        return {result:{editable:!!field,length:field?.length||0}};
+        return {result:{editable:!!field,length:field?.length||0,...(typeof field?.ends==='boolean'?{ends:field.ends}:{})}};
       }
       return {result:m.op==='check'?{found:results.some(r=>r.result?.found),truncated:results.some(r=>r.result?.truncated)}:{page:results.some(r=>r.result?.page),submits:results.some(r=>r.result?.submits)}};
     }

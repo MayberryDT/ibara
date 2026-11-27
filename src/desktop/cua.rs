@@ -906,7 +906,8 @@ impl Cua {
                 error.with("typed_chars", typed).with("unsure_chars", 0).with("no_input_held", true).with("execution_not_started", typed == 0)
             };
             // After the gap, not beside it: a focus change during the gap must stop the next piece.
-            let focus = if typed > 0 {
+            // Also before going on from an interruption at the text's first key.
+            let focus = if typed > 0 || stalled > 0 {
                 tokio::time::sleep(pause).await;
                 focused().await
             } else {
@@ -920,6 +921,7 @@ impl Cua {
             args["text"] = json!(piece);
             let Err(error) = self.call("type_text", args, true, ACT_TIMEOUT).await else {
                 typed += piece.len();
+                stalled = 0;
                 pause = PIECE_GAP;
                 continue;
             };

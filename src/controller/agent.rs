@@ -196,6 +196,18 @@ fn access_pending(tool: &str, args: &Value, mut pending: Value) -> Reply {
 const BROWSER_CONNECT: Duration = Duration::from_secs(10);
 /// How long a pasted piece gets to show in the page's field.
 const PASTE_WITHIN: Duration = Duration::from_secs(2);
+
+/// What the page reader says of the field of a tab that has the keyboard.
+enum Caret {
+    /// A field of the page has it: how much it holds, and whether the text
+    /// before its caret ends with what was asked about.
+    Field { length: u64, ends: bool },
+    /// No field of the page has it (the address bar may).
+    NoField,
+    /// The reader could not say: a frame of the page is loading, it did not
+    /// answer, or it is an earlier reader.
+    Unsaid,
+}
 /// How long `finish` waits for the windows it asked to close to go, and how
 /// often it looks.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
@@ -2155,7 +2167,7 @@ impl Controller {
                         _ => None,
                     };
                     let (dx, dy) = (notches(s.dx), notches(s.dy));
-                    (Effect::Scroll { at, dx, dy }, format!("scroll {dx},{dy} at {d}{}", read_as_pixels((s.dx, s.dy), (dx, dy))), "scroll".to_string(), "scroll")
+                    (Effect::Scroll { at, surface: None, dx, dy }, format!("scroll {dx},{dy} at {d}{}", read_as_pixels((s.dx, s.dy), (dx, dy))), "scroll".to_string(), "scroll")
                 }
                 Target::Element(_) => {
                     return Err(invalid("action.target: scroll needs a point {x, y}; elements have no position here"));
@@ -2349,14 +2361,15 @@ impl Controller {
                     page_refusal(&data)?;
                     moved = true;
                     // The wheel goes over the element, so what holds it
-                    // scrolls: a list inside the page, not the page. Without
-                    // a place (a covered element, an earlier page reader) it
-                    // goes to the window as before.
+                    // scrolls: a list inside the page, not the page; and to
+                    // the browser's window by name, whatever lies over it
+                    // there. Without a place (a covered element, an earlier
+                    // page reader) it goes to the window as before.
                     let window = self.desktop.windows().await.ok().and_then(|all| all.into_iter().find(|w| w.address == step.window.address && w.pid == step.window.pid));
                     at = window.and_then(|w| page_point(&data, &w.rect).ok());
                 }
                 if *dx != 0 || *dy != 0 {
-                    let wheel = act(Effect::Scroll { at, dx: *dx, dy: *dy }).await;
+                    let wheel = act(Effect::Scroll { at, surface: at.map(|_| step.window.clone()), dx: *dx, dy: *dy }).await;
                     return if moved { wheel.map_err(started) } else { wheel };
                 }
                 Ok(Done::default())
@@ -2511,7 +2524,7 @@ impl Controller {
         // The tab is named once: if another takes the focus meanwhile, this
         // one's field no longer has the keyboard and the typing stops.
         let tab = match self.focused_tab().await {
-            Some(tab) if self.caret(&tab).await.is_some() => tab,
+            Some(tab) if matches!(self.caret_said(&tab, None).await, Caret::Field { .. }) => tab,
             _ => return Err(fail(
                 "INVALID_ARGUMENT",
                 "action.target: ibara cannot confirm that a field of the page has the keyboard, and text with characters beyond ASCII is pasted, so it could land in the address bar; nothing was sent.",
@@ -2525,12 +2538,36 @@ impl Controller {
         self.clipboard_back(typed).await
     }
 
-    /// How much the field of `tab` that has the keyboard focus holds, when a
-    /// field of its page has it. The page reader says only that: the field's
-    /// text never leaves the page. None from a reader that cannot say.
-    async fn caret(&self, tab: &Tab) -> Option<u64> {
-        let caret = self.desktop.browser_call("caret", json!({ "tabId": tab.id }), false).await.ok()?;
-        (caret.get("editable").and_then(Value::as_bool) == Some(true)).then(|| caret.get("length").and_then(Value::as_u64).unwrap_or(0))
+    /// What the page reader says of the field of `tab` that has the keyboard
+    /// focus, and with `expected` whether the text before its caret ends with
+    /// that. The reader says only that: the field's text never leaves the
+    /// page.
+    async fn caret(&self, tab: &Tab, expected: Option<&str>) -> Caret {
+        let mut ask = json!({ "tabId": tab.id });
+        if let Some(expected) = expected {
+            ask["expected"] = json!(expected);
+        }
+        let Ok(answer) = self.desktop.browser_call("caret", ask, false).await else { return Caret::Unsaid };
+        match answer.get("editable").and_then(Value::as_bool) {
+            Some(true) => Caret::Field {
+                length: answer.get("length").and_then(Value::as_u64).unwrap_or(0),
+                ends: answer.get("ends").and_then(Value::as_bool) == Some(true),
+            },
+            Some(false) => Caret::NoField,
+            None => Caret::Unsaid,
+        }
+    }
+
+    /// [`Self::caret`], asked again while the reader cannot say (a frame of
+    /// the page is loading), for as long as a paste is waited for.
+    async fn caret_said(&self, tab: &Tab, expected: Option<&str>) -> Caret {
+        let until = Instant::now() + PASTE_WITHIN;
+        loop {
+            match self.caret(tab, expected).await {
+                Caret::Unsaid if Instant::now() < until => tokio::time::sleep(Duration::from_millis(50)).await,
+                said => return said,
+            }
+        }
     }
 
     /// Set the person's clipboard aside before pasting; `clicked` when the
@@ -2585,10 +2622,14 @@ impl Controller {
     }
 
     /// Type `text` where the caret is, piece by piece: ASCII typed, the rest
-    /// pasted from the clipboard. A paste counts as arrived when the field
-    /// holds a different amount than it did once the typing before it had
-    /// arrived; nothing more is sent until then, so the pieces arrive in
-    /// order and each paste is read before the clipboard changes again.
+    /// pasted from the clipboard. A paste has arrived when the text before
+    /// the caret ends with it (and, where it already did, the field holds a
+    /// different amount): the field holding a different amount is not enough,
+    /// since keys typed before the paste, or the page itself, change that
+    /// too. Nothing more is sent until then, so the pieces arrive in order
+    /// and each paste is read before the clipboard changes again. A reader
+    /// that cannot say is asked again until the paste's time is up; only its
+    /// answer that no field has the keyboard stops at once.
     async fn insert_text(&self, step: &BrowserStep, tab: &Tab, text: &str, cancel: &Cancel) -> Result<Done> {
         let total = text.chars().count();
         let stopped = |before: usize| move |e: IbaraError| typing_stopped(e, before, total, TypedInto::Window);
@@ -2605,18 +2646,15 @@ impl Controller {
                 typed += count;
                 continue;
             }
-            // What the field holds once the keys before this paste arrived:
-            // the same amount twice.
-            let mut held = self.caret(tab).await.ok_or_else(|| stopped(typed)(lost()))?;
-            let settle = Instant::now() + PASTE_WITHIN;
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let now = self.caret(tab).await.ok_or_else(|| stopped(typed)(lost()))?;
-                if now == held || Instant::now() >= settle {
-                    break;
+            // Before the paste: how much the field holds, and whether the
+            // text before the caret already ends with the piece.
+            let (held, ended) = match self.caret_said(tab, Some(piece)).await {
+                Caret::Field { length, ends } => (length, ends),
+                Caret::NoField => return Err(stopped(typed)(lost())),
+                Caret::Unsaid => {
+                    return Err(stopped(typed)(fail("OUTCOME_UNKNOWN", "The page stopped answering while ibara typed into its field, so the rest was not sent; observe the page.", false)));
                 }
-                held = now;
-            }
+            };
             self.desktop.clipboard_paste_text(piece).await.map_err(stopped(typed))?;
             // A Ctrl+V that went out may have pasted the piece.
             let unsure = |e: IbaraError| {
@@ -2626,13 +2664,13 @@ impl Controller {
             act(Effect::Key { surface: step.window.clone(), combo: "ctrl+v".into() }).await.map_err(unsure)?;
             let until = Instant::now() + PASTE_WITHIN;
             loop {
-                match self.caret(tab).await {
-                    Some(now) if now != held => break,
-                    None => return Err(unsure(lost())),
-                    Some(_) if Instant::now() >= until => {
+                match self.caret(tab, Some(piece)).await {
+                    Caret::Field { length, ends: true } if !ended || length != held => break,
+                    Caret::NoField => return Err(unsure(lost())),
+                    _ if Instant::now() >= until => {
                         return Err(unsure(fail("OUTCOME_UNKNOWN", "The field does not show the text ibara pasted into it; observe the page.", false)));
                     }
-                    Some(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
             }
             typed += count;
@@ -3944,7 +3982,7 @@ fn target_identity(resolved: &Resolved) -> Value {
             }),
             Effect::Type { surface, text, .. } => json!({ "type": hex_sha256(text.as_bytes()), "window": window(surface) }),
             Effect::Key { surface, combo } => json!({ "key": combo, "window": window(surface) }),
-            Effect::Scroll { at, dx, dy } => json!({ "scroll": [dx, dy], "at": at.map(|(x, y)| [x.round(), y.round()]) }),
+            Effect::Scroll { at, dx, dy, .. } => json!({ "scroll": [dx, dy], "at": at.map(|(x, y)| [x.round(), y.round()]) }),
         },
     }
 }

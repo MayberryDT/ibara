@@ -985,15 +985,17 @@ impl Desktop {
         .await
     }
 
-    /// Wheel notches (−50..50 each) into the window at `at`, else the focused one.
-    pub async fn scroll(&self, at: Option<Point>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
+    /// Wheel notches (−50..50 each) at `at`, into `surface` when it is named
+    /// and else into the window under the point; with no point, into the
+    /// focused window.
+    pub async fn scroll(&self, at: Option<Point>, surface: Option<&SurfaceId>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
         if let Some(control) = &self.gnome_control {
             return self.effect(cancel,async {
                 if !(-50..=50).contains(&dx) || !(-50..=50).contains(&dy) {
                     return Err(invalid("Scroll accepts -50 to 50 wheel notches per axis.").with("execution_not_started",true));
                 }
                 let window=match at {
-                    Some(at)=>self.window_at(at.x,at.y,None).await?.0,
+                    Some(at)=>self.window_at(at.x,at.y,surface).await?.0,
                     None=>self.hypr.active_window().await?.ok_or_else(||stale("No window has focus."))?,
                 };
                 let point=at.unwrap_or(Point {x:window.at[0] as f64+window.size[0] as f64/2.0,
@@ -1008,7 +1010,7 @@ impl Desktop {
             // The place in its window, for Cua: what is under it scrolls.
             let (window, place) = match at {
                 Some(at) => {
-                    let (window, lx, ly, _) = self.window_at(at.x, at.y, None).await?;
+                    let (window, lx, ly, _) = self.window_at(at.x, at.y, surface).await?;
                     (window, Some((lx, ly)))
                 }
                 None => (self.hypr.active_window().await?.ok_or_else(|| stale("No window has focus."))?, None),

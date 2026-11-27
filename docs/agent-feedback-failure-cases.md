@@ -130,3 +130,20 @@ Refusals
 23. `send` without `to.host` is still refused, or goes anywhere but the
     computer the agent works from; a `to.host` that names another computer is
     no longer refused.
+
+X11 windows
+
+Cua's Hyprland plugin takes no X11 (Xwayland) window as a target and answers
+`stale_target` for every key, click and scroll to one. Wine and Proton games
+are X11 windows unless started in their Wayland mode.
+
+24. A key to an X11 window is still refused with "use the pointer instead"
+    and a click with "use keys instead", so an agent goes round between them,
+    observes again and uses `recovery_of`, none of which can work.
+25. A Wayland window refused as `stale_target` (it was unmapped, or its
+    target binding went stale) is wrongly called an X11 app.
+26. An X11 window refused for another cause (Caps Lock, a held key, a grab)
+    loses that cause and is told only that it is X11.
+27. The window is gone by the time ibara looks it up, and the refusal is
+    lost or replaced by a lookup error.
+28. `hyprctl -j clients` says `"xwayland": true` and ibara does not read it.

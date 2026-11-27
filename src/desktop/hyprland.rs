@@ -625,6 +625,15 @@ mod tests {
         Monitor { name: name.into(), width: 1920, height: 1080, scale, ..Monitor::default() }
     }
 
+    // Failure case 28 of docs/agent-feedback-failure-cases.md.
+    #[test]
+    fn a_window_says_whether_it_is_an_x11_app() {
+        let x11: Window = serde_json::from_str(r#"{"address":"0x1","class":"steam_proton","xwayland":true}"#).unwrap();
+        assert!(x11.xwayland);
+        assert!(!serde_json::from_str::<Window>(r#"{"address":"0x1","xwayland":false}"#).unwrap().xwayland);
+        assert!(!serde_json::from_str::<Window>(r#"{"address":"0x1"}"#).unwrap().xwayland);
+    }
+
     #[test]
     fn revisions_format_numbers_like_javascript() {
         assert_eq!(display_revision(&monitor("HDMI-A-1", 1.0)), r#"["HDMI-A-1",1920,1080,1,0,0,0]"#);

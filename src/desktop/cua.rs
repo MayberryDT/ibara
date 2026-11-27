@@ -1931,6 +1931,32 @@ esac
         })
     }
 
+    // Failure cases 24 to 27 of docs/agent-feedback-failure-cases.md.
+    #[test]
+    fn a_refusal_for_an_x11_window_says_so_and_not_to_try_other_input() {
+        let window = |xwayland| Window { xwayland, class: "steam_proton".into(), ..Window::default() };
+        for tool in ["press_key", "click", "scroll", "type_text"] {
+            let said = for_x11(refusal(tool, &refused("stale_target", "stale_target"), true), Some(&window(true)));
+            assert_eq!((said.code, &said.details["reason"]), ("CAPABILITY_UNAVAILABLE", &json!("x11_window")), "{tool}");
+            assert_eq!(said.details["execution_not_started"], json!(true), "{tool}");
+            assert!(said.message.contains("X11"), "{}", said.message);
+            let next = said.details["next"].as_str().unwrap();
+            assert!(!next.contains("Use the pointer instead") && !next.contains("Use keys instead"), "{next}");
+            assert!(next.contains("Wayland"), "{next}");
+        }
+        // 25: a Wayland window keeps what Cua said.
+        let wayland = for_x11(refusal("click", &refused("stale_target", "stale_target"), true), Some(&window(false)));
+        assert_eq!(wayland.details["reason"], json!("stale_target"));
+        assert!(!wayland.message.contains("X11"), "{}", wayland.message);
+        // 26: another cause on an X11 window stays that cause.
+        let caps = for_x11(refusal("press_key", &refused("primary_target_busy", "foreground_keyboard_locked"), true), Some(&window(true)));
+        assert_eq!(caps.details["reason"], json!("keyboard_locked"));
+        assert!(caps.message.contains("Caps Lock"), "{}", caps.message);
+        // 27: no window to ask about.
+        let gone = for_x11(refusal("click", &refused("stale_target", "stale_target"), true), None);
+        assert_eq!(gone.details["reason"], json!("stale_target"));
+    }
+
     #[test]
     fn foreground_refusals_are_reported_by_their_cause_not_cuas_shared_reason() {
         let caps_lock = refusal("press_key", &refused("primary_target_busy", "foreground_keyboard_locked"), true);

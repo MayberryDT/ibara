@@ -1798,6 +1798,20 @@ mv "$dir/elements.new" "$dir/elements"
     }
 
     #[tokio::test]
+    async fn an_interruption_before_the_first_key_does_not_go_on_into_a_window_that_took_the_focus() {
+        let screen = Screen::new((500, 400)).await;
+        screen.taken().await;
+        std::fs::write(screen.dir.join("stop_at"), "0 stalled\n").unwrap();
+        std::fs::write(screen.dir.join("focus_on_stop"), VIEWER).unwrap();
+        let stopped = screen.desktop.type_text(&screen.surface, SAVE_AS, TypingCursor::ToField, None).await.unwrap_err();
+        assert_eq!(stopped.code, "STALE_TARGET", "{stopped:?}");
+        assert_eq!(stopped.details["typed_chars"], serde_json::json!(0), "{stopped:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(screen.field(), "", "nothing typed into the window that took the focus");
+        screen.desktop.reset_input().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn interruptions_that_let_no_key_through_are_counted_only_in_a_row() {
         let screen = Screen::new((500, 400)).await;
         screen.taken().await;

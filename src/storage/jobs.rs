@@ -332,8 +332,18 @@ impl StorageService {
         if program.is_empty() || jsv::utf16_len(&program) > 512 {
             return Err(fail("INVALID_ARGUMENT", "exec requires a program name.", true));
         }
-        if args.len() > 100 || args.iter().any(|a| jsv::utf16_len(a) > 4096) {
-            return Err(fail("INVALID_ARGUMENT", "exec arguments exceed limits.", true));
+        // A script or a long text belongs in a file, which has no such limit.
+        let in_a_file = "Write a long script or text to a file in the task workspace with computer_files, then run or read that file.";
+        if args.len() > 100 {
+            return Err(fail("INVALID_ARGUMENT", format!("command: {} arguments after the program; exec takes at most 100.", args.len()), true).with("next", in_a_file));
+        }
+        if let Some((at, long)) = args.iter().enumerate().find(|(_, a)| jsv::utf16_len(a) > 4096) {
+            return Err(fail(
+                "INVALID_ARGUMENT",
+                format!("command: argument {} has {} characters; each argument takes at most 4096.", at + 1, jsv::utf16_len(long)),
+                true,
+            )
+            .with("next", in_a_file));
         }
         if let Some(allowed) = &opts.allowed_programs {
             let base = jsv::basename(&program);

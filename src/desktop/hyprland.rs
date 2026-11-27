@@ -103,6 +103,8 @@ pub struct Window {
     pub initial_title: String,
     pub pid: i64,
     pub fullscreen: i64,
+    /// An X11 app, shown through Xwayland. Cua's plugin sends it no input.
+    pub xwayland: bool,
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i64,
     pub stable_id: Option<String>,
@@ -623,6 +625,15 @@ mod tests {
 
     fn monitor(name: &str, scale: f64) -> Monitor {
         Monitor { name: name.into(), width: 1920, height: 1080, scale, ..Monitor::default() }
+    }
+
+    // Failure case 28 of docs/agent-feedback-failure-cases.md.
+    #[test]
+    fn a_window_says_whether_it_is_an_x11_app() {
+        let x11: Window = serde_json::from_str(r#"{"address":"0x1","class":"steam_proton","xwayland":true}"#).unwrap();
+        assert!(x11.xwayland);
+        assert!(!serde_json::from_str::<Window>(r#"{"address":"0x1","xwayland":false}"#).unwrap().xwayland);
+        assert!(!serde_json::from_str::<Window>(r#"{"address":"0x1"}"#).unwrap().xwayland);
     }
 
     #[test]

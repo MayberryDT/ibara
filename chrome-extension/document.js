@@ -19,11 +19,15 @@
 //   verify   whether that press reached the element (or something inside it)
 //   lock     whether this document holds the pointer locked, and on what
 //   selected the label that list now shows
-//   reveal   scroll an element into view
+//   reveal   scroll an element into view, and return a point in it that a
+//            wheel reaches it at, as locate gives a press one, when it has one
 //   field    whether the element last located has the keyboard focus (the
 //            page has it, not the address bar) and the text it holds
 //   keys     whether a key pressed now (args.key: enter or space) submits a
 //            form in this page
+//   caret    whether a field of this page has the keyboard focus, how much
+//            it holds (never what) and, asked with args.expected, whether
+//            the text before its caret ends with that
 export async function documentOperation(message) {
   // Traverse only open shadow roots; closed roots remain opaque.
   const all=(selector,root=document)=>{
@@ -413,12 +417,64 @@ export async function documentOperation(message) {
   // The next rendered frame; after 100 ms without one, go on.
   const frame=()=>new Promise(done=>{requestAnimationFrame(()=>done());setTimeout(done,100);});
   const centre=el=>{const r=el.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];};
+  // Bring el into the part of each scrolling list around it that shows (an
+  // option into its list), centred there, without moving the page; whether
+  // it now can be reached. Only a box a person can scroll, along the way it
+  // scrolls, and through slots and shadow trees. When el still cannot be
+  // reached (something covers it, or it does not move with the box),
+  // every box is put back where it was.
+  const unclip=async el=>{
+    const was=[];
+    for(let p=parent(el);p&&p!==document.body&&p!==document.documentElement;p=parent(p)){
+      const style=getComputedStyle(p),scrolls=axis=>['auto','scroll','overlay'].includes(axis);
+      const down=scrolls(style.overflowY),across=scrolls(style.overflowX);
+      if(!down&&!across)continue;
+      const r=el.getBoundingClientRect(),b=p.getBoundingClientRect();
+      const top=b.top+p.clientTop,left=b.left+p.clientLeft,bottom=top+p.clientHeight,right=left+p.clientWidth;
+      const dy=down&&(r.top<top||r.bottom>bottom)?(r.top+r.bottom)/2-(top+bottom)/2:0;
+      const dx=across&&(r.left<left||r.right>right)?(r.left+r.right)/2-(left+right)/2:0;
+      if(!dx&&!dy)continue;
+      const at=[p,p.scrollLeft,p.scrollTop];
+      p.scrollBy({left:dx,top:dy,behavior:'instant'});
+      if(p.scrollLeft!==at[1]||p.scrollTop!==at[2])was.push(at);
+    }
+    if(!was.length)return false;
+    await frame();await frame();
+    if(el.isConnected&&reachable(el))return true;
+    for(const [p,left,top] of was)p.scrollTo({left,top,behavior:'instant'});
+    return false;
+  };
   const selectSignature=el=>JSON.stringify([...el.options].map(o=>[o.value,o.text,o.matches(':disabled')]));
   if(message.op==='keys') {
     // Not when the keyboard is elsewhere (the address bar). A form inside a
     // frame is not seen: the focus is then the frame itself.
     const el=document.hasFocus()?active():null;
     return {page:!!el,submits:!!el&&(submitter(el)||(args.key==='enter'&&enterSubmits(el)))};
+  }
+  if(message.op==='caret') {
+    // Not when the keyboard is elsewhere (the address bar). Only whether a
+    // field has it and how much the field holds: its text never leaves the page.
+    const el=document.hasFocus()?active():null;
+    const text=el instanceof HTMLTextAreaElement||(el instanceof HTMLInputElement&&['text','search','url','tel','email','password','number',''].includes(el.getAttribute('type')?.toLowerCase()??''));
+    const editable=!!el&&!el.matches(':disabled,[readonly]')&&(text||el.isContentEditable);
+    const answer={editable,length:!editable?0:text?el.value.length:el.innerText.replace(/\n$/,'').length};
+    // Whether the text before the caret ends with what ibara just pasted
+    // (args.expected): how a paste is known to have arrived. Only yes or no.
+    if(editable&&typeof args.expected==='string'){
+      let before;
+      if(text)before=el.value.slice(0,el.selectionStart??el.value.length);
+      else{
+        const selection=el.getRootNode().getSelection?.()||getSelection();
+        if(selection?.focusNode&&el.contains(selection.focusNode)){
+          const range=document.createRange();
+          range.selectNodeContents(el);
+          range.setEnd(selection.focusNode,selection.focusOffset);
+          before=range.toString();
+        }else before=el.innerText.replace(/\n$/,'');
+      }
+      answer.ends=before.endsWith(args.expected);
+    }
+    return answer;
   }
   if(message.op==='check') {
     // innerText excludes hidden rendered text and does not expose password values.
@@ -469,9 +525,19 @@ export async function documentOperation(message) {
     // reach any other element, so none is located.
     const lock=document.pointerLockElement;
     if(message.op==='locate'&&lock&&lock!==el&&!el.contains(lock))return {locked:reached(lock)};
-    const scrolled=!inView(el);
+    let scrolled=!inView(el);
     if(scrolled)el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
-    if(message.op==='reveal')return {revealed:true};
+    // Inside the window but outside the part of its own scrolling list that
+    // shows (an hour further down an open time picker): a press at its place
+    // would reach whatever is there instead.
+    else if(!reachable(el))scrolled=await unclip(el);
+    if(message.op==='reveal') {
+      // Where a wheel reaches it, so what holds it scrolls (a list inside the
+      // page); no place when something covers it.
+      if(scrolled){await frame();await frame();}
+      const place=el.isConnected?reachable(el):null;
+      return {revealed:true,...(place?{...place,outer:[outerWidth,outerHeight],inner:[innerWidth,innerHeight]}:{})};
+    }
     // Read a unique native option and an ordinal among enabled options.
     // The controller clicks and presses Home/End + arrows + Return; this
     // reader never assigns selectedIndex/value or synthesizes input.

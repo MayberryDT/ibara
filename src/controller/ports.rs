@@ -132,7 +132,10 @@ pub enum Effect {
     /// `cursor`: whether the agent's named cursor glides to the field first.
     Type { surface: WinKey, cursor: TypingCursor, text: String },
     Key { surface: WinKey, combo: String },
-    Scroll { at: Option<(f64, f64)>, dx: i32, dy: i32 },
+    /// A wheel scroll at a screen point, into the named window when there
+    /// is one, else into the window under the point; with no point, into
+    /// the focused window.
+    Scroll { at: Option<(f64, f64)>, surface: Option<WinKey>, dx: i32, dy: i32 },
 }
 
 /// What an effect reported.

@@ -9,7 +9,7 @@
 use super::budget;
 use super::control::{Charge, Release};
 use super::checks::{TaskPath, pause};
-use super::ports::{Button, Cancel, Done, Effect, Image, PutBack, TypingCursor, Win, WinKey};
+use super::ports::{Button, Cancel, Done, Effect, Image, PutBack, Tab, TypingCursor, Win, WinKey};
 use super::approval::{self, Ask, Place};
 use super::situation::{FrameSpec, FrameState, app_class, app_id_for, dirty_title, surface_signature};
 use crate::access::agent_label;
@@ -129,6 +129,9 @@ fn typing_stopped(mut e: IbaraError, before: usize, total: usize, into: TypedInt
     let cause = stop_cause(&e).map_or_else(|| format!("{}.", e.message.trim_end_matches('.')), str::to_string);
     let rest = total.saturating_sub(typed + unsure);
     let next = match (into, unsure) {
+        (TypedInto::Field, 0) if typed > 0 && rest > 0 => format!(
+            "The other {rest} were not typed: to add only those, type them without a target, which adds at the caret. Typing the whole text into the field again replaces what it holds."
+        ),
         (TypedInto::Field, _) => "Typing the whole text again replaces what the field holds.".to_string(),
         (TypedInto::Window, 0) => format!("The other {rest} were not typed: type only those."),
         (TypedInto::Window, _) => "Check what arrived before typing again.".to_string(),
@@ -193,6 +196,18 @@ fn access_pending(tool: &str, args: &Value, mut pending: Value) -> Reply {
 const BROWSER_CONNECT: Duration = Duration::from_secs(10);
 /// How long a pasted piece gets to show in the page's field.
 const PASTE_WITHIN: Duration = Duration::from_secs(2);
+
+/// What the page reader says of the field of a tab that has the keyboard.
+enum Caret {
+    /// A field of the page has it: how much it holds, and whether the text
+    /// before its caret ends with what was asked about.
+    Field { length: u64, ends: bool },
+    /// No field of the page has it (the address bar may).
+    NoField,
+    /// The reader could not say: a frame of the page is loading, it did not
+    /// answer, or it is an earlier reader.
+    Unsaid,
+}
 /// How long `finish` waits for the windows it asked to close to go, and how
 /// often it looks.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
@@ -2125,9 +2140,10 @@ impl Controller {
                 if !text.is_ascii() && is_browser(&win.class) {
                     return Err(fail(
                         "WRONG_TOOL",
-                        "Text with characters beyond ASCII goes into a web page with browser_act: type, with the field as its target; typed into the browser window it could land in the address bar.",
+                        "Text with characters beyond ASCII goes into a web page with browser_act type; typed into the browser window it could land in the address bar.",
                         true,
                     )
+                    .with("next", "With the field as its target, browser_act type replaces the field's text. Without a target it adds the text at the caret of the page field that has the keyboard: click into the field first.")
                     .with("execution_not_started", true));
                 }
                 let describe = format!("type {} characters into {}", text.chars().count(), win.class);
@@ -2151,7 +2167,7 @@ impl Controller {
                         _ => None,
                     };
                     let (dx, dy) = (notches(s.dx), notches(s.dy));
-                    (Effect::Scroll { at, dx, dy }, format!("scroll {dx},{dy} at {d}{}", read_as_pixels((s.dx, s.dy), (dx, dy))), "scroll".to_string(), "scroll")
+                    (Effect::Scroll { at, surface: None, dx, dy }, format!("scroll {dx},{dy} at {d}{}", read_as_pixels((s.dx, s.dy), (dx, dy))), "scroll".to_string(), "scroll")
                 }
                 Target::Element(_) => {
                     return Err(invalid("action.target: scroll needs a point {x, y}; elements have no position here"));
@@ -2235,10 +2251,8 @@ impl Controller {
                         let (args, what, words) = node(target, "fill")?;
                         (Some(args), BrowserOp::Type(t.text.clone()), format!("type into {what}"), format!("type {typed} into {words}"), "browser_type")
                     }
-                    None if !t.text.is_ascii() => {
-                        return Err(invalid("action.target: text with characters beyond ASCII is pasted into a field, so name the field from the page's elements.")
-                            .with("execution_not_started", true));
-                    }
+                    // Text beyond ASCII is pasted, and only into a page field
+                    // that has the keyboard ([`Self::browser_insert`]).
                     None => (None, BrowserOp::Type(t.text.clone()), "type in the page".into(), format!("type {typed}"), "browser_type"),
                 }
             }
@@ -2305,9 +2319,10 @@ impl Controller {
                     self.browser_click(step, target.clone(), false, cancel).await?;
                     self.browser_type(step, target, text, cancel).await
                 }
-                None => act(Effect::Type { surface: surface(), text: text.clone(), cursor: TypingCursor::Stays })
+                None if text.is_ascii() || self.desktop.native_unicode_typing() => act(Effect::Type { surface: surface(), text: text.clone(), cursor: TypingCursor::Stays })
                     .await
                     .map_err(|e| typing_stopped(e, 0, text.chars().count(), TypedInto::Window)),
+                None => self.browser_insert(step, text, cancel).await,
             },
             BrowserOp::Select(value) => {
                 let mut args = step.target.clone().unwrap_or(Value::Null);
@@ -2340,14 +2355,21 @@ impl Controller {
                 Ok(Done { note: Some("The requested option is selected; this does not prove the form was saved.".into()), ..Done::default() })
             }
             BrowserOp::Scroll { dx, dy } => {
-                let mut moved = false;
+                let (mut moved, mut at) = (false, None);
                 if let Some(target) = &step.target {
                     let data = self.desktop.browser_call("reveal", target.clone(), true).await?;
                     page_refusal(&data)?;
                     moved = true;
+                    // The wheel goes over the element, so what holds it
+                    // scrolls: a list inside the page, not the page; and to
+                    // the browser's window by name, whatever lies over it
+                    // there. Without a place (a covered element, an earlier
+                    // page reader) it goes to the window as before.
+                    let window = self.desktop.windows().await.ok().and_then(|all| all.into_iter().find(|w| w.address == step.window.address && w.pid == step.window.pid));
+                    at = window.and_then(|w| page_point(&data, &w.rect).ok());
                 }
                 if *dx != 0 || *dy != 0 {
-                    let wheel = act(Effect::Scroll { at: None, dx: *dx, dy: *dy }).await;
+                    let wheel = act(Effect::Scroll { at, surface: at.map(|_| step.window.clone()), dx: *dx, dy: *dy }).await;
                     return if moved { wheel.map_err(started) } else { wheel };
                 }
                 Ok(Done::default())
@@ -2485,13 +2507,83 @@ impl Controller {
         if text.is_ascii() || self.desktop.native_unicode_typing() {
             return self.replace_text(step, target, text, cancel).await;
         }
-        self.desktop.clipboard_set_aside().await.map_err(|e| {
-            fail("CAPABILITY_UNAVAILABLE", format!("ibara pastes characters beyond ASCII and could not set the clipboard aside first, so nothing was typed. {}", e.message), true)
-                .with("next", "Try again; if it keeps failing, type ASCII text only.")
-                .with("clicked", true)
-                .with("execution_not_started", true)
-        })?;
+        self.clipboard_aside(true).await?;
         let typed = self.replace_text(step, target, text, cancel).await;
+        self.clipboard_back(typed).await
+    }
+
+    /// Add `text`, which has characters beyond ASCII, where the caret is in
+    /// the page field that has the keyboard focus: no click, and nothing is
+    /// selected, so nothing is replaced. The page reader says a field of the
+    /// page has the keyboard before anything is sent: the text is never
+    /// aimed at the address bar. ASCII is typed and the rest pasted, with
+    /// the person's clipboard set aside and put back as
+    /// [`Self::browser_type`] does. Typed text reaches no message, receipt or
+    /// timeline entry.
+    async fn browser_insert(&self, step: &BrowserStep, text: &str, cancel: &Cancel) -> Result<Done> {
+        // The tab is named once: if another takes the focus meanwhile, this
+        // one's field no longer has the keyboard and the typing stops.
+        let tab = match self.focused_tab().await {
+            Some(tab) if matches!(self.caret_said(&tab, None).await, Caret::Field { .. }) => tab,
+            _ => return Err(fail(
+                "INVALID_ARGUMENT",
+                "action.target: ibara cannot confirm that a field of the page has the keyboard, and text with characters beyond ASCII is pasted, so it could land in the address bar; nothing was sent.",
+                true,
+            )
+            .with("next", "Name the field as the target, which replaces the field's text. Or click into the field first, then send the text again without a target to add it at the caret.")
+            .with("execution_not_started", true)),
+        };
+        self.clipboard_aside(false).await?;
+        let typed = self.insert_text(step, &tab, text, cancel).await;
+        self.clipboard_back(typed).await
+    }
+
+    /// What the page reader says of the field of `tab` that has the keyboard
+    /// focus, and with `expected` whether the text before its caret ends with
+    /// that. The reader says only that: the field's text never leaves the
+    /// page.
+    async fn caret(&self, tab: &Tab, expected: Option<&str>) -> Caret {
+        let mut ask = json!({ "tabId": tab.id });
+        if let Some(expected) = expected {
+            ask["expected"] = json!(expected);
+        }
+        let Ok(answer) = self.desktop.browser_call("caret", ask, false).await else { return Caret::Unsaid };
+        match answer.get("editable").and_then(Value::as_bool) {
+            Some(true) => Caret::Field {
+                length: answer.get("length").and_then(Value::as_u64).unwrap_or(0),
+                ends: answer.get("ends").and_then(Value::as_bool) == Some(true),
+            },
+            Some(false) => Caret::NoField,
+            None => Caret::Unsaid,
+        }
+    }
+
+    /// [`Self::caret`], asked again while the reader cannot say (a frame of
+    /// the page is loading), for as long as a paste is waited for.
+    async fn caret_said(&self, tab: &Tab, expected: Option<&str>) -> Caret {
+        let until = Instant::now() + PASTE_WITHIN;
+        loop {
+            match self.caret(tab, expected).await {
+                Caret::Unsaid if Instant::now() < until => tokio::time::sleep(Duration::from_millis(50)).await,
+                said => return said,
+            }
+        }
+    }
+
+    /// Set the person's clipboard aside before pasting; `clicked` when the
+    /// step has already clicked its field.
+    async fn clipboard_aside(&self, clicked: bool) -> Result<()> {
+        self.desktop.clipboard_set_aside().await.map_err(|e| {
+            let e = fail("CAPABILITY_UNAVAILABLE", format!("ibara pastes characters beyond ASCII and could not set the clipboard aside first, so nothing was typed. {}", e.message), true)
+                .with("next", "Try again; if it keeps failing, type ASCII text only.")
+                .with("execution_not_started", true);
+            if clicked { e.with("clicked", true) } else { e }
+        })
+    }
+
+    /// Put the person's clipboard back after pasting, and say what happened
+    /// to it when they need to know, whatever the typing's outcome.
+    async fn clipboard_back(&self, typed: Result<Done>) -> Result<Done> {
         let note = match self.desktop.clipboard_put_back().await {
             Ok(PutBack::Unchanged | PutBack::Restored) => None,
             // The refusal to paste over the copy already says so.
@@ -2527,6 +2619,63 @@ impl Controller {
         crate::desktop::cua::unless_cancelled(Some(cancel)).map_err(|e| e.with("no_input_held", true))?;
         self.turns.borrow_mut().before_action()?;
         self.desktop.act(effect, cancel).await
+    }
+
+    /// Type `text` where the caret is, piece by piece: ASCII typed, the rest
+    /// pasted from the clipboard. A paste has arrived when the text before
+    /// the caret ends with it (and, where it already did, the field holds a
+    /// different amount): the field holding a different amount is not enough,
+    /// since keys typed before the paste, or the page itself, change that
+    /// too. Nothing more is sent until then, so the pieces arrive in order
+    /// and each paste is read before the clipboard changes again. A reader
+    /// that cannot say is asked again until the paste's time is up; only its
+    /// answer that no field has the keyboard stops at once.
+    async fn insert_text(&self, step: &BrowserStep, tab: &Tab, text: &str, cancel: &Cancel) -> Result<Done> {
+        let total = text.chars().count();
+        let stopped = |before: usize| move |e: IbaraError| typing_stopped(e, before, total, TypedInto::Window);
+        let act = |effect: Effect| async move { self.send_input(&effect, cancel).await };
+        let lost = || fail("OUTCOME_UNKNOWN", "The page's field lost the keyboard focus while ibara typed into it; observe the page.", false);
+        let mut typed = 0;
+        for (piece, ascii) in text_runs(text) {
+            if cancel.is_cancelled() {
+                return Err(stopped(typed)(IbaraError::new("TIMEOUT", "Typing cancelled between pieces.", false).with("no_input_held", true)));
+            }
+            let count = piece.chars().count();
+            if ascii {
+                act(Effect::Type { surface: step.window.clone(), text: piece.to_string(), cursor: TypingCursor::Stays }).await.map_err(stopped(typed))?;
+                typed += count;
+                continue;
+            }
+            // Before the paste: how much the field holds, and whether the
+            // text before the caret already ends with the piece.
+            let (held, ended) = match self.caret_said(tab, Some(piece)).await {
+                Caret::Field { length, ends } => (length, ends),
+                Caret::NoField => return Err(stopped(typed)(lost())),
+                Caret::Unsaid => {
+                    return Err(stopped(typed)(fail("OUTCOME_UNKNOWN", "The page stopped answering while ibara typed into its field, so the rest was not sent; observe the page.", false)));
+                }
+            };
+            self.desktop.clipboard_paste_text(piece).await.map_err(stopped(typed))?;
+            // A Ctrl+V that went out may have pasted the piece.
+            let unsure = |e: IbaraError| {
+                let unsure = if not_started(&e) { 0 } else { count };
+                stopped(typed)(e.with("unsure_chars", unsure))
+            };
+            act(Effect::Key { surface: step.window.clone(), combo: "ctrl+v".into() }).await.map_err(unsure)?;
+            let until = Instant::now() + PASTE_WITHIN;
+            loop {
+                match self.caret(tab, Some(piece)).await {
+                    Caret::Field { length, ends: true } if !ended || length != held => break,
+                    Caret::NoField => return Err(unsure(lost())),
+                    _ if Instant::now() >= until => {
+                        return Err(unsure(fail("OUTCOME_UNKNOWN", "The field does not show the text ibara pasted into it; observe the page.", false)));
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+            typed += count;
+        }
+        Ok(Done::default())
     }
 
     /// Select the focused field's text and type `text` over it, piece by
@@ -3833,7 +3982,7 @@ fn target_identity(resolved: &Resolved) -> Value {
             }),
             Effect::Type { surface, text, .. } => json!({ "type": hex_sha256(text.as_bytes()), "window": window(surface) }),
             Effect::Key { surface, combo } => json!({ "key": combo, "window": window(surface) }),
-            Effect::Scroll { at, dx, dy } => json!({ "scroll": [dx, dy], "at": at.map(|(x, y)| [x.round(), y.round()]) }),
+            Effect::Scroll { at, dx, dy, .. } => json!({ "scroll": [dx, dy], "at": at.map(|(x, y)| [x.round(), y.round()]) }),
         },
     }
 }

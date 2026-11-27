@@ -26,7 +26,7 @@
 
 use super::atspi::{ElementPage, RawElement, ResolvedElement, Tree};
 use super::handover::Motion;
-use super::hyprland::{Rect, Screens};
+use super::hyprland::{Rect, Screens, Window};
 use super::run::{Cancel, Cmd, clip, run};
 use crate::error::{IbaraError, Result, invalid};
 use serde_json::{Value, json};
@@ -53,11 +53,20 @@ const PIECE_GAP: Duration = Duration::from_millis(40);
 const INPUT_ENDED: &str = "text_interrupted";
 /// Cua's reason when its connection failed with a key sent and unacknowledged.
 const KEY_IN_FLIGHT: &str = "transport_or_protocol_error";
-/// Typing goes on after [`INPUT_ENDED`] at most this often in one text, each
-/// time after [`RESUME_AFTER`]: a display change comes as several of
-/// Hyprland's events, and the plugin ends the input connection on each.
+/// Typing goes on after every [`INPUT_ENDED`] that let keys through, after
+/// [`RESUME_SOON`]: a field that takes the keyboard focus again makes an input
+/// method send its keymap again, Hyprland announces a layout change, and the
+/// plugin ends the input connection on that as on a display change. An
+/// editor that takes the focus again as it redraws does so over and over,
+/// each time after a key arrived. After one that let no key through, typing
+/// goes on at most this often in a row, each time after [`RESUME_AFTER`]: a
+/// display change comes as several of Hyprland's events, and the plugin ends
+/// the connection on each.
 const RESUMES: usize = 3;
 const RESUME_AFTER: Duration = Duration::from_millis(500);
+/// An input method's keymap comes as two events about 10 ms apart
+/// (fcitx5 5.1.22 on Hyprland 0.56.2, measured).
+const RESUME_SOON: Duration = Duration::from_millis(100);
 /// Starting a worker, including the MCP handshake.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// One accessibility walk.
@@ -817,8 +826,11 @@ impl Cua {
         self.call_as("get_window_state", args, Kind::Picture, READ_TIMEOUT).await.map(|_| ())
     }
 
-    /// Wheel notches into the window's focused region.
-    pub async fn scroll(&self, pid: i64, window: u64, dx: i32, dy: i32) -> Result<()> {
+    /// Wheel notches into the window at `at` (window-local pixels), where
+    /// what is under that place scrolls (a list inside a page); without a
+    /// place, where Cua puts them, the window's centre. `cancel` stops a
+    /// scroll at a place before a second try (see `at_point`).
+    pub async fn scroll(&self, pid: i64, window: u64, at: Option<(f64, f64)>, dx: i32, dy: i32, cancel: Option<&Cancel>) -> Result<()> {
         // Wheel input may bring the real pointer into the window first.
         let _moving = self.inner.motion.begin();
         let mut sent = false;
@@ -829,7 +841,15 @@ impl Cua {
             let mut args = Self::target(pid, window);
             args["direction"] = json!(direction);
             args["amount"] = json!(amount.unsigned_abs().min(50));
-            if let Err(error) = self.call("scroll", args, true, ACT_TIMEOUT).await {
+            let wheel = match at {
+                Some((x, y)) => {
+                    args["x"] = json!(x);
+                    args["y"] = json!(y);
+                    self.at_point("scroll", pid, window, args, ACT_TIMEOUT, cancel).await
+                }
+                None => self.call("scroll", args, true, ACT_TIMEOUT).await.map(drop),
+            };
+            if let Err(error) = wheel {
                 // The other direction's notches went through.
                 return Err(if sent { error.with("execution_not_started", false) } else { error });
             }
@@ -869,22 +889,25 @@ impl Cua {
     /// effect between pieces. `focused` is asked between pieces too, so a
     /// window that took the keyboard focus meanwhile gets none of the rest.
     /// When Cua stops a piece before its next key ([`INPUT_ENDED`], as on a
-    /// display change), exactly the keys it counts arrived, and the rest goes
-    /// on from there past the same checks, a few times at most.
+    /// display change or a field taking the keyboard focus again), exactly
+    /// the keys it counts arrived, and the rest goes on from there past the
+    /// same checks: every time keys arrived, a few times in a row at most
+    /// when none did.
     /// A failure says how many characters were typed for sure
     /// (`typed_chars`) and how many more may have been (`unsure_chars`: the
     /// piece in flight once it went out, or only its key in flight when Cua
     /// counts the keys before it).
     pub async fn type_ascii(&self, pid: i64, window: u64, text: &str, cancel: Option<&Cancel>, focused: impl AsyncFn() -> Result<()>) -> Result<()> {
         debug_assert!(text.is_ascii(), "one byte a character");
-        let (mut typed, mut resumes, mut pause) = (0usize, 0usize, PIECE_GAP);
+        let (mut typed, mut stalled, mut pause) = (0usize, 0usize, PIECE_GAP);
         while typed < text.len() {
             let piece = &text[typed..text.len().min(typed + TYPE_PIECE)];
             let stopped = |error: IbaraError| {
                 error.with("typed_chars", typed).with("unsure_chars", 0).with("no_input_held", true).with("execution_not_started", typed == 0)
             };
             // After the gap, not beside it: a focus change during the gap must stop the next piece.
-            let focus = if typed > 0 {
+            // Also before going on from an interruption at the text's first key.
+            let focus = if typed > 0 || stalled > 0 {
                 tokio::time::sleep(pause).await;
                 focused().await
             } else {
@@ -898,16 +921,20 @@ impl Cua {
             args["text"] = json!(piece);
             let Err(error) = self.call("type_text", args, true, ACT_TIMEOUT).await else {
                 typed += piece.len();
+                stalled = 0;
                 pause = PIECE_GAP;
                 continue;
             };
             if let Some(delivered) = error.details.get("delivered").and_then(Value::as_u64) {
-                typed += piece.len().min(delivered as usize);
+                let arrived = piece.len().min(delivered as usize);
+                typed += arrived;
                 let reason = error.details.get("reason").and_then(Value::as_str);
-                if reason == Some(INPUT_ENDED) && resumes < RESUMES {
-                    resumes += 1;
-                    pause = RESUME_AFTER;
-                    continue;
+                if reason == Some(INPUT_ENDED) {
+                    stalled = if arrived > 0 { 0 } else { stalled + 1 };
+                    if stalled <= RESUMES {
+                        pause = if arrived > 0 { RESUME_SOON } else { RESUME_AFTER };
+                        continue;
+                    }
                 }
                 let unsure = usize::from(reason == Some(KEY_IN_FLIGHT));
                 return Err(error.with("typed_chars", typed).with("unsure_chars", unsure));
@@ -1589,7 +1616,9 @@ fn refusal(tool: &str, outcome: &Value, mutates: bool) -> IbaraError {
 /// Cua's text stopped part way (`effect: partial`), with `delivered` the
 /// keys that went out before it stopped. [`INPUT_ENDED`]: Cua stopped
 /// before sending the next key, so exactly those arrived; Hyprland's plugin
-/// ends every input connection when a display is added or removed.
+/// ends every input connection when a display is added or removed, and when
+/// a keyboard's keymap is sent again (an input method, each time a field
+/// takes the keyboard focus).
 /// [`KEY_IN_FLIGHT`]: the connection failed with the next key sent, which
 /// may have arrived too. Otherwise the plugin refused the next key, for a
 /// cause as before any input. Other input (a drag) keeps "failed after
@@ -1600,7 +1629,7 @@ fn partial(tool: &str, sc: &Value, text: &str) -> Option<IbaraError> {
     }
     let delivered = sc["delivery"]["delivered_count"].as_u64()?;
     let error = match sc["reason"].as_str() {
-        Some(INPUT_ENDED) => unavailable("Cua's connection to the desktop ended part way, as it does when a display is added or removed.")
+        Some(INPUT_ENDED) => unavailable("Cua's input connection ended part way, as it does when a display changes or the field takes the keyboard focus again.")
             .with("reason", INPUT_ENDED),
         Some(KEY_IN_FLIGHT) => IbaraError::new("OUTCOME_UNKNOWN", format!("Cua {tool} failed after dispatch."), false)
             .requires_reconciliation()
@@ -1700,6 +1729,19 @@ fn refused_by(tool: &str, sc: &Value, text: &str) -> IbaraError {
         Some(next) => error.with("next", next),
         None => error,
     }
+}
+
+/// Cua's Hyprland plugin takes no X11 (Xwayland) window as a target and says
+/// only `stale_target`, whatever the input. For such a window, say that
+/// instead of offering the other kind of input, which is refused the same.
+pub fn for_x11(error: IbaraError, window: Option<&Window>) -> IbaraError {
+    if error.details.get("reason").and_then(Value::as_str) != Some("stale_target") || !window.is_some_and(|w| w.xwayland) {
+        return error;
+    }
+    unavailable("This window is an X11 app (it runs through Xwayland), and ibara cannot send keys, clicks or scrolls to an X11 window. It can still show it.")
+        .with("reason", "x11_window")
+        .with("execution_not_started", true)
+        .with("next", "No other input reaches it: not keys instead of clicks, another observation or recovery_of. If the app can run as a Wayland app, close it and start it that way (for example --ozone-platform=wayland for Chromium and Electron apps, SDL_VIDEODRIVER=wayland for SDL games, PROTON_ENABLE_WAYLAND=1 for Proton 10 or newer). Otherwise work through computer_exec or files, or finish partial and say the app needs X11 input.")
 }
 
 async fn write_line(worker: &mut Worker, message: &Value) -> Result<()> {
@@ -1902,6 +1944,32 @@ esac
         })
     }
 
+    // Failure cases 24 to 27 of docs/agent-feedback-failure-cases.md.
+    #[test]
+    fn a_refusal_for_an_x11_window_says_so_and_not_to_try_other_input() {
+        let window = |xwayland| Window { xwayland, class: "steam_proton".into(), ..Window::default() };
+        for tool in ["press_key", "click", "scroll", "type_text"] {
+            let said = for_x11(refusal(tool, &refused("stale_target", "stale_target"), true), Some(&window(true)));
+            assert_eq!((said.code, &said.details["reason"]), ("CAPABILITY_UNAVAILABLE", &json!("x11_window")), "{tool}");
+            assert_eq!(said.details["execution_not_started"], json!(true), "{tool}");
+            assert!(said.message.contains("X11"), "{}", said.message);
+            let next = said.details["next"].as_str().unwrap();
+            assert!(!next.contains("Use the pointer instead") && !next.contains("Use keys instead"), "{next}");
+            assert!(next.contains("Wayland"), "{next}");
+        }
+        // 25: a Wayland window keeps what Cua said.
+        let wayland = for_x11(refusal("click", &refused("stale_target", "stale_target"), true), Some(&window(false)));
+        assert_eq!(wayland.details["reason"], json!("stale_target"));
+        assert!(!wayland.message.contains("X11"), "{}", wayland.message);
+        // 26: another cause on an X11 window stays that cause.
+        let caps = for_x11(refusal("press_key", &refused("primary_target_busy", "foreground_keyboard_locked"), true), Some(&window(true)));
+        assert_eq!(caps.details["reason"], json!("keyboard_locked"));
+        assert!(caps.message.contains("Caps Lock"), "{}", caps.message);
+        // 27: no window to ask about.
+        let gone = for_x11(refusal("click", &refused("stale_target", "stale_target"), true), None);
+        assert_eq!(gone.details["reason"], json!("stale_target"));
+    }
+
     #[test]
     fn foreground_refusals_are_reported_by_their_cause_not_cuas_shared_reason() {
         let caps_lock = refusal("press_key", &refused("primary_target_busy", "foreground_keyboard_locked"), true);
@@ -1977,7 +2045,7 @@ esac
         assert!(rejected.message.contains("unknown field"), "Cua's reason is kept: {}", rejected.message);
         assert!(cua.running().await, "a rejection is an answer, not a dead worker");
 
-        let unknown = cua.scroll(1, 1, 0, 3).await.unwrap_err();
+        let unknown = cua.scroll(1, 1, None, 0, 3, None).await.unwrap_err();
         assert_eq!(unknown.code, "OUTCOME_UNKNOWN", "an error that can follow a tool that ran is not a refusal");
 
         cua.tree(1, 1).await.unwrap();
@@ -2091,6 +2159,63 @@ esac
         let calls = lines(dir.join("calls.log"));
         assert_eq!(calls.iter().filter(|c| *c == "get_window_state").count(), 1, "no picture is taken: {calls:?}");
         assert_eq!(calls.iter().filter(|c| matches!(c.as_str(), "click" | "drag")).count(), 2);
+
+        cua.stop().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A wheel scroll at a place (agent feedback, November 2026). Failure
+    // cases, written first (docs/agent-feedback-failure-cases.md 17, 18, 21):
+    // - a scroll aimed at a point still gives Cua no place, so Cua scrolls at
+    //   the window's centre: the page scrolls and the list under the point
+    //   does not;
+    // - a scroll with no point starts naming one, and no longer scrolls the
+    //   focused window as before;
+    // - on a Cua that wants a picture before pixels, a scroll at a point is
+    //   refused instead of taking the picture and trying once more.
+
+    /// The arguments of each `scroll` call the stand-in received.
+    fn scrolls(dir: &Path) -> Vec<Value> {
+        lines(dir.join("scrolls.log"))
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["params"]["arguments"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_wheel_scroll_at_a_window_point_gives_cua_the_point() {
+        let dir = temp_dir();
+        let cua = cua(&dir, fake_cua(&dir, true, r#"      scroll) printf '%s\n' "$line" >>"$dir/scrolls.log";;"#));
+
+        cua.scroll(1, 1, Some((236.0, 470.0)), 0, 3, None).await.unwrap();
+        cua.scroll(1, 1, None, -2, 0, None).await.unwrap();
+
+        let sent = scrolls(&dir);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!((&sent[0]["x"], &sent[0]["y"]), (&json!(236.0), &json!(470.0)), "the point, in window pixels: {sent:?}");
+        assert_eq!((&sent[0]["direction"], &sent[0]["amount"]), (&json!("down"), &json!(3)), "{sent:?}");
+        assert!(sent[1].get("x").is_none() && sent[1].get("y").is_none(), "no point, no place: the focused window scrolls as before: {sent:?}");
+        assert_eq!((&sent[1]["direction"], &sent[1]["amount"]), (&json!("left"), &json!(2)), "{sent:?}");
+
+        cua.stop().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wheel_scroll_at_a_point_takes_the_picture_cua_asks_for_and_tries_once_more() {
+        let dir = temp_dir();
+        // Cua 0.29's rule for pixels (CUA_029_POINTER), taken to hold for a
+        // scroll at a point as it does for a click: not probed on a computer.
+        let replies = CUA_029_POINTER.replace("click|drag)", "click|drag|scroll)");
+        let cua = cua(&dir, fake_cua(&dir, true, &replies));
+        cua.set_agent(Some("codex@test".into()));
+        cua.show_cursor(0.0, 0.0).await.unwrap();
+
+        cua.tree(1, 1).await.unwrap();
+        cua.scroll(1, 1, Some((40.0, 40.0)), 0, 3, None).await.unwrap();
+        assert_eq!(lines(dir.join("landed.log")), ["scroll native"], "sent once, at the window point asked for");
+        let calls = lines(dir.join("calls.log"));
+        assert_eq!(calls.iter().filter(|c| *c == "scroll").count(), 2, "refused once, then sent: {calls:?}");
 
         cua.stop().await;
         std::fs::remove_dir_all(dir).unwrap();

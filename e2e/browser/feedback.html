@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ibara feedback repro</title>
+<style>
+  body { font: 16px sans-serif; margin: 24px; height: 3000px; }
+  .editor { border: 1px solid #888; min-height: 40px; width: 520px; padding: 8px; white-space: pre-wrap; }
+  .popup { position: absolute; background: #ffe; border: 1px solid #aa0; padding: 6px; width: 200px; }
+  .picker { position: relative; display: inline-block; }
+  .lists { display: flex; gap: 8px; border: 1px solid #555; padding: 6px; background: #fff; width: 170px; }
+  .list { height: 168px; width: 76px; overflow-y: auto; border: 1px solid #ccc; }
+  .list div { height: 24px; line-height: 24px; text-align: center; cursor: pointer; }
+  .list div[aria-selected=true] { background: #cde; }
+  section { margin-bottom: 28px; }
+</style>
+<h1>ibara feedback repro</h1>
+
+<section>
+  <h2>Plain editor</h2>
+  <div id="plain" class="editor" contenteditable="true" role="textbox" aria-label="Plain editor"></div>
+</section>
+
+<section>
+  <h2>Suggest editor</h2>
+  <p>Shows a suggestion popup while a word starts with #, and redraws it on every key.</p>
+  <div id="suggest" class="editor" contenteditable="true" role="textbox" aria-label="Suggest editor"></div>
+</section>
+
+<section>
+  <h2>Refocus editor</h2>
+  <p>Blurs and focuses itself on every key, as an editor that re-creates its input does.</p>
+  <div id="refocus" class="editor" contenteditable="true" role="textbox" aria-label="Refocus editor"></div>
+</section>
+
+<section>
+  <h2>Time picker</h2>
+  <button id="open" aria-haspopup="listbox">Select time</button>
+  <span id="time" aria-label="Chosen time">00:00</span>
+  <div class="picker" id="picker" hidden role="combobox" aria-label="Select time">
+    <div class="lists">
+      <div class="list" id="hours" role="listbox" aria-label="Hours"></div>
+      <div class="list" id="minutes" role="listbox" aria-label="Minutes"></div>
+    </div>
+  </div>
+</section>
+
+<p id="log" aria-label="Event log"></p>
+
+<script>
+  // Suggest editor: an absolutely positioned popup, drawn again on every key while a hashtag is open.
+  const suggest = document.getElementById('suggest');
+  let popup = null;
+  suggest.addEventListener('input', () => {
+    const open = /#\w*$/.test(suggest.innerText);
+    if (popup) { popup.remove(); popup = null; }
+    if (open) {
+      popup = document.createElement('div');
+      popup.className = 'popup';
+      popup.setAttribute('role', 'listbox');
+      popup.innerHTML = '<div role="option">#siege</div><div role="option">#moba</div><div role="option">#plays</div>';
+      const r = suggest.getBoundingClientRect();
+      popup.style.left = (r.left + scrollX + 40) + 'px';
+      popup.style.top = (r.bottom + scrollY + 2) + 'px';
+      document.body.appendChild(popup);
+    }
+  });
+
+  // Refocus editor: loses and retakes the keyboard focus on every key, keeping the caret at the end.
+  const refocus = document.getElementById('refocus');
+  refocus.addEventListener('input', () => {
+    refocus.blur();
+    refocus.focus();
+    const range = document.createRange();
+    range.selectNodeContents(refocus);
+    range.collapse(false);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+
+  // Time picker: two scrolling lists that show seven rows; choosing a row re-centres it.
+  const fill = (id, count) => {
+    const list = document.getElementById(id);
+    for (let i = 0; i < count; i++) {
+      const row = document.createElement('div');
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-label', (id === 'hours' ? 'Hours ' : 'Minutes ') + String(i).padStart(2, '0'));
+      row.textContent = String(i).padStart(2, '0');
+      row.setAttribute('aria-selected', i === 0 ? 'true' : 'false');
+      row.addEventListener('click', () => {
+        for (const other of list.children) other.setAttribute('aria-selected', 'false');
+        row.setAttribute('aria-selected', 'true');
+        list.scrollTop = row.offsetTop - list.offsetTop - 72;
+        const pick = name => document.querySelector('#' + name + ' [aria-selected=true]').textContent;
+        document.getElementById('time').textContent = pick('hours') + ':' + pick('minutes');
+      });
+      list.appendChild(row);
+    }
+  };
+  fill('hours', 24);
+  fill('minutes', 60);
+  document.getElementById('open').addEventListener('click', () => {
+    const picker = document.getElementById('picker');
+    picker.hidden = !picker.hidden;
+  });
+</script>

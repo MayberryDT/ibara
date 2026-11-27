@@ -405,9 +405,13 @@ impl Controller {
     /// runs there. It answers to the names and ids every command takes
     /// ([`crate::operator::directory::pick_computer`]): its name and host in any
     /// case, its `cmp_` or `computer_` id, its endpoint id, and its collector
-    /// identity. Anything else is refused before a person is asked, naming it.
+    /// identity; no name means that computer. Anything else is refused before
+    /// a person is asked, naming it.
     pub(crate) fn delivery_host(&self, principal: &str, field: &str, name: &str) -> Result<String> {
         let canonical = self.storage.collector_host(principal);
+        if name.is_empty() {
+            return Ok(canonical);
+        }
         let record = (self.operator_grants)().remove(principal).unwrap_or(Value::Null);
         let paired = crate::access::Access::load(&self.journal).ok().flatten().and_then(|a| a.pairings.get(principal).and_then(|p| p.endpoint.clone()));
         let endpoint_id = paired.or_else(|| record["operator_endpoint_id"].as_str().map(str::to_string)).unwrap_or_default();

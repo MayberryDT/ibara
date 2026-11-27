@@ -199,7 +199,7 @@ impl DesktopPort for LiveDesktop {
 
     fn act<'a>(&'a self, effect: &'a Effect, cancel: &'a Cancel) -> LocalFuture<'a, Result<Done>> {
         Box::pin(async move {
-            match effect {
+            let done = match effect {
                 Effect::Launch { app_id } => self.desktop.launch(app_id, None, Some(cancel)).await.map(|l| Done { pid: Some(l.pid), ..Done::default() }),
                 Effect::Focus(key) => self.desktop.focus(&surface(key), Some(cancel)).await.map(|_| Done::default()),
                 Effect::Close(key) => self.desktop.close(&surface(key), Some(cancel)).await.map(|_| Done::default()),
@@ -216,6 +216,17 @@ impl DesktopPort for LiveDesktop {
                 Effect::Scroll { at, surface: key, dx, dy } => {
                     let at = at.map(|(x, y)| desktop::Point { x, y });
                     self.desktop.scroll(at, key.as_ref().map(surface).as_ref(), *dx, *dy, Some(cancel)).await.map(|_| Done::default())
+                }
+            };
+            match done {
+                Ok(done) => Ok(done),
+                Err(error) => {
+                    let key = match effect {
+                        Effect::ClickElement { surface: key, .. } | Effect::Type { surface: key, .. } | Effect::Key { surface: key, .. } => Some(key),
+                        Effect::ClickPoint { surface: key, .. } | Effect::Scroll { surface: key, .. } => key.as_ref(),
+                        Effect::Launch { .. } | Effect::Focus(_) | Effect::Close(_) => return Err(error),
+                    };
+                    Err(self.desktop.for_x11(error, key.map(surface).as_ref()).await)
                 }
             }
         })

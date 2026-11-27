@@ -451,6 +451,19 @@ impl Desktop {
         Ok(Snapshot { geometry_key: hyprland::geometry_key(&monitors), monitors, windows: windows?, active: active? })
     }
 
+    /// A refused input with its real cause when the window it was for
+    /// (`id`, else the focused one) is an X11 app: see [`cua::for_x11`].
+    pub async fn for_x11(&self, error: IbaraError, id: Option<&SurfaceId>) -> IbaraError {
+        if error.details.get("reason").and_then(Value::as_str) != Some("stale_target") {
+            return error;
+        }
+        let window = match id {
+            Some(id) => self.live(id).await,
+            None => self.focused().await,
+        };
+        cua::for_x11(error, window.ok().flatten().as_ref())
+    }
+
     /// The window with this identity, if it still exists.
     pub async fn live(&self, id: &SurfaceId) -> Result<Option<Window>> {
         Ok(self.hypr.clients().await?.into_iter().find(|w| w.is(id)))

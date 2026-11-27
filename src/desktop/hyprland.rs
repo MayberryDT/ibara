@@ -103,6 +103,8 @@ pub struct Window {
     pub initial_title: String,
     pub pid: i64,
     pub fullscreen: i64,
+    /// An X11 app, shown through Xwayland. Cua's plugin sends it no input.
+    pub xwayland: bool,
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i64,
     pub stable_id: Option<String>,

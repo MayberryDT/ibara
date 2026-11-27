@@ -5,6 +5,7 @@
 - Click an option that is inside the window but outside the part of its own scrolling list that shows, such as an hour further down an open time picker. It was refused as covered; the list is now scrolled to it first, without moving the page.
 - Send a wheel scroll to its point. `computer_act` `scroll` at a point and `browser_act` `scroll` with an element as its target both scrolled at the window's centre, so the page moved and a list inside it did not.
 - Name the limit in the refusal of an `exec` with too many or too long arguments (100 after the program, 4,096 characters each) and which was exceeded. Let `computer_files` `send` leave out `to.host`: a send goes to the computer the agent works from, and a host that names another computer is still refused.
+- Say that a window is an X11 app when its input is refused. The desktop's input plugin sends nothing to an X11 window (one shown through Xwayland, such as a Wine or Proton game), and ibara answered a key with "use the pointer instead" and a click with "use keys instead". The refusal now names the cause and what can work: the app's Wayland mode, `computer_exec` or files. Input to X11 windows itself is unchanged.
 
 # 0.3.10
 

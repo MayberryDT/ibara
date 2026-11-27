@@ -26,7 +26,7 @@
 
 use super::atspi::{ElementPage, RawElement, ResolvedElement, Tree};
 use super::handover::Motion;
-use super::hyprland::{Rect, Screens};
+use super::hyprland::{Rect, Screens, Window};
 use super::run::{Cancel, Cmd, clip, run};
 use crate::error::{IbaraError, Result, invalid};
 use serde_json::{Value, json};
@@ -1729,6 +1729,19 @@ fn refused_by(tool: &str, sc: &Value, text: &str) -> IbaraError {
         Some(next) => error.with("next", next),
         None => error,
     }
+}
+
+/// Cua's Hyprland plugin takes no X11 (Xwayland) window as a target and says
+/// only `stale_target`, whatever the input. For such a window, say that
+/// instead of offering the other kind of input, which is refused the same.
+pub fn for_x11(error: IbaraError, window: Option<&Window>) -> IbaraError {
+    if error.details.get("reason").and_then(Value::as_str) != Some("stale_target") || !window.is_some_and(|w| w.xwayland) {
+        return error;
+    }
+    unavailable("This window is an X11 app (it runs through Xwayland), and ibara cannot send keys, clicks or scrolls to an X11 window. It can still show it.")
+        .with("reason", "x11_window")
+        .with("execution_not_started", true)
+        .with("next", "No other input reaches it: not keys instead of clicks, another observation or recovery_of. If the app can run as a Wayland app, close it and start it that way (for example --ozone-platform=wayland for Chromium and Electron apps, SDL_VIDEODRIVER=wayland for SDL games, PROTON_ENABLE_WAYLAND=1 for Proton 10 or newer). Otherwise work through computer_exec or files, or finish partial and say the app needs X11 input.")
 }
 
 async fn write_line(worker: &mut Worker, message: &Value) -> Result<()> {

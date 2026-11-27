@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.11
 
 - Keep typing through a web editor that takes the keyboard focus again as it redraws. An input method resends its keymap at each such focus, the desktop's input connection ends, and typing went on only 3 times in one text, so a long caption stopped after a few characters ("ibara typed the first 4 of the 195 characters, then stopped"). Typing now goes on for as long as each interruption lets keys through, counts every key that arrived, and stops only after 3 interruptions in a row that let none through. A stop in a page field says how to add only the rest.
 - Add text with characters beyond ASCII where the caret is: `browser_act` `type` without a target, into the page field that has the keyboard. It was refused; the only route replaced the whole field. The page reader confirms a field of the page has the keyboard before anything is sent, so the text is never aimed at the address bar. The refusal of such text typed with `computer_act` now says what each route does.
